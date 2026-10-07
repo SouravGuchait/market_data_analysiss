@@ -1,0 +1,32 @@
+# Runtime: Django 5.2 is the chosen LTS application line.
+Django>=5.2,<5.3
+djangorestframework>=3.15,<3.17
+django-filter>=24.3,<26.0
+django-environ>=0.11,<1.0
+drf-spectacular>=0.28,<1.0
+djangorestframework-simplejwt>=5.3,<6.0
+
+# Data, database, and asynchronous work
+mysqlclient>=2.2,<3.0
+celery[redis]>=5.5,<5.7
+redis>=5.0,<7.0
+pandas>=2.2,<3.0
+numpy>=2.0,<3.0
+requests>=2.32,<3.0
+
+# File ingestion and synthetic-data generation
+openpyxl>=3.1,<4.0
+Faker>=30.0,<40.0
+
+# Production serving and monitoring
+gunicorn>=23.0,<24.0
+whitenoise>=6.8,<7.0
+django-cors-headers>=4.6,<5.0
+structlog>=24.4,<26.0
+
+# Development and tests
+pytest>=8.3,<9.0
+pytest-django>=4.9,<5.0
+factory-boy>=3.3,<4.0
+coverage>=7.6,<8.0
+ruff>=0.8,<1.0
