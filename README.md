@@ -38,11 +38,59 @@ python manage.py check --database default
 python manage.py runserver
 # In another terminal:
 Invoke-RestMethod http://127.0.0.1:8000/api/v1/health/
-python manage.py test apps.health
 ```
 
 The health endpoint returns `{"status": "ok", "database": "ok"}` only after a
 real `SELECT 1` succeeds against MySQL.
+
+## Running tests
+
+```powershell
+python manage.py test
+python -m pytest            # pytest is configured in .vscode/settings.json
+```
+
+Tests run against in-memory SQLite with a fast MD5 password hasher, so no
+MySQL server is needed and the whole suite finishes in about a second.
+Development, the health check, and production all stay on MySQL — only
+`config/settings.py` sees the swap, gated on whether tests are running.
+
+## Authentication
+
+The API authenticates with JWT bearer tokens and authorizes with Django
+`Group`s. Tokens are sent in the `Authorization: Bearer <access>` header, never
+in a cookie, so the JSON API carries no CSRF surface; `CsrfViewMiddleware`
+remains in place because `/admin/` still uses Django sessions.
+
+```powershell
+# Create a user and receive an access/refresh token pair.
+$body = @{ username = "analyst"; email = "a@example.com"; password = "drf-portfolio-42!" } | ConvertTo-Json
+Invoke-RestMethod -Uri http://127.0.0.1:8000/api/v1/auth/register/ -Method Post -Body $body -ContentType application/json
+
+# Exchange credentials for tokens; the response also carries the user profile.
+# Call the protected endpoint with the returned access token.
+Invoke-RestMethod -Uri http://127.0.0.1:8000/api/v1/auth/me/ -Headers @{ Authorization = "Bearer $access" }
+```
+
+| Method | Endpoint | Access |
+|---|---|---|
+| `POST` | `/api/v1/auth/register/` | anonymous |
+| `POST` | `/api/v1/auth/login/` | anonymous, throttled |
+| `POST` | `/api/v1/auth/logout/` | authenticated |
+| `POST` | `/api/v1/auth/token/refresh/` | anonymous |
+| `GET` | `/api/v1/auth/me/` | authenticated |
+
+Every response body — success or failure — uses one envelope. Errors are shaped
+as `{"error": {"code": ..., "message": ..., "fields": {...}}}`.
+
+Passwords go through Django's `AUTH_PASSWORD_VALIDATORS` and are stored hashed.
+Refresh tokens are rotated on use and blacklisted on logout, so a stolen refresh
+token is rejected on its next use. Access tokens expire after 15 minutes
+(`JWT_ACCESS_MINUTES`).
+
+Roles are the `analyst` and `administrator` groups, created by the
+`accounts.0001_role_groups` migration. Registration assigns `analyst`; grant
+`administrator` from Django admin.
 
 ## File ownership
 
@@ -51,6 +99,8 @@ market_data_analysiss/
 ├── manage.py                 # Django management commands
 ├── config/                   # Project settings and root routing
 ├── apps/
+│   ├── accounts/             # Registration, login, logout, roles
+│   ├── common/               # Shared permissions and the error envelope
 │   └── health/               # Operational endpoint only
 ├── scripts/                  # Local utility scripts, including sample-data generation
 ├── templates/                # Project-wide templates
@@ -64,9 +114,12 @@ market_data_analysiss/
 
 - `manage.py`: Django management-command entry point.
 - `config/`: project-level settings, URL routing, and ASGI/WSGI server entry points.
+- `apps/accounts/`: JWT registration, login, logout, and the analyst/administrator role groups.
+- `apps/common/`: `IsOwner` for object-level ownership checks, the `OwnedModel` abstract base,
+  and the single `{"error": {...}}` response envelope used by every endpoint.
 - `apps/health/`: the first self-contained application, limited to operational health checks.
-- `apps/`: the namespace for future domain apps such as `accounts`, `instruments`,
-  `ingestion`, `marketdata`, `analytics`, `audit`, and `common`.
+- `apps/`: the namespace for future domain apps such as `instruments`, `ingestion`,
+  `marketdata`, `analytics`, and `audit`.
 - `templates/`, `static/`, and `media/`: project templates, static assets, and local uploaded media.
 - `.env`: ignored local configuration. `.env.example`: safe key-only template.
 
