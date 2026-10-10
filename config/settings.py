@@ -27,7 +27,6 @@ INSTALLED_APPS = [
     "rest_framework_simplejwt.token_blacklist",
     "apps.accounts.apps.AccountsConfig",
     "apps.common.apps.CommonConfig",
-    "apps.health.apps.HealthConfig",
 ]
 
 MIDDLEWARE = [
