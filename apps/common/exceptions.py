@@ -14,6 +14,8 @@ STATUS_CODES = {
     403: "permission_denied",
     404: "not_found",
     405: "method_not_allowed",
+    409: "conflict",
+    415: "unsupported_media_type",
     429: "throttled",
 }
 
