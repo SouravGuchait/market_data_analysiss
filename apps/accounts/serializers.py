@@ -1,23 +1,24 @@
-"""Serializers for registration, the current-user payload, and login tokens."""
+"""Serializers for registration, login, the current user, and logout."""
 
 from django.contrib.auth import get_user_model, password_validation
-from django.contrib.auth.models import Group
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .permissions import ANALYST_GROUP
+from .models import Role
 
 
 class UserSerializer(serializers.ModelSerializer):
+    """The shape the API returns for a user. Never includes the password."""
+
     roles = serializers.SerializerMethodField()
 
     class Meta:
         model = get_user_model()
-        fields = ["id", "username", "email", "roles"]
+        fields = ["id", "email", "first_name", "last_name", "roles"]
 
     def get_roles(self, obj):
-        return sorted(obj.groups.values_list("name", flat=True))
+        return [obj.role]
 
 
 class RegisterSerializer(serializers.ModelSerializer):
@@ -28,22 +29,47 @@ class RegisterSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = get_user_model()
-        fields = ["id", "username", "email", "password"]
+        fields = ["id", "email", "password", "first_name", "last_name"]
+
+    def validate(self, attrs):
+        # Registration always produces an analyst. Silently dropping a role
+        # field would look like the API accepted it, and quietly self-assigning
+        # one would be privilege escalation, so refuse it explicitly.
+        attempted = {
+            key: self.initial_data[key]
+            for key in ("role", "roles")
+            if key in self.initial_data
+        }
+        if attempted:
+            raise serializers.ValidationError(
+                {
+                    "role": (
+                        "Roles cannot be set during registration. New accounts "
+                        "always start as analyst; ask an administrator to change "
+                        "your role."
+                    )
+                }
+            )
+        return attrs
 
     def create(self, validated_data):
         user = get_user_model().objects.create_user(**validated_data)
-        user.groups.add(Group.objects.get(name=ANALYST_GROUP))
         return user
 
 
 class LoginSerializer(TokenObtainPairSerializer):
-    """Adds the user profile to the token response and role claims to the token."""
+    """Authenticates on email and password, and carries the role into the token.
+
+    ``TokenObtainPairSerializer`` reads its username field from
+    ``User.USERNAME_FIELD``, which is now ``email``, so the request body uses
+    ``email`` rather than ``username`` without any change here.
+    """
 
     @classmethod
     def get_token(cls, user):
         token = super().get_token(user)
-        token["username"] = user.username
-        token["roles"] = sorted(user.groups.values_list("name", flat=True))
+        token["email"] = user.email
+        token["role"] = user.role
         return token
 
     def validate(self, attrs):

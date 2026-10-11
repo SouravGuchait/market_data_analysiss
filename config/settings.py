@@ -1,10 +1,25 @@
 """Django settings for the Market Data Intelligence API."""
 
+import logging
 from datetime import timedelta
 from pathlib import Path
 import sys
 
 import environ
+
+
+class SuppressProbeNotFound(logging.Filter):
+    """Silences 404 warnings from health-check probes hitting absent paths.
+
+    An uptime monitor polls paths like ``/health`` on a timer. The 404 is the
+    correct response, but a WARNING every 30 seconds buries genuine request
+    errors in the console. Only "Not Found" is suppressed; 500s, 403s and
+    SuspiciousOperation warnings still surface.
+    """
+
+    def filter(self, record):
+        message = record.getMessage()
+        return "Not Found:" not in message and "Resource Not Found" not in message
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -27,6 +42,11 @@ INSTALLED_APPS = [
     "rest_framework_simplejwt.token_blacklist",
     "apps.accounts.apps.AccountsConfig",
     "apps.common.apps.CommonConfig",
+    "apps.instruments.apps.InstrumentsConfig",
+    "apps.marketdata.apps.MarketdataConfig",
+    "apps.ingestion.apps.IngestionConfig",
+    "apps.analytics.apps.AnalyticsConfig",
+    "apps.audit.apps.AuditConfig",
 ]
 
 MIDDLEWARE = [
@@ -40,6 +60,10 @@ MIDDLEWARE = [
 ]
 
 ROOT_URLCONF = "config.urls"
+
+# Email is the login identifier for this project, not username. Must be set
+# before any migration is applied to auth or to the accounts app.
+AUTH_USER_MODEL = "accounts.User"
 
 TEMPLATES = [
     {
@@ -144,10 +168,18 @@ LOGGING = {
             "style": "{",
         },
     },
+    "filters": {
+        # External uptime monitors poll paths like /health on a timer. The 404 is
+        # the correct response, but a WARNING every 30 seconds buries real
+        # request errors. Only "Not Found" is dropped — 500s, 403s and
+        # SuspiciousOperation warnings still surface.
+        "suppress_probe_not_found": {"()": SuppressProbeNotFound},
+    },
     "handlers": {
         "console": {
             "class": "logging.StreamHandler",
             "formatter": "verbose",
+            "filters": ["suppress_probe_not_found"],
         },
     },
     "root": {"handlers": ["console"], "level": "INFO"},
