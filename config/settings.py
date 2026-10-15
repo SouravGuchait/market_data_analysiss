@@ -40,6 +40,7 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "rest_framework",
     "rest_framework_simplejwt.token_blacklist",
+    "django_filters",
     "apps.accounts.apps.AccountsConfig",
     "apps.common.apps.CommonConfig",
     "apps.instruments.apps.InstrumentsConfig",
@@ -147,6 +148,15 @@ REST_FRAMEWORK = {
         "login": "10/min",
         "register": "5/hour",
     },
+    # Every list endpoint is paginated and filterable by default. An endpoint
+    # that genuinely cannot be paginated sets pagination_class = None.
+    "DEFAULT_PAGINATION_CLASS": "apps.common.pagination.StandardResultsPagination",
+    "PAGE_SIZE": 25,
+    "DEFAULT_FILTER_BACKENDS": [
+        "django_filters.rest_framework.DjangoFilterBackend",
+        "rest_framework.filters.OrderingFilter",
+        "rest_framework.filters.SearchFilter",
+    ],
 }
 
 SIMPLE_JWT = {

@@ -42,51 +42,407 @@ python manage.py runserver
 
 ```powershell
 python manage.py test
-python -m pytest            # pytest is configured in .vscode/settings.json
+python -m pytest            # both run the same suite via pytest.ini
 ```
 
-Tests run against in-memory SQLite with a fast MD5 password hasher, so no
-MySQL server is needed and the whole suite finishes in about a second.
-Development, the health check, and production all stay on MySQL — only
-`config/settings.py` sees the swap, gated on whether tests are running.
+207 tests run against in-memory SQLite with a fast MD5 password hasher, so no
+MySQL server is needed and the whole suite finishes in a few seconds.
+Development and production stay on MySQL — only `config/settings.py` sees the
+swap, gated on whether tests are running.
 
 ## Authentication
 
-The API authenticates with JWT bearer tokens and authorizes with Django
-`Group`s. Tokens are sent in the `Authorization: Bearer <access>` header, never
-in a cookie, so the JSON API carries no CSRF surface; `CsrfViewMiddleware`
+The API authenticates with JWT bearer tokens and authorizes with a role column
+on the user. Tokens are sent in the `Authorization: Bearer <access>` header,
+never in a cookie, so the JSON API carries no CSRF surface; `CsrfViewMiddleware`
 remains in place because `/admin/` still uses Django sessions.
 
 ```powershell
 # Create a user and receive an access/refresh token pair.
-$body = @{ username = "analyst"; email = "a@example.com"; password = "drf-portfolio-42!" } | ConvertTo-Json
+$body = @{ email = "analyst@example.com"; password = "drf-portfolio-42!" } | ConvertTo-Json
 Invoke-RestMethod -Uri http://127.0.0.1:8000/api/v1/auth/register/ -Method Post -Body $body -ContentType application/json
 
 # Exchange credentials for tokens; the response also carries the user profile.
-# Call the protected endpoint with the returned access token.
-Invoke-RestMethod -Uri http://127.0.0.1:8000/api/v1/auth/me/ -Headers @{ Authorization = "Bearer $access" }
+$tokens = Invoke-RestMethod -Uri http://127.0.0.1:8000/api/v1/auth/login/ -Method Post -Body $body -ContentType application/json
+
+# Call a protected endpoint with the returned access token.
+Invoke-RestMethod -Uri http://127.0.0.1:8000/api/v1/auth/me/ -Headers @{ Authorization = "Bearer $($tokens.access)" }
 ```
 
-| Method | Endpoint | Access |
-|---|---|---|
-| `POST` | `/api/v1/auth/register/` | anonymous |
-| `POST` | `/api/v1/auth/login/` | anonymous, throttled |
-| `POST` | `/api/v1/auth/logout/` | authenticated |
-| `POST` | `/api/v1/auth/token/refresh/` | anonymous |
-| `GET` | `/api/v1/auth/me/` | authenticated |
+Login uses **email**, not username — `User.USERNAME_FIELD = "email"` and the
+`username` field does not exist.
+
+| Method | Endpoint | Access | Purpose |
+|---|---|---|---|
+| `POST` | `/api/v1/auth/register/` | anonymous, 5/hr | create an account, return tokens |
+| `POST` | `/api/v1/auth/login/` | anonymous, 10/min | exchange credentials for tokens |
+| `POST` | `/api/v1/auth/logout/` | authenticated | blacklist the refresh token |
+| `POST` | `/api/v1/auth/token/refresh/` | anonymous | rotate a refresh token |
+| `GET` | `/api/v1/auth/me/` | authenticated | the current user's profile |
+| `GET` | `/api/v1/auth/usage/` | authenticated | the current user's activity statistics |
 
 Every response body — success or failure — uses one envelope. Errors are shaped
 as `{"error": {"code": ..., "message": ..., "fields": {...}}}`.
 
 Passwords go through Django's `AUTH_PASSWORD_VALIDATORS` and are stored hashed.
 Refresh tokens are rotated on use and blacklisted on logout, so a stolen refresh
-token is rejected on its next use. Access tokens expire after 15 minutes
-(`JWT_ACCESS_MINUTES`).
+token is rejected on its next use. Access tokens expire after 30 minutes
+(`JWT_ACCESS_MINUTES`; `settings.py` defaults to 30 if unset).
 
 Roles live on the `User.role` column, not in Django `Group`s. The values are
 `analyst` and `administrator`, and an administrator is created by
-`createsuperuser`. Roles are edited in the Django admin user change form, which
-is the natural place for them because it is where the account itself is managed.
+`createsuperuser`. Registration **always** produces an analyst and rejects a
+`role` or `roles` field outright, because otherwise anyone could self-assign
+administrator. Roles are edited in the Django admin user change form.
+
+## REST API
+
+Every endpoint under `/api/v1/` requires `Authorization: Bearer <access>`
+except `register`, `login`, and `token/refresh`. Each app owns its URL namespace
+(`app_name` in `urls.py`), so routes are referenced as
+`reverse("instruments:list")` rather than by hardcoded path.
+
+| # | Method | Endpoint | Access | Purpose |
+|---|---|---|---|---|
+| 1 | `GET` | `/api/v1/instruments/` | authenticated | list instruments, filter and search |
+| 2 | `GET` | `/api/v1/instruments/<id>/` | authenticated | retrieve one instrument |
+| 3 | `GET` | `/api/v1/instruments/exchanges/` | authenticated | list exchanges (unpaginated) |
+| 4 | `GET` | `/api/v1/market-data/instruments/<id>/prices/` | authenticated | price history, optional date range |
+| 5 | `POST` | `/api/v1/ingestion/` | authenticated | create an ingestion job |
+| 6 | `GET` | `/api/v1/ingestion/` | authenticated | list **your own** jobs |
+| 7 | `GET` | `/api/v1/ingestion/<uuid>/` | authenticated, **owner** | job status |
+| 8 | `GET` | `/api/v1/ingestion/<uuid>/validation-errors/` | authenticated, **owner** | rejected rows for a job |
+| 9 | `GET` | `/api/v1/analytics/instruments/<id>/metrics/` | authenticated | metric snapshots for an instrument |
+| 10 | `GET` | `/api/v1/auth/usage/` | authenticated | activity statistics |
+
+Instruments, prices, and analytics are **read-only** through the API — those
+rows are written by the ingestion pipeline, never by a client. The only write
+is creating an ingestion job.
+
+### Query parameters
+
+All parameters are optional and combine with `&`. An **unknown** parameter is
+always ignored. An invalid *value* usually gives a `400` — with two documented
+exceptions noted under each table (`is_active` silently ignoring a
+non-boolean, and `page` returning `404` when out of range).
+
+**`GET /api/v1/instruments/`**
+
+| Parameter | Match | Accepted values | Example |
+|---|---|---|---|
+| `symbol` | exact, **case-insensitive** | any ticker | `?symbol=aapl` |
+| `exchange` | exact, **case-insensitive** | exchange `code` | `?exchange=NASDAQ` |
+| `asset_type` | exact, **case-sensitive** | `equity`, `etf`, `crypto`, `forex`, `index`, `future` | `?asset_type=equity` |
+| `is_active` | boolean | `true` or `false`, case-insensitive. **Any other value is silently ignored** | `?is_active=true` |
+| `search` | substring of symbol **or** name, case-insensitive | any text | `?search=Apple` |
+| `ordering` | sort | `symbol`, `name`, `asset_type`, `created_at`; prefix `-` to reverse. An unknown field is ignored | `?ordering=-symbol` |
+| `page`, `page_size` | pagination | `page_size` ≤ 100; a non-numeric or out-of-range `page` returns **404** | `?page_size=50` |
+
+Default order is `symbol` ascending.
+
+> **`is_active` accepts only `true` and `false`.** `?is_active=1`, `?is_active=yes`,
+> and `?is_active=` are all silently *ignored*, returning every instrument rather
+> than the active ones. That is `django-filter`'s documented `BooleanFilter`
+> contract, but it is a trap: a client asking for active-only gets no error and
+> no hint that its filter did nothing. Worth knowing before you publish this
+> endpoint to a frontend.
+
+**`GET /api/v1/market-data/instruments/<id>/prices/`**
+
+| Parameter | Match | Accepted values | Example |
+|---|---|---|---|
+| `start_date` | inclusive lower bound | ISO date `YYYY-MM-DD` | `?start_date=2024-03-12` |
+| `end_date` | inclusive upper bound | ISO date `YYYY-MM-DD` | `?end_date=2024-03-14` |
+| `ordering` | sort | `trading_date`, `close`, `volume`; prefix `-` to reverse | `?ordering=-trading_date` |
+| `page`, `page_size` | pagination | `page_size` ≤ 100 | `?page_size=100` |
+
+Default order is `trading_date` ascending. A malformed date or an inverted
+range (`start_date` after `end_date`) is a `400`.
+
+**`GET /api/v1/ingestion/`**
+
+| Parameter | Match | Accepted values | Example |
+|---|---|---|---|
+| `status` | exact | `pending`, `running`, `succeeded`, `failed`, `partial` | `?status=running` |
+| `source_type` | exact | `csv`, `json`, `api`, `manual` | `?source_type=csv` |
+| `ordering` | sort | `requested_at`, `status`, `rows_received`; prefix `-` to reverse | `?ordering=-requested_at` |
+| `page`, `page_size` | pagination | `page_size` ≤ 100 | `?page_size=10` |
+
+Default order is `requested_at` descending — newest first.
+
+**`GET /api/v1/ingestion/<uuid>/validation-errors/`**
+
+| Parameter | Match | Accepted values | Example |
+|---|---|---|---|
+| `error_code` | exact | any code the pipeline records | `?error_code=negative_volume` |
+| `ordering` | sort | `row_number`, `error_code`; prefix `-` to reverse | `?ordering=-row_number` |
+| `page`, `page_size` | pagination | `page_size` ≤ 100 | `?page_size=100` |
+
+Default order is `row_number` ascending, so rejections read in file order.
+
+**`GET /api/v1/analytics/instruments/<id>/metrics/`**
+
+| Parameter | Match | Accepted values | Example |
+|---|---|---|---|
+| `metric_type` | exact | `return`, `moving_average`, `volatility`, `drawdown` | `?metric_type=return` |
+| `start_date` | inclusive lower bound | ISO date `YYYY-MM-DD` | `?start_date=2024-01-01` |
+| `end_date` | inclusive upper bound | ISO date `YYYY-MM-DD` | `?end_date=2024-03-31` |
+| `ordering` | sort | `as_of_date`, `metric_type`, `value`; prefix `-` to reverse | `?ordering=-as_of_date` |
+| `page`, `page_size` | pagination | `page_size` ≤ 100 | `?page_size=50` |
+
+Default order is `as_of_date` descending, then `metric_type`.
+
+**Endpoints with no query parameters**
+
+These take path or body parameters only. A `GET` sent with a query string still
+returns `200` — the parameters are simply ignored.
+
+| Endpoint | Parameters that apply |
+|---|---|
+| `GET /api/v1/auth/me/` | none |
+| `GET /api/v1/auth/usage/` | none |
+| `POST /api/v1/auth/register/` | body: `email`, `password`, `first_name`, `last_name` |
+| `POST /api/v1/auth/login/` | body: `email`, `password` |
+| `POST /api/v1/auth/logout/` | body: `refresh` |
+| `POST /api/v1/auth/token/refresh/` | body: `refresh` |
+| `POST /api/v1/ingestion/` | body: `source_type` |
+| `GET /api/v1/instruments/<id>/` | path: `id` — instrument primary key |
+| `GET /api/v1/instruments/exchanges/` | none — and deliberately **unpaginated** |
+
+**Pagination on every list.** `PageNumberPagination`, `page_size=25` by default,
+`max_page_size=100`, overridable with `?page_size=`. Responses are always
+`{"count", "next", "previous", "results"}` — `next` and `previous` are URLs or
+`null`. The one exception is `/instruments/exchanges/`, which sets
+`pagination_class = None` because the table holds a few hundred rows and a page
+wrapper would add noise.
+
+### Verified filter behaviour
+
+Every row below was checked against a running server with four instruments
+(three active, one inactive) rather than asserted from memory:
+
+| Query | Result | Why |
+|---|---|---|
+| `(no params)` | `200`, 4 rows | default ordering by `symbol` |
+| `?symbol=AAPL` | `200`, 1 row | exact match |
+| `?symbol=aapl` | `200`, 1 row | `iexact` — case does not matter |
+| `?symbol=AAPLX` | `200`, 0 rows | no match, not an error |
+| `?exchange=NASDAQ` | `200`, 2 rows | joins on `exchange.code` |
+| `?exchange=nasdaq` | `200`, 2 rows | case-insensitive |
+| `?asset_type=equity` | `200`, 3 rows | valid choice |
+| `?asset_type=EQUITY` | **`400`** | case-**sensitive**; uppercase is an invalid choice |
+| `?is_active=true` | `200`, 3 rows | works |
+| `?is_active=false` | `200`, 1 row | works, case-insensitive |
+| `?is_active=1` | `200`, **4 rows** | ⚠️ silently ignored — filter not applied |
+| `?is_active=maybe` | `200`, **4 rows** | ⚠️ silently ignored |
+| `?search=Inc` | `200`, 4 rows | substring on symbol **or** name |
+| `?ordering=-symbol` | `200`, 4 rows | reversed |
+| `?ordering=nope` | `200`, 4 rows | unknown field ignored |
+| `?bogus_param=1` | `200` | unknown parameter ignored |
+| `?page=1` | `200` | first page |
+| `?page=999` | **`404`** | past the last page is not-found, not empty |
+| `?page=abc` | **`404`** | non-numeric page |
+| `?page_size=abc` | `200` | ignored, falls back to 25 |
+| `?page_size=1000` | `200` | clamped to `max_page_size` of 100 |
+
+### Request and response examples
+
+**List instruments** — `GET /api/v1/instruments/?asset_type=equity&exchange=NASDAQ&search=Apple&ordering=-symbol&page_size=10`
+
+```json
+{
+  "count": 2,
+  "next": null,
+  "previous": null,
+  "results": [
+    {
+      "id": 1,
+      "symbol": "MSFT",
+      "name": "Microsoft Corporation",
+      "asset_type": "equity",
+      "exchange_code": "NASDAQ",
+      "currency": "USD",
+      "is_active": true
+    }
+  ]
+}
+```
+
+**Retrieve one instrument** — `GET /api/v1/instruments/1/`
+
+```json
+{
+  "id": 1,
+  "symbol": "AAPL",
+  "name": "Apple Inc.",
+  "asset_type": "equity",
+  "exchange": { "id": 1, "code": "NASDAQ", "name": "Nasdaq", "timezone": "America/New_York" },
+  "currency": "USD",
+  "is_active": true,
+  "created_at": "2026-01-01T00:00:00Z",
+  "updated_at": "2026-01-01T00:00:00Z"
+}
+```
+
+**Price history** — `GET /api/v1/market-data/instruments/1/prices/?start_date=2024-03-12&end_date=2024-03-14`
+
+```json
+{
+  "count": 3,
+  "results": [
+    {
+      "trading_date": "2024-03-12",
+      "open": "102.00000000",
+      "high": "107.00000000",
+      "low": "97.00000000",
+      "close": "102.00000000",
+      "adjusted_close": null,
+      "volume": 1000,
+      "source": "test"
+    }
+  ]
+}
+```
+
+**Create a job** — `POST /api/v1/ingestion/` with body `{"source_type": "csv"}`
+
+```json
+{
+  "id": "2043cca3-ec4f-4817-8fa0-40ad78ac08e7",
+  "source_type": "csv",
+  "status": "pending",
+  "requested_at": "2026-10-12T03:57:22Z",
+  "started_at": null,
+  "completed_at": null,
+  "rows_received": 0,
+  "rows_accepted": 0,
+  "rows_rejected": 0,
+  "error_summary": "",
+  "created_by_email": "analyst@example.com"
+}
+```
+
+`source_type` is one of `csv`, `json`, `api`, `manual`. Only that one field is
+writable — `status`, timestamps, and row counts are absent from the input
+serializer entirely, so sending them is ignored rather than trusted. An unknown
+value is a `400` with `{"source_type": ["\"x\" is not a valid choice."]}`.
+
+**List your own jobs** — `GET /api/v1/ingestion/?status=running&source_type=csv`
+
+```json
+{
+  "count": 1,
+  "results": [
+    {
+      "id": "2043cca3-ec4f-4817-8fa0-40ad78ac08e7",
+      "source_type": "csv",
+      "status": "running",
+      "rows_received": 100,
+      "rows_accepted": 90,
+      "rows_rejected": 10,
+      "created_by_email": "analyst@example.com"
+    }
+  ]
+}
+```
+
+**Validation errors** — `GET /api/v1/ingestion/<uuid>/validation-errors/?error_code=negative_volume`
+
+```json
+{
+  "count": 1,
+  "results": [
+    {
+      "id": 5,
+      "row_number": 7,
+      "field_name": "volume",
+      "error_code": "negative_volume",
+      "raw_row": { "row": 7, "close": "abc" }
+    }
+  ]
+}
+```
+
+**Analytics metrics** — `GET /api/v1/analytics/instruments/1/metrics/?metric_type=return`
+
+```json
+{
+  "count": 1,
+  "results": [
+    {
+      "symbol": "AAPL",
+      "metric_type": "return",
+      "as_of_date": "2024-03-15",
+      "lookback_days": 30,
+      "value": "0.08000000",
+      "metadata": { "method": "simple" },
+      "calculated_at": "2026-01-01T00:00:00Z"
+    }
+  ]
+}
+```
+
+**Usage statistics** — `GET /api/v1/auth/usage/`
+
+```json
+{
+  "jobs": {
+    "total": 4,
+    "by_status": { "pending": 3, "succeeded": 1 },
+    "rows_received": 160,
+    "rows_accepted": 140,
+    "rows_rejected": 20
+  },
+  "prices": {
+    "records_imported": 137,
+    "instruments_covered": 3,
+    "earliest_date": "2024-03-11",
+    "latest_date": "2024-03-15"
+  }
+}
+```
+
+### Status codes and ownership
+
+| Code | When |
+|---|---|
+| `200` | list or retrieve succeeded |
+| `201` | job created |
+| `400` | invalid filter, malformed date, or inverted date range |
+| `401` | missing or invalid token |
+| `403` | authenticated, but the object belongs to someone else |
+| `404` | the object does not exist |
+| `429` | rate limited (`register` 5/hr, `login` 10/min) |
+
+Ownership is enforced two ways. **List** endpoints scope the queryset to
+`request.user` *before* filtering, so another user's jobs can never match.
+**Detail** endpoints use `get_object_or_404` across all jobs and then
+`check_object_permissions`, returning **403 rather than 404** — the caller is
+authenticated and the resource genuinely exists, so 404 would be a lie.
+
+Views with custom `permission_classes` list `IsAuthenticated` explicitly,
+because view-level permissions *replace* the global default. Without it an
+anonymous request to a job detail would return 403 instead of the accurate 401.
+
+### Architecture
+
+Each app follows the same four-file shape:
+
+| File | Responsibility |
+|---|---|
+| `services.py` | querysets and business rules, as plain functions with keyword-only args |
+| `serializers.py` | input validation and output representation |
+| `views.py` | thin adapters: parse request, call a service, render |
+| `filters.py` | query-parameter to ORM lookup mapping (`django-filter`) |
+
+Views never build querysets themselves and never contain business rules. A
+Celery task, a management command, or another service can call
+`services.list_instruments(symbol="AAPL")` directly without HTTP, which is the
+point of the split.
+
+Every list joins its foreign keys through `select_related` in the service layer,
+so query counts stay constant rather than growing with page size — asserted in
+tests via `assertNumQueries` (3 for instruments, 4 for prices, 2 for job detail).
 
 ## Database schema
 
@@ -192,7 +548,7 @@ market_data_analysiss/
   `IngestionValidationError` children.
 - `apps/analytics/`: `AnalyticSnapshot`, one metric per instrument, date, and lookback.
 - `apps/audit/`: `AuditEvent`, append-only records of privileged actions.
-- `thealthemplates/`, `static/`, and `media/`: project templates, static assets, and local uploaded media.
+- `templates/`, `static/`, and `media/`: project templates, static assets, and local uploaded media.
 - `.env`: ignored local configuration. `.env.example`: safe key-only template.
 
 ## Commands Django would normally generate

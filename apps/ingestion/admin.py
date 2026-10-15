@@ -1,5 +1,4 @@
 from django.contrib import admin
-
 from .models import IngestionFile, IngestionJob, IngestionValidationError
 
 
@@ -21,7 +20,7 @@ class IngestionJobAdmin(admin.ModelAdmin):
     search_fields = ("id", "created_by__email")
     date_hierarchy = "requested_at"
     readonly_fields = ("id", "requested_at")
-    inlines = [IngestionFileInline, ValidationErrorInline]
+    inlines = [IngestionFileInline, ValidationErrorInline]      
 
 
 @admin.register(IngestionFile)
