@@ -9,6 +9,7 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 
+from . import services
 from .serializers import (
     LogoutSerializer,
     LoginSerializer,
@@ -24,6 +25,7 @@ class RegisterView(CreateAPIView):
     serializer_class = RegisterSerializer
 
     def create(self, request, *args, **kwargs):
+        # get_serializer() honours get_serializer_class() and passes context.
         serializer = RegisterSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
@@ -61,3 +63,17 @@ class MeView(APIView):
 
     def get(self, request):
         return Response(UserSerializer(request.user).data)
+
+
+class UserUsageView(APIView):
+    """The authenticated user's own activity summary.
+
+    An ``APIView`` rather than a generic view because the response is not a model
+    representation: it is an aggregate built by a service function, so there is
+    no queryset, serializer, or pagination to configure.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return Response(services.get_user_usage_statistics(request.user))

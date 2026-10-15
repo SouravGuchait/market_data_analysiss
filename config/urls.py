@@ -9,6 +9,10 @@ from django.urls import include, path
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("api/v1/auth/", include("apps.accounts.urls")),
+    path("api/v1/instruments/", include("apps.instruments.urls")),
+    path("api/v1/market-data/", include("apps.marketdata.urls")),
+    path("api/v1/ingestion/", include("apps.ingestion.urls")),
+    path("api/v1/analytics/", include("apps.analytics.urls")),
 ]
 
 if settings.DEBUG:
