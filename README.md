@@ -470,6 +470,13 @@ oversize upload is a `400` naming the `file` field, and no job is created.
 }
 ```
 
+This endpoint reads *stored* snapshots. The engine that computes the metrics
+(returns, moving averages, volatility, drawdown, volume summaries, rankings) is
+documented separately in [docs/market_analytics.md](docs/market_analytics.md):
+the formula behind each measure, how missing prices and zero denominators are
+handled, trading days versus calendar days, the SQL-window and Pandas
+implementations, and the hand-calculated samples its tests assert.
+
 **Usage statistics** — `GET /api/v1/auth/usage/`
 
 ```json
