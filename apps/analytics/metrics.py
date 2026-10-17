@@ -97,6 +97,38 @@ def format_decimal(value: Decimal | None) -> str | None:
     return None if value is None else format(value, "f")
 
 
+#: The quantum a *count* -- trading volume, a session's or a period's -- is rounded
+#: to: whole numbers, because a share count is not divisible in a report and the
+#: column is an integer. A third name for a third kind of quantity, and the one
+#: that would change first if fractional volume ever arrived.
+COUNT_EXPONENT = Decimal("1")
+COUNT_DECIMAL_PLACES = 0
+
+
+def quantize_count(value: Decimal) -> Decimal:
+    """Rounds a count to a whole number.
+
+    The single-session and summed volumes this is applied to are already whole, so
+    for them it is a normalisation: a driver returns a ``BIGINT`` as an ``int`` and
+    a ``SUM() OVER ()`` annotation as whatever the database felt like, and this
+    makes both render the same way. The one place it rounds is the **mean volume**,
+    which is a statistic about counts rather than a count -- see
+    :func:`summarize_volume` for what is reported alongside it so the fraction is
+    not lost.
+    """
+    return value.quantize(COUNT_EXPONENT, rounding=ROUND_HALF_UP)
+
+
+def format_count(value: Decimal | None) -> str | None:
+    """The engine's rendering of a count: fixed point, no decimal places.
+
+    ``format_decimal`` would render a session's 1,000 shares as
+    ``"1000.00000000"``, which says eight things about a number that has no
+    fractional part.
+    """
+    return None if value is None else format(value, "f")
+
+
 @dataclass(frozen=True)
 class ReturnPoint:
     """One observation, the return it produces, and the inputs to that return.
@@ -1095,4 +1127,200 @@ def summarize_extremes(
         traded_range=(
             None if highest_high is None or lowest_low is None else highest_high - lowest_low
         ),
+    )
+
+
+@dataclass(frozen=True)
+class VolumePoint:
+    """One session's volume, the total so far, and the volume relative to that.
+
+    ``relative_volume`` is the session's volume divided by the **mean of the
+    sessions in the range so far** -- 1 means "exactly typical of this range up to
+    and including today", above 1 means heavier than typical. It is a trailing
+    ratio by construction, like every window in this engine: a value dated ``t``
+    uses no session after ``t``. See :func:`volume_series` for why it is not
+    measured against the whole range's mean.
+    """
+
+    trading_date: date
+    volume: Decimal
+    cumulative_volume: Decimal
+    relative_volume: Decimal | None
+
+
+@dataclass(frozen=True)
+class VolumeSummary:
+    """What a period's volume came to, and how the sessions were spread.
+
+    ``average_volume`` is per **observation** -- per trading session -- and it is
+    reported next to ``observations`` and ``total_volume`` precisely so a reader can
+    see that, and can divide the total by a different denominator if they want a
+    per-calendar-day figure. It is quantized as a count, so it is a whole number; the
+    exact mean is ``total_volume / observations``, both of which are here, and the
+    classification counts below use that exact quotient rather than the rounded one.
+    """
+
+    total_volume: Decimal | None = None
+    average_volume: Decimal | None = None
+    observations: int = 0
+    highest_volume: Decimal | None = None
+    highest_volume_date: date | None = None
+    lowest_volume: Decimal | None = None
+    lowest_volume_date: date | None = None
+    sessions_above_average: int = 0
+    sessions_at_average: int = 0
+    sessions_below_average: int = 0
+    zero_volume_sessions: int = 0
+
+
+def volume_series(
+    dates: Sequence[date],
+    volumes: Sequence[Decimal],
+    *,
+    cumulative: Sequence[Decimal] | None = None,
+) -> list[VolumePoint]:
+    """The running volume total and the volume relative to the mean so far.
+
+    Definitions, with ``n`` the number of sessions up to and including ``t``::
+
+        cumulative_volume(t) = sum(volume(s) for s in range, s <= t)
+        mean_so_far(t)       = cumulative_volume(t) / n
+        relative_volume(t)   = volume(t) / mean_so_far(t)
+
+    **The anchor is inside the range**, as it is for the cumulative return, the
+    drawdown and the extremes: the running total starts at the first requested
+    session, ``padding`` is ``0``, and a caller who wants a total that includes
+    earlier sessions asks for a range that starts earlier. No warm-up row is read.
+
+    **The ratio is against the mean *so far*, not the range's mean.** The range's
+    mean is only known at the end, so using it would put a value into a row dated
+    ``t`` that could not have been computed on ``t`` -- the same look-ahead the
+    moving average avoids by being trailing. A reader who wants the end-of-period
+    view has :func:`summarize_volume`, which is a statement about the whole range
+    and may use the whole range's mean; a *point* may not.
+
+    **A zero denominator is ``None``, not ``0`` and not ``inf``.** While nothing has
+    traded the mean so far is ``0``, and ``volume / 0`` is not a ratio; those points
+    have ``relative_volume = None`` and the result counts them as undefined. The
+    running total is still exact and still reported, so the information is not lost.
+
+    ``cumulative`` lets the database supply the running total (the ``sql`` backend)
+    instead of adding it up here. The mean and the ratio are derived from whatever
+    total is used, so a supplied total flows through the same arithmetic.
+    """
+    if len(dates) != len(volumes):
+        raise ValueError("dates and volumes must be the same length")
+    if cumulative is not None and len(cumulative) != len(volumes):
+        raise ValueError("cumulative and volumes must be the same length")
+
+    points: list[VolumePoint] = []
+    running_total = Decimal(0)
+
+    for index, (trading_date, volume) in enumerate(zip(dates, volumes)):
+        volume = quantize_count(Decimal(volume))
+
+        running_total = (
+            quantize_count(Decimal(cumulative[index]))
+            if cumulative is not None
+            else running_total + volume
+        )
+        observations = index + 1
+
+        # volume * observations / total, not volume / (total / observations): the
+        # numerator and denominator are exact counts, so this is one rounding of an
+        # exact quotient rather than a ratio of a rounded mean.
+        relative = (
+            None
+            if running_total == 0
+            else quantize_ratio(volume * observations / running_total)
+        )
+
+        points.append(
+            VolumePoint(
+                trading_date=trading_date,
+                volume=volume,
+                cumulative_volume=running_total,
+                relative_volume=relative,
+            )
+        )
+    return points
+
+
+def volume_series_pandas(
+    dates: Sequence[date],
+    volumes: Sequence[Decimal],
+) -> list[VolumePoint]:
+    """The same series, with the running total taken by ``Series.cumsum()``.
+
+    ``int64`` rather than ``float64`` on purpose: a share count is an integer, and
+    integer cumsum is exact where a float one silently drops the low bits once the
+    total passes 2**53 (~9.0e15 shares). The int64 total is exact to 2**63, which is
+    the widest a ``BIGINT`` column can be, so the only way for this reference to
+    disagree with the other two is a period total above ~9.2e18 shares -- at which
+    point the sum, not the engine, is the thing to look at.
+    """
+    import pandas as pd
+
+    if len(dates) != len(volumes):
+        raise ValueError("dates and volumes must be the same length")
+
+    totals = pd.Series([int(value) for value in volumes], dtype="int64").cumsum()
+    return volume_series(
+        dates, volumes, cumulative=[Decimal(int(total)) for total in totals]
+    )
+
+
+def summarize_volume(points: Sequence[VolumePoint]) -> VolumeSummary:
+    """The period's volume, its extremes, and how the sessions were spread.
+
+    Derived from the points rather than computed beside them, so every backend
+    reports the same summary by construction.
+
+    **The classification uses the exact mean, not the reported one.** A session is
+    above average when ``volume * observations > total`` -- integer arithmetic on
+    the two exact counts, which is the same statement as ``volume > total /
+    observations`` with no division and no rounding. It matters: volumes 2 and 3
+    have an exact mean of 2.5 which rounds to 3 as a count, and comparing against
+    the rounded 3 would call the 3-based session "exactly average" when it is in
+    fact above. The three counts always add up to ``observations``, which a test
+    pins.
+
+    ``zero_volume_sessions`` counts rows whose volume is ``0``. They are kept as
+    observations -- a session that traded nothing is a session that traded nothing,
+    and dropping the row would change the denominator and flatter the mean -- but
+    they are worth a number of their own, because a run of them usually means a
+    halt or a gap rather than a quiet market.
+    """
+    if not points:
+        return VolumeSummary()
+
+    total = points[-1].cumulative_volume
+    observations = len(points)
+
+    highest_volume, highest_volume_date = _first_extreme(
+        [point.trading_date for point in points],
+        [point.volume for point in points],
+        largest=True,
+    )
+    lowest_volume, lowest_volume_date = _first_extreme(
+        [point.trading_date for point in points],
+        [point.volume for point in points],
+        largest=False,
+    )
+
+    above = sum(1 for point in points if point.volume * observations > total)
+    below = sum(1 for point in points if point.volume * observations < total)
+
+    return VolumeSummary(
+        total_volume=total,
+        average_volume=quantize_count(total / observations),
+        observations=observations,
+        highest_volume=highest_volume,
+        highest_volume_date=highest_volume_date,
+        lowest_volume=lowest_volume,
+        lowest_volume_date=lowest_volume_date,
+        sessions_above_average=above,
+        sessions_at_average=observations - above - below,
+        sessions_below_average=below,
+        zero_volume_sessions=sum(1 for point in points if point.volume == 0),
     )

@@ -24,6 +24,8 @@ from .metrics import (
     MovingAveragePoint,
     ReturnPoint,
     VolatilityPoint,
+    VolumePoint,
+    VolumeSummary,
     cumulative_returns,
     cumulative_returns_pandas,
     daily_returns,
@@ -38,6 +40,9 @@ from .metrics import (
     rolling_volatility_pandas,
     summarize_drawdown,
     summarize_extremes,
+    summarize_volume,
+    volume_series,
+    volume_series_pandas,
 )
 from .models import AnalyticSnapshot
 from .series import load_price_series
@@ -137,12 +142,17 @@ def get_latest_snapshot(instrument, metric_type, *, lookback_days=None):
 #: Price extremes are the same case with two directions: a running maximum and a
 #: running minimum are each a single frame over the closes, so both can be had in
 #: the one query.
+#:
+#: Volume summaries are the same case again, one shape further out: a running sum
+#: is a single frame over the ``volume`` column, so the database can carry the
+#: total and Python only derives the ratio and the period figures.
 DAILY_RETURN_BACKENDS = ("sql", "python", "pandas")
 CUMULATIVE_RETURN_BACKENDS = ("python", "pandas")
 MOVING_AVERAGE_BACKENDS = ("sql", "python", "pandas")
 VOLATILITY_BACKENDS = ("sql", "python", "pandas")
 DRAWDOWN_BACKENDS = ("sql", "python", "pandas")
 EXTREME_BACKENDS = ("sql", "python", "pandas")
+VOLUME_BACKENDS = ("sql", "python", "pandas")
 
 
 @dataclass(frozen=True)
@@ -256,6 +266,30 @@ class PriceExtremes(MetricResult):
         afterthought.
         """
         return 0
+
+
+@dataclass(frozen=True)
+class VolumeSummaries(MetricResult):
+    """One volume answer: the running total per session, and the period's figures.
+
+    ``summary`` holds the period totals and spread; ``points`` hold the running
+    total and the relative volume, whose last cumulative is the summary's
+    ``total_volume``.
+    """
+
+    summary: VolumeSummary = field(default_factory=VolumeSummary)
+    points: list[VolumePoint] = field(default_factory=list)
+
+    @property
+    def undefined(self) -> int:
+        """Points with no relative volume: a prefix in which nothing had traded.
+
+        ``relative_volume`` is ``None`` while the running total is ``0``, because
+        ``volume / 0`` is not a ratio. It is usually the first point only -- and only
+        when the range opens on a zero-volume session -- so this counts a real,
+        explainable hole rather than a rounding artefact.
+        """
+        return sum(1 for point in self.points if point.relative_volume is None)
 
 
 def _reject_backend(backend: str, allowed: Sequence[str]) -> None:
@@ -602,5 +636,64 @@ def price_extremes_for_instrument(
         end_date=end_date,
         padding=series.padding,
         summary=summary,
+        points=points[series.padding :],
+    )
+
+
+def volume_summaries_for_instrument(
+    instrument,
+    *,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    backend: str = "sql",
+) -> VolumeSummaries:
+    """Volume for one instrument's range: the running total, and the period's.
+
+    The period figures answer the questions a volume report is made of — how much
+    traded, what a typical session looked like, which sessions were heaviest and
+    lightest, and how the sessions were spread around the average — and the points
+    make them checkable session by session.
+
+    The anchors are inside the range, as they are for the cumulative return, the
+    drawdown and the extremes: the running total starts at the first requested
+    session and ``padding`` is ``0``. A caller who wants a total that includes
+    earlier sessions asks for a range that starts earlier; a running total that
+    reached back arbitrarily far would be an unbounded read, which is the same
+    reason the all-time peak is not offered.
+
+    The ``sql`` backend gets the running total from
+    ``SUM(volume) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)`` — a
+    single frame over a column the row already carries — and derives the mean and
+    the ratio here. This is the third metric whose SQL form is one legal window,
+    and the reason it has one is the reason volatility does not: the window is over
+    the *volume*, not over another window's output.
+    """
+    _reject_backend(backend, VOLUME_BACKENDS)
+
+    series = load_price_series(
+        instrument,
+        start_date=start_date,
+        end_date=end_date,
+        fields=("volume",),
+        with_running_total=backend == "sql",
+    )
+    volumes = series.column("volume")
+
+    if backend == "sql":
+        points = volume_series(
+            series.dates, volumes, cumulative=series.column("running_total")
+        )
+    elif backend == "pandas":
+        points = volume_series_pandas(series.dates, volumes)
+    else:
+        points = volume_series(series.dates, volumes)
+
+    return VolumeSummaries(
+        symbol=series.symbol,
+        backend=backend,
+        start_date=start_date,
+        end_date=end_date,
+        padding=series.padding,
+        summary=summarize_volume(points),
         points=points[series.padding :],
     )

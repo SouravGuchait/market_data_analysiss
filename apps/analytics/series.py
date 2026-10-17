@@ -39,6 +39,7 @@ from django.db.models import (
     Q,
     RowRange,
     Subquery,
+    Sum,
     Window,
 )
 from django.db.models.functions import Coalesce, Lag
@@ -208,6 +209,7 @@ def load_price_series(
     moving_average_window: int | None = None,
     with_running_max: bool = False,
     with_running_extremes: bool = False,
+    with_running_total: bool = False,
 ) -> PriceSeries:
     """Reads one instrument's prices as an ordered, gap-tolerant series.
 
@@ -244,6 +246,12 @@ def load_price_series(
         Add both ``running_max`` and ``running_min`` over the same frame: the
         highest and lowest close so far, for the price-extremes metric. Two single
         windows, so still one query.
+    with_running_total
+        Add ``SUM(volume) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT
+        ROW)`` as a ``running_total`` column: the volume traded in the range so
+        far. Needs only the ``volume`` column, which the caller asks for through
+        ``fields``; the window sums a column the row already carries rather than a
+        second read of it.
 
     The window columns are parameters of *this* function rather than SQL handed in
     by a caller, because a window and the padding that makes it correct are one
@@ -321,6 +329,17 @@ def load_price_series(
         )
         window_columns["running_min"] = Window(
             expression=Min("close", output_field=PRICE_FIELD),
+            partition_by=[F("instrument_id")],
+            order_by=F("trading_date").asc(),
+            frame=RowRange(start=None, end=0),
+        )
+    if with_running_total:
+        # The third shape of frame over the same rows: a running sum rather than a
+        # running extreme. Note there is no ``output_field``: the sum of a BIGINT is
+        # a BIGINT, and telling Django it is a DECIMAL(18,8) would invite it to
+        # convert a count as if it were money.
+        window_columns["running_total"] = Window(
+            expression=Sum("volume"),
             partition_by=[F("instrument_id")],
             order_by=F("trading_date").asc(),
             frame=RowRange(start=None, end=0),

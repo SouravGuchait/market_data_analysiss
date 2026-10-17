@@ -346,6 +346,82 @@ def check_extremes(instrument, mid, end):
     print("  the engine's four extremes equal the database's four aggregates")
 
 
+def check_volume(instrument, mid, end):
+    print("\n-- volume summaries --")
+
+    def request(backend="sql"):
+        return services.volume_summaries_for_instrument(
+            instrument, start_date=mid, end_date=end, backend=backend
+        )
+
+    print(explain(captured_sql(request)))
+
+    reference = request("python")
+    for backend in services.VOLUME_BACKENDS:
+        result = request(backend)
+        assert result.points == reference.points, (
+            f"{backend} disagrees on the running totals"
+        )
+        assert result.summary == reference.summary, f"{backend} disagrees on the summary"
+
+    summary = reference.summary
+    print(
+        f"  {len(reference.points)} points, padding={reference.padding}, "
+        f"undefined={reference.undefined}"
+    )
+    print(
+        f"  total {summary.total_volume}, average {summary.average_volume} per session, "
+        f"{summary.observations} sessions"
+    )
+    print(
+        f"  heaviest {summary.highest_volume} on {summary.highest_volume_date}, "
+        f"lightest {summary.lowest_volume} on {summary.lowest_volume_date}"
+    )
+    print(
+        f"  above {summary.sessions_above_average}, at {summary.sessions_at_average}, "
+        f"below {summary.sessions_below_average}, "
+        f"zero-volume sessions {summary.zero_volume_sessions}"
+    )
+    print("  one request: 1 query (asserted above)")
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT SUM(volume), AVG(volume), MAX(volume), MIN(volume), COUNT(*) "
+            "FROM marketdata_pricerecord "
+            f"WHERE instrument_id = {instrument.pk} "
+            f"AND trading_date BETWEEN '{mid}' AND '{end}'"
+        )
+        db_total, db_average, db_heaviest, db_lightest, db_sessions = cursor.fetchone()
+
+    print(
+        f"  MySQL: SUM={db_total} AVG={db_average} MAX={db_heaviest} "
+        f"MIN={db_lightest} COUNT={db_sessions}"
+    )
+    assert Decimal(db_total) == summary.total_volume
+    assert Decimal(db_heaviest) == summary.highest_volume
+    assert Decimal(db_lightest) == summary.lowest_volume
+    assert db_sessions == summary.observations
+    # The engine rounds the exact quotient to a count; MySQL's AVG is already a
+    # decimal, so the two can differ by the last place of a rounding. The exact
+    # figures (SUM and COUNT) are asserted above.
+    assert abs(Decimal(db_average) - summary.average_volume) <= 1, (
+        "the engine's average is not the database's"
+    )
+    print("  the engine's total, extremes and session count are the database's")
+
+    # Trading days versus calendar days, on the same total: the paragraph in the
+    # documentation, computed rather than asserted.
+    span = (end - mid).days + 1
+    per_calendar_day = Decimal(db_total) / span
+    line = (
+        f"  {summary.observations} sessions span {span} calendar days: "
+        f"per session {summary.average_volume}, per calendar day {per_calendar_day:.0f}"
+    )
+    if summary.average_volume:
+        line += f" ({(1 - per_calendar_day / summary.average_volume) * 100:.0f}% lower)"
+    print(line)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--instrument-id", type=int, default=None)
@@ -408,6 +484,7 @@ def main() -> int:
     check_cumulative(instrument)
     check_drawdown(instrument, mid, end)
     check_extremes(instrument, mid, end)
+    check_volume(instrument, mid, end)
 
     print(f"\nOK (window {mid} .. {end})")
     return 0

@@ -348,6 +348,58 @@ class LoaderTests(TestCase):
             (Decimal("102"), Decimal("101"), Decimal("101"), Decimal("101")),
         )
 
+    def test_the_running_total_is_the_volume_of_the_range_so_far(self):
+        series = load_price_series(
+            self.aapl,
+            start_date=DAY1,
+            end_date=DAY5,
+            fields=("volume",),
+            with_running_total=True,
+        )
+
+        # The sample instrument trades 1000 every session.
+        self.assertEqual(series.column("volume"), (Decimal(1000),) * 5)
+        self.assertEqual(
+            series.column("running_total"),
+            (
+                Decimal(1000),
+                Decimal(2000),
+                Decimal(3000),
+                Decimal(4000),
+                Decimal(5000),
+            ),
+        )
+
+    def test_the_running_total_starts_at_the_ranges_first_row(self):
+        """A total that reached back before ``start_date`` would be an unbounded
+        read, which is why the frame is bounded by the rows returned."""
+        series = load_price_series(
+            self.aapl,
+            start_date=DAY3,
+            end_date=DAY5,
+            fields=("volume",),
+            with_running_total=True,
+        )
+
+        self.assertEqual(
+            series.column("running_total"),
+            (Decimal(1000), Decimal(2000), Decimal(3000)),
+        )
+
+    def test_a_running_total_is_one_query_and_can_share_the_read_with_a_window(self):
+        with self.assertNumQueries(1):
+            series = load_price_series(
+                self.aapl,
+                start_date=DAY1,
+                end_date=DAY5,
+                fields=("volume",),
+                moving_average_window=2,
+                with_running_total=True,
+            )
+
+        self.assertEqual(series.column("moving_average")[1], Decimal("101"))
+        self.assertEqual(series.column("running_total")[1], Decimal("2000"))
+
     # ----------------------------------------------------------------- #
     # Arguments
     # ----------------------------------------------------------------- #

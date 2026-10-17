@@ -24,8 +24,8 @@ its edge-case policy, and its trade-offs written down before the next one starts
 | 4 | Rolling volatility | implemented |
 | 5 | Maximum drawdown | implemented |
 | 6 | Highest and lowest prices | implemented |
-| 7 | Trading-volume summaries | next |
-| 8 | Percentage change over a selected period | planned |
+| 7 | Trading-volume summaries | implemented |
+| 8 | Percentage change over a selected period | next |
 | 9 | Rankings by return and trading volume | planned |
 
 ## Where the code is
@@ -57,6 +57,18 @@ tick. Rounding away from zero is symmetric, so a gain and an equal loss round to
 the same magnitude, and it is what a reader of a reported percentage expects
 (Python's default banker's rounding would take `0.000000025` down to
 `0.00000002`; see `test_rounding_is_half_up_away_from_zero_not_bankers`).
+
+**Counts are `Decimal`, quantized to whole numbers.** Trading volume is a share
+count, not a price and not a ratio: the column is a `BIGINT`, and a count is not
+divisible in a report. The single-session and summed volumes are whole by
+construction, so for them the quantizer is a normalisation — a driver returns a
+`BIGINT` as an `int` and a `SUM() OVER ()` annotation as whatever the engine felt
+like, and one normalisation makes both render alike. The one place it rounds is the
+**mean** volume, which is a statistic *about* counts rather than a count; the exact
+figures it came from (`total_volume` and `observations`) are reported beside it so
+nothing is lost, and the summary's classification uses the exact quotient rather
+than the rounded one. Three quantizers for three kinds of quantity, named so that a
+schema change to one does not silently move the others.
 
 **Undefined is `None`, never `0` and never `inf`.** "No value" is a real answer
 here — the first day of a series genuinely has no return — and `0` would be a
@@ -109,6 +121,7 @@ and leaving the off-by-one to be discovered:
 | Cumulative returns | — (anchored at the range start) | 1 close | — |
 | Maximum drawdown | — (running maximum from the range start) | 1 close | — |
 | Price extremes | — (running extremes from the range start) | 1 close | — |
+| Volume summaries | — (running total from the range start) | 1 volume | — |
 
 Both columns are right. "20-day volatility" really is the standard deviation of
 twenty daily returns, and "20-day average" really is the mean of twenty closes;
@@ -120,8 +133,8 @@ after `t` — and all of them count **observations**, not calendar days, so a
 holiday does not shorten a window and a gap does not become one of its members.
 `pad` is `window - 1` for a moving average, `window` for a volatility (which
 needs one more close than return), and `1` for a daily return. It is `0` for
-cumulative returns, maximum drawdown and price extremes — the three metrics whose
-anchor is inside the range: see their sections.
+cumulative returns, maximum drawdown, price extremes and volume summaries — the
+four metrics whose anchor is inside the range: see their sections.
 
 ### Backends
 
@@ -136,8 +149,9 @@ the same points, asserted row for row:
 | Cumulative returns | — | direct ratio | direct ratio, vectorised |
 | Maximum drawdown | running maximum from `MAX(close) OVER (...)`, ratio in Python | running maximum scan | `Series.cummax()` |
 | Price extremes | running maximum and minimum from `MAX(close)`/`MIN(close) OVER (...)` | running scan in both directions | `Series.cummax()`/`cummin()` |
+| Volume summaries | running total from `SUM(volume) OVER (...)`, ratio in Python | running sum | `Series.cumsum()` (`int64`) |
 
-Two of the six have no `sql` member, and both for the same reason: **a metric
+Two of the seven have no `sql` member, and both for the same reason: **a metric
 whose window must be computed from *windowed values* cannot be expressed in one
 SQL query**, because a window function may not appear inside another window
 function's arguments. Cumulative returns need a *product* (no dialect has a
@@ -148,12 +162,12 @@ which are themselves `LAG`s. MySQL states the second one outright:
 OperationalError: (3593, "You cannot use the window function 'lag' in this context.'")
 ```
 
-Maximum drawdown and price extremes are the test of that rule rather than an
-exception to it: their windows are over the *closes* — one legal frame, or two of
-them — so the database can carry the whole scan, and only the arithmetic on top of
-it is computed in Python. Asking for two levels is what fails, which is why the
-verification script writes the drawdown as a derived table to get a
-database-computed cross-check:
+Maximum drawdown, price extremes and volume summaries are the test of that rule
+rather than an exception to it: each of their windows is over a column the row
+already carries — one frame, or two of them — so the database can carry the whole
+scan, and only the arithmetic on top of it is computed in Python. Asking for two
+levels is what fails, which is why the verification script writes the drawdown as a
+derived table to get a database-computed cross-check:
 
 ```
 OperationalError: (3593, "You cannot use the window function 'max' in this context.'")
@@ -182,6 +196,7 @@ the analytics API is read-only (`ListAPIView`).
 |---|---|---|
 | **Missing price** (a session with no row) | Not an observation. Windows close over the gap and span it. Returned rows are the observations only. | A gap is an absence of data, not a price of zero; inserting a zero would invent a 100% loss. `missing_trading_dates()` reports gaps separately for anyone auditing the data. |
 | **Zero previous close** | The return is `None`. No exception, no `inf`. | The table permits a zero close (it constrains `high >= low` and `volume >= 0`, not the price), so this is reachable production data. Division by zero has no value, and reporting `0` or a very large number would both be wrong. |
+| **Zero mean volume** (nothing has traded yet in the range) | `relative_volume` is `None` while the running total is `0`; the running total and the session volume are still exact and still reported. | `volume / 0` is not a ratio. Same rule as a zero previous close: report no value rather than `0` (typical of nothing?) or `inf`. |
 | **Duplicate dates** | Rejected. `PriceSeries.assert_one_row_per_date()` raises rather than deduplicating. In the table it cannot happen: `uniq_price_instrument_trading_date` is unique, and re-ingestion upserts on it (the corrected price replaces the old row). | Deduplication would have to choose which of two contradictory closes for one day is real. Either choice fabricates a price; fixing the source is the only correct response. |
 | **Insufficient history** | `None`, never a partial window. Nine observations cannot produce a ten-day measure. | A "7-day average" of three days is a different statistic wearing the same name. A short series returns `None` for the early rows and a value as soon as the window is full. |
 | **No history at all** | An empty series, one query, no error. | A newly listed instrument is a normal state, not a failure. |
@@ -1045,6 +1060,193 @@ a docstring saying why, rather than being inherited and raising: a point here ca
 be missing a value, because every row has a close. The traded pair can be `None`,
 but only when there is no range at all, in which case there are no points to count.
 
+## Metric 7 — trading-volume summaries
+
+### Business meaning
+
+How much changed hands, and whether that is normal. A price move on heavy volume is
+a different event from the same move on light volume: volume is the participation
+behind a price, and the questions a report is actually made of are — how much traded
+over the period, what a typical session looked like, which sessions were heaviest and
+lightest, and whether volume was running above or below its own average. It is also
+the denominator of every liquidity question, and the thing a halt or a data gap is
+most likely to show up in.
+
+### Formula
+
+With ``n`` sessions up to and including ``t``, and ``v`` the session's volume:
+
+```
+cumulative_volume(t) = sum(volume(s) for s in range, s <= t)
+mean_so_far(t)       = cumulative_volume(t) / n
+relative_volume(t)   = volume(t) / mean_so_far(t)
+```
+
+and over the whole range:
+
+```
+total_volume      = cumulative_volume(last)
+average_volume    = total_volume / observations
+highest_volume    = max(volume(s))          lowest_volume = min(volume(s))
+```
+
+with the count of sessions above, exactly at, and below the average, using the
+**exact** mean: a session is above average when ``volume x n > total``, which is the
+same statement as ``volume > total / n`` with no division and no rounding.
+
+### The ratio is against the mean *so far*, not the period's mean
+
+This is the metric's one real design decision, and it is the same rule every other
+window in the engine follows: **a value dated ``t`` may not use a session after
+``t``**. The period's mean is only known once the period is over, so a relative
+volume computed against it would put a number in the first session's row that could
+not have been computed on that day. Four typical sessions and one heavy one show the
+difference concretely:
+
+| Session | Volume | Mean so far | `relative_volume` | Against the period's mean (180) |
+|---|---|---|---|---|
+| 1 | 100 | 100 | `1.00000000` | `0.55555556` |
+| 2 | 100 | 100 | `1.00000000` | `0.55555556` |
+| 3 | 100 | 100 | `1.00000000` | `0.55555556` |
+| 4 | 100 | 100 | `1.00000000` | `0.55555556` |
+| 5 | 500 | 180 | `2.77777778` | `2.77777778` |
+
+Only the last row can be computed both ways; the first four can only be the `1` of
+"exactly typical of this range so far". A reader who wants the end-of-period view
+has the **summary**, which is a statement about the whole range and may use the whole
+range's mean — the same division of labour as the drawdown's per-date decline
+against its summary episode.
+
+### Intermediate calculations
+
+Five sessions of 100, 300, 200, 0, 400 shares:
+
+| Trading day | Volume | Total so far | `n` | Mean so far | `relative_volume` |
+|---|---|---|---|---|---|
+| 2024-03-11 | 100 | 100 | 1 | 100 | `1.00000000` |
+| 2024-03-12 | 300 | 400 | 2 | 200 | `1.50000000` |
+| 2024-03-13 | 200 | 600 | 3 | 200 | `1.00000000` |
+| 2024-03-14 | **0** | 600 | 4 | 150 | `0.00000000` |
+| 2024-03-15 | 400 | 1000 | 5 | 200 | `2.00000000` |
+
+and the period's summary, every figure checkable against the column above:
+
+| Quantity | Value | Check |
+|---|---|---|
+| `total_volume` | `1000` | the last running total |
+| `observations` | `5` | one per session |
+| `average_volume` | `200` | `1000 / 5` |
+| `highest_volume` | `400` on 2024-03-15 | the largest volume, first date on a tie |
+| `lowest_volume` | `0` on 2024-03-14 | the zero-volume session |
+| `sessions_above_average` | `2` | 300 and 400 (`v x 5 > 1000`) |
+| `sessions_at_average` | `1` | 200 (`200 x 5 == 1000` exactly) |
+| `sessions_below_average` | `2` | 100 and 0 |
+| `zero_volume_sessions` | `1` | 2024-03-14 |
+
+The three classification counts always add up to `observations`, which a test pins
+across several datasets.
+
+### Why the classification does not use the reported average
+
+Volumes 2 and 3, `n = 2`:
+
+| Session | Volume | `v x n` | vs `total = 5` | Classification |
+|---|---|---|---|---|
+| 1 | 2 | 4 | `4 < 5` | below |
+| 2 | 3 | 6 | `6 > 5` | **above** |
+
+The exact mean is `2.5`, which the count quantizer reports as `3` (half up). Comparing
+against the *reported* `3` would call the three-share session "exactly average" — it
+is not; `3 > 2.5`. Multiplying the two exact integers instead of dividing is both
+exact and reproducible from the payload, which this test pins as
+`test_the_classification_uses_the_exact_mean_not_the_rounded_one`.
+
+### Trading days versus calendar days
+
+`average_volume` is per **observation** — per trading session. On the benchmark range
+2024-02-01 … 2024-03-14 the difference is not subtle:
+
+```
+31 sessions span 43 calendar days: per session 2356781, per calendar day 1699075 (28% lower)
+```
+
+Dividing the total by 43 would report an "average" that is 28% below anything the
+market did, because 12 of those days were weekends and holidays on which nothing
+traded. `observations` and `total_volume` are both in the response, so a reader who
+wants a per-calendar-day figure can compute it deliberately rather than receive it
+by accident. The same distinction is why every window in this engine counts
+observations (see the window-units table above), and why a *gap* — a session with no
+row — is not an observation at all.
+
+### Edge cases with a policy, not an accident
+
+| Situation | Behaviour | Why |
+|---|---|---|
+| A zero-volume session | Kept as an observation; `relative_volume` is `0`, and it is counted in `zero_volume_sessions` | It is a session that traded nothing — real information. Dropping the row would change the denominator and flatter the mean (2 sessions of 0 and 10 average 5, not 10). |
+| Nothing has traded *yet* | `relative_volume` is `None` while the running total is `0` | `volume / 0` is not a ratio, and `0` would claim the session was typical of a mean that does not exist. The running total is still exact and still reported, and the result counts these points as `undefined`. |
+| A constant-volume series | Exactly at its own average on every session: above `0`, at `n`, below `0` | `v x n == total` for every session, which is a true statement rather than a degenerate case. |
+| A tie for heaviest or lightest | The **first** session that reached it | Consistent with every other dated extreme in the engine. |
+| An empty range | No points, every field `None` except the counts, which are `0` | There is no volume of nothing. |
+| `volume` fractional in a future schema | `quantize_count` is the one place that changes | The column's comment already anticipates fractional-volume assets; the name exists so that change is local. |
+
+### What the database does
+
+A running total is a scan, and a scan is a window the database already has:
+
+```sql
+SUM(volume) OVER (PARTITION BY instrument_id ORDER BY trading_date
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total
+```
+
+`EXPLAIN FORMAT=TREE` against MySQL, over a request bounded to 2024-02-01 …
+2024-03-14:
+
+```
+-> Sort: marketdata_pricerecord.trading_date
+    -> Table scan on <temporary>
+        -> Temporary table
+            -> Window aggregate: sum(marketdata_pricerecord.volume) OVER (
+                 PARTITION BY instrument_id ORDER BY trading_date
+                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                -> Sort: instrument_id, trading_date
+                    -> Index range scan ... over (instrument_id = 13 AND
+                         '2024-02-01' <= trading_date <= '2024-03-14')
+```
+
+One buffered stage — fewer than the extremes, which needs two — and the range scan
+starts at the requested date: no offset subquery, and no warm-up row for a metric
+whose anchor is inside the range.
+
+The summary is checked against the database's own aggregates, which are exact:
+
+```
+MySQL: SUM=73060222 AVG=2356781.3548 MAX=4697728 MIN=61475 COUNT=31
+total 73060222, average 2356781 per session, 31 sessions
+heaviest 4697728 on 2024-03-07, lightest 61475 on 2024-02-14
+above 17, at 0, below 14, zero-volume sessions 0
+```
+
+`SUM`, `MAX`, `MIN` and `COUNT` are asserted equal. `AVG` is *not* asserted equal to
+the last place, and deliberately: MySQL returns `2356781.3548` and the engine rounds
+its own exact quotient to the count `2356781`, so the two can differ in the final
+place of a rounding. The exact figures the mean is derived from are the ones asserted,
+which is the point of reporting them.
+
+### Snapshots, and recalculating after new data
+
+This metric is **computed on demand**, like every other per-instrument series: the
+answer depends on the requested range, and the rows are already in memory. It is not
+a cross-sectional figure, which is what the snapshot grain is for.
+
+If a period total were stored, the recalculation rule is the one the existing
+snapshot model already imposes and no more: the read is a pure function of
+`PriceRecord` rows in a bounded range, so re-running it after new prices arrive
+produces the same numbers for the same range and different numbers only for a range
+that now contains the new sessions — no incremental state, no accumulation, and no
+"recalculate *everything*" step. The upsert key
+(`instrument, as_of_date, metric_type, lookback_days`) would make the rewrite
+idempotent if the job existed. It does not yet; see *Deliberately not done yet*.
+
 ## Backend timings, measured
 
 Median of 25 warm calls per cell against MySQL, on the benchmark instrument: 500
@@ -1057,6 +1259,7 @@ machine load, so read the ordering and the gaps rather than the digits.
 | Cumulative returns | **0.67 ms** | — | 1.24 ms |
 | Maximum drawdown | **0.66 ms** | 1.18 ms | 0.85 ms |
 | Price extremes | **0.76 ms** | 1.48 ms | 0.90 ms |
+| Volume summaries | **0.72 ms** | 1.31 ms | 0.88 ms |
 | Daily returns | **1.52 ms** | 2.22 ms | 2.22 ms |
 | Moving average, window 30 | **1.52 ms** | 2.19 ms | 2.95 ms |
 | Rolling volatility, window 30 | **3.25 ms** | 3.34 ms | 3.96 ms |
@@ -1093,8 +1296,15 @@ What the table says, honestly:
   0.76 ms, roughly double) because it asks *two* questions of the same frame: MySQL
   materialises the running minimum over the temporary table of the running maximum,
   so the row pays two buffered stages rather than one. The Python scan answers both
-  in a single pass. It is also the only metric that reads columns other than
-  `close`, so its query carries `high` and `low` as well.
+  in a single pass. It is one of the two metrics that read columns other than
+  `close`, and the only one that reads two of them (`high` and `low`).
+* **Volume summaries is the cheapest `sql` row after the drawdown** (1.31 ms against
+  Python's 0.72 ms) and needs **one** buffered stage rather than the extremes' two,
+  because it asks one question of the frame — a running sum — rather than two
+  extremes. It is the other metric that reads a column other than `close` (`volume`),
+  and the window sums that same column rather than adding a read. Its `pandas` cost
+  is close to Python's (0.88 ms) because `cumsum` is a single vectorised pass, with
+  no second allocation.
 * **`pandas` is the slowest per instrument and that is not its use case.** Its cost
   is Series construction and the vectorised call over 500 rows; the same call over
   fifty instruments in one frame amortises both to nothing, which is what the
@@ -1106,7 +1316,7 @@ What the table says, honestly:
 
 | Growth | Effect | Why |
 |---|---|---|
-| More rows per instrument (longer history) | The loader's range scan is bounded by the requested range, not the instrument's life: `pad + observations in range`. A 20-year history costs the same per request as a 1-year one. | The bounds are pushed into `WHERE`, which uses `uniq_price_instrument_trading_date`. Warm-up padding adds `pad` rows — 1 for a daily return, `window - 1` for a moving average, `window` for a volatility, and 0 for cumulative returns, maximum drawdown and price extremes, whose anchors are inside the range — a constant per request, independent of how much history exists. |
+| More rows per instrument (longer history) | The loader's range scan is bounded by the requested range, not the instrument's life: `pad + observations in range`. A 20-year history costs the same per request as a 1-year one. | The bounds are pushed into `WHERE`, which uses `uniq_price_instrument_trading_date`. Warm-up padding adds `pad` rows — 1 for a daily return, `window - 1` for a moving average, `window` for a volatility, and 0 for cumulative returns, maximum drawdown, price extremes and volume summaries, whose anchors are inside the range — a constant per request, independent of how much history exists. |
 | More instruments | Per-request cost is unchanged: one instrument, one query. Ranking across instruments is the case that changes the answer — it must not become one query per instrument. | Pending: the rankings metric will read the cross-section in one frame and group by instrument, which is what the `pandas` backend is for. |
 | More metrics on the same series | Free if they share the loader call. Each additional metric over the same rows adds arithmetic, not queries. | The loader is the only thing that reads, and it returns every column a metric asked for. |
 | More concurrent readers | Linear in requests, with no shared mutable state in the engine. | The engine writes nothing. The API's response cache (see [api_optimisation.md](api_optimisation.md)) covers the snapshot reads, not the computed series, which depends on the requested range. |
@@ -1114,7 +1324,7 @@ What the table says, honestly:
 
 ## Tests
 
-`apps/analytics/tests/test_series.py` — the read boundary, 31 tests:
+`apps/analytics/tests/test_series.py` — the read boundary, 34 tests:
 
 * the whole series in exactly one query, in date order (query count pinned);
 * only the requested columns are selected — `source`, `ingestion_job_id`,
@@ -1126,7 +1336,9 @@ What the table says, honestly:
 * the window columns: `previous_close` is the previous session, the moving-average
   column is the trailing mean, the running-max and running-min columns are the highest
   and lowest close so far *within the rows returned* (so the date range anchors them),
-  the one-direction and two-direction reads are each a single query, a database
+  the running-total column is the `volume` traded so far with the same in-range anchor
+  and shares the read with a window, the one-direction and two-direction reads are each
+  a single query, a database
   partial-frame mean is passed through as data (the metric applies the completeness
   rule), and a window below 1 is rejected;
 * `PriceSeries` invariants: repeated or out-of-order dates raise, `in_range()`
@@ -1247,13 +1459,41 @@ What the table says, honestly:
   `padding == 0`, one query, the date bounds, `undefined == 0` (the overridden count),
   the traded pair read from the columns, an empty instrument, and backend validation.
 
+`apps/analytics/tests/test_volume_summaries.py` — the running total and the period's
+figures, 30 tests:
+
+* the running total and the relative volume, row by row, against the table above —
+  including the zero-volume session, which is a `0.00000000` ratio rather than a
+  missing one;
+* the ratio is against the mean *so far* and not the period's mean, shown by the one
+  series where the two rules give different answers on four of five rows;
+* volumes are normalised to counts (a driver's `DECIMAL('100.00000000')` renders as
+  `100`), a supplied running total is the one used, and supplied totals that *are* the
+  running total agree with the scan;
+* the `pandas` reference is exact past the float integer limit — a `2**53` total is
+  asserted equal to the `Decimal` scan, and the float path that would have dropped a
+  share is recorded in the test;
+* length mismatches are rejected and an empty series is an empty answer;
+* the summary: the hand-computed period figures, the exact-mean classification (the
+  2-and-3 case that a rounded average would get wrong), a constant-volume series at
+  its own average on every session, and the three classification counts adding up to
+  `observations` across six datasets;
+* a zero-volume session lowers the mean rather than being dropped, ties report the
+  first session that reached the extreme, and an all-zero series has a total of zero
+  with every session at average;
+* the three backends agree on the points *and* the summary, on the sample series and
+  on a series containing a zero-volume session;
+* the service: `padding == 0` and no warm-up row, the range's own total rather than the
+  history's, one query, the date bounds, the summary total equal to the last running
+  total, a zero-volume opening session counted as `undefined`, an empty instrument, and
+  backend validation.
+
 ## Deliberately not done yet
 
-* Metrics 7–9, each with its own sample, edge-case policy and trade-off note:
-  volume summaries, percentage change over a period, and the cross-sectional
-  rankings.
+* Metrics 8–9, each with its own sample, edge-case policy and trade-off note:
+  percentage change over a period, and the cross-sectional rankings.
 * **No HTTP endpoint yet.** The service layer is where a metric is defined, and
-  six metrics in it is the right moment to fix the shape rather than the moment it
+  seven metrics in it is the right moment to fix the shape rather than the moment it
   was settled: the results now share a `MetricResult` base with a `points` list, a
   `padding` count, an echoed `window`, a nested summary object where a metric has
   one, an overridable `undefined` count, and a consistent rendering rule, and that is
@@ -1289,7 +1529,8 @@ history, of which the request asks for a 31-observation window. They are all in
 single query and that the backends agree point for point, and prints the plans and
 the engine-versus-database comparisons quoted above — including the two
 `STDDEV_SAMP` and derived-table `MIN` cross-checks, the four-aggregate extremes
-check, and the two nested-window rejections that explain why two metrics have no
+check, the volume summary against the database's own `SUM`/`AVG`/`MAX`/`MIN`/`COUNT`,
+and the two nested-window rejections that explain why two metrics have no
 SQL member:
 
 ```powershell
