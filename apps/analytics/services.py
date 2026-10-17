@@ -13,16 +13,20 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date
+from decimal import Decimal
 
 from .metrics import (
+    RANKING_MEASURES,
     TRADING_DAYS_PER_YEAR,
     CumulativePoint,
     DrawdownPoint,
     DrawdownSummary,
     ExtremePoint,
     ExtremesSummary,
+    MeasurePoint,
     MovingAveragePoint,
     PeriodChange,
+    RankingRow,
     ReturnPoint,
     SelectedPeriod,
     VolatilityPoint,
@@ -41,6 +45,9 @@ from .metrics import (
     moving_average_series,
     period_change,
     period_change_pandas,
+    quantize_count,
+    quantize_ratio,
+    rank_measures,
     rolling_volatility,
     rolling_volatility_pandas,
     summarize_drawdown,
@@ -50,7 +57,7 @@ from .metrics import (
     volume_series_pandas,
 )
 from .models import AnalyticSnapshot
-from .series import load_price_series
+from .series import CrossSection, load_price_cross_section, load_price_series
 
 
 def get_snapshot_queryset():
@@ -162,6 +169,32 @@ def get_latest_snapshot(instrument, metric_type, *, lookback_days=None):
 #: Volume summaries are the same case again, one shape further out: a running sum
 #: is a single frame over the ``volume`` column, so the database can carry the
 #: total and Python only derives the ratio and the period figures.
+#:
+#: Rankings across instruments have no ``sql`` member either, for a fourth reason
+#: again, and it is the one worth reading closely because the SQL looks so natural.
+#: The metric's window is "the newest *n* observations **of each** instrument", and
+#: the natural query for that is
+#: ``ROW_NUMBER() OVER (PARTITION BY instrument_id ORDER BY trading_date DESC)``
+#: filtered to ``rn <= n`` -- a real, single-level, legal window, which Django can
+#: express. It is declined because it is *slower*, and ``scripts/verify_analytics.py``
+#: measures both shapes rather than asserting it. On the benchmark universe the range
+#: read and the row-number read return the same 3,100 rows, and the row number is
+#: never the faster of the two: with a date bound it is pure overhead (a few tens of
+#: per cent in successive runs, and nothing bought), and without one it ships sixteen
+#: times fewer rows and is *still* around 60% slower (about 130 ms against 80 ms),
+#: because the window has to materialise and sort each partition before ``rn <= n`` can
+#: filter it. So ``sql`` would be the slow path here, and a default that is slower is
+#: not a default.
+#:
+#: The other SQL shape -- pushing the *measure* down, one row per instrument -- is a
+#: different read shape rather than a window over the rows the loader returns, which
+#: is the same reason the period change declined one: a ``GROUP BY instrument_id``
+#: with ``SUM(volume)`` serves the volume measure only, while the return needs each
+#: instrument's first and last close, which is the two-endpoint read again. It would
+#: also have to be a pivot (``MAX(CASE WHEN ...)`` over two row-numbers) that the ORM
+#: cannot express without raw SQL. Two backends that read the same rows and differ in
+#: the arithmetic are what the engine promises; a third that reads differently and
+#: computes the same thing is not.
 DAILY_RETURN_BACKENDS = ("sql", "python", "pandas")
 CUMULATIVE_RETURN_BACKENDS = ("python", "pandas")
 MOVING_AVERAGE_BACKENDS = ("sql", "python", "pandas")
@@ -170,6 +203,7 @@ DRAWDOWN_BACKENDS = ("sql", "python", "pandas")
 EXTREME_BACKENDS = ("sql", "python", "pandas")
 VOLUME_BACKENDS = ("sql", "python", "pandas")
 PERIOD_CHANGE_BACKENDS = ("python", "pandas")
+RANKING_BACKENDS = ("python", "pandas")
 
 
 @dataclass(frozen=True)
@@ -375,6 +409,65 @@ class VolumeSummaries(MetricResult):
         explainable hole rather than a rounding artefact.
         """
         return sum(1 for point in self.points if point.relative_volume is None)
+
+
+@dataclass(frozen=True)
+class Ranking:
+    """Instruments ordered by one measure over one window.
+
+    Deliberately **not** a :class:`MetricResult`. That base carries a ``symbol``, and
+    a ranking is *about* symbols rather than belonging to one: there is no single
+    instrument whose series this is. What it carries instead is the universe it was
+    taken over -- how many instruments were read, how many could not be measured, and
+    how many the ``limit`` left out -- because "first of five" and "first of five
+    hundred" are different statements and the report should not have to be trusted
+    to remember which it was.
+
+    ``rows`` is in ranking order: the measured instruments first, best to worst for
+    the requested direction, then the unmeasured ones ordered by symbol.
+    ``lookback`` is echoed because it is the *window*: with no date bounds it is the
+    only thing that says what the numbers mean, and the read it did not bound is
+    worth being able to see.
+    """
+
+    measure: str
+    backend: str
+    descending: bool = True
+    start_date: date | None = None
+    end_date: date | None = None
+    lookback: int | None = None
+    rows: tuple[RankingRow, ...] = ()
+    universe: int = 0
+    ranked: int = 0
+
+    @property
+    def symbols(self) -> tuple[str, ...]:
+        """The symbols of the returned rows, in ranking order."""
+        return tuple(row.symbol for row in self.rows)
+
+    @property
+    def unranked(self) -> int:
+        """Instruments the ranking could not measure, whether or not they are shown.
+
+        Counted over the whole universe rather than over ``rows``: a limit may cut
+        the unmeasured rows off the end, and the number a reader needs is how many
+        instruments had no measure, not how many of those survived the truncation.
+        """
+        return self.universe - self.ranked
+
+    @property
+    def truncated(self) -> int:
+        """Universe entries the ``limit`` left out of ``rows``."""
+        return self.universe - len(self.rows)
+
+    def row(self, symbol: str) -> RankingRow:
+        """One instrument's row by symbol, or ``KeyError`` naming what is here."""
+        for row in self.rows:
+            if row.symbol == symbol:
+                return row
+        raise KeyError(
+            f"{symbol!r} is not in this ranking; it has {list(self.symbols)}"
+        )
 
 
 def _reject_backend(backend: str, allowed: Sequence[str]) -> None:
@@ -907,4 +1000,250 @@ def percentage_change_for_instrument(
         end_date=read_end,
         padding=data.padding,
         periods=changes,
+    )
+
+
+def _windowed_value(value, observations: int, lookback: int | None):
+    """``value``, or ``None`` when the window was shorter than the lookback asked for.
+
+    The completeness rule, and it is deliberately the same one the moving averages
+    and the volatility apply to their own windows: a number computed over fewer
+    sessions than the request named is a *different statistic*, and putting it in the
+    same ranking as a full window would compare things that are not comparable -- a
+    three-session volume total is not a small twenty-one-session one, it is a
+    different measurement. Such an instrument is still listed, with its
+    ``observations`` saying how much history it actually had.
+    """
+    if lookback is not None and observations < lookback:
+        return None
+    return value
+
+
+def _measure_point(
+    *,
+    instrument_id: int,
+    symbol: str,
+    dates,
+    closes,
+    measure: str,
+    lookback: int | None,
+    volumes=None,
+) -> MeasurePoint:
+    """One instrument's number, from the observations of its window.
+
+    The two measures are the engine's existing arithmetic rather than new metric
+    code: a ``return`` is metric 8's change over the window, and a ``volume`` is
+    metric 7's total for it. Reusing them is what keeps a ranking and a per-instrument
+    report from disagreeing, and it is why the ranking adds no formula of its own --
+    a ranking is a *comparison*, and the thing being compared is already defined.
+    """
+    observations = len(dates)
+    if not observations:
+        return MeasurePoint(instrument_id, symbol, None, 0)
+
+    if measure == "volume":
+        total = sum((Decimal(volume) for volume in volumes), Decimal(0))
+        value = quantize_count(total)
+    else:
+        # Metric 8's arithmetic: the change from the window's first observation to
+        # its last. A one-observation window is a change of 0, which is what that
+        # metric says a one-session period is.
+        value = period_change(dates, closes).change
+
+    return MeasurePoint(
+        instrument_id=instrument_id,
+        symbol=symbol,
+        value=_windowed_value(value, observations, lookback),
+        observations=observations,
+        first_date=dates[0],
+        last_date=dates[-1],
+    )
+
+
+def _measure_points(cross: CrossSection, *, measure: str, lookback: int | None):
+    """One point per instrument, each window taken off the end of its own series."""
+    points = []
+    for instrument_id, series in cross.series.items():
+        window = series.tail(lookback) if lookback else series
+        points.append(
+            _measure_point(
+                instrument_id=instrument_id,
+                symbol=series.symbol,
+                dates=window.dates,
+                closes=window.closes,
+                measure=measure,
+                lookback=lookback,
+                volumes=window.column("volume") if measure == "volume" else None,
+            )
+        )
+    return points
+
+
+def _measure_points_pandas(cross: CrossSection, *, measure: str, lookback: int | None):
+    """The same points, with each window taken by ``groupby().tail()``.
+
+    This is the metric the ``pandas`` backend was for. The work here is a
+    *grouping* -- one trailing window per instrument out of one cross-section -- and
+    that is what pandas does in a single pass, where the ``python`` backend slices
+    each series in turn. The rows a group ends up with are the same rows a slice
+    ends up with, so the two agree by construction on the window; the number on top
+    of each group is then the shared arithmetic, a period change or a sum.
+
+    What is vectorised is the window and the summary of it -- ``size``, ``first``,
+    ``last``, ``sum`` for every instrument at once -- not the ratio. ``Decimal`` is
+    not a numpy dtype, and a float division here would report a different number from
+    the other two backends, which is the one thing a reference backend may not do.
+    """
+    frame = cross.to_frame()
+    if frame.empty:
+        return []
+
+    if lookback:
+        frame = frame.groupby(
+            "instrument_id", sort=False, group_keys=False
+        ).tail(lookback)
+
+    grouped = frame.groupby("instrument_id", sort=True)
+    sizes = grouped.size()
+    first_dates = grouped["trading_date"].first()
+    last_dates = grouped["trading_date"].last()
+    symbols = grouped["symbol"].last()
+
+    if measure == "volume":
+        values = [
+            quantize_count(Decimal(int(total))) for total in grouped["volume"].sum()
+        ]
+    else:
+        bases = grouped["close"].first()
+        ends = grouped["close"].last()
+        values = [
+            None
+            if Decimal(base) == 0
+            else quantize_ratio((Decimal(end) - Decimal(base)) / Decimal(base))
+            for base, end in zip(bases, ends)
+        ]
+
+    points = []
+    for position, instrument_id in enumerate(sizes.index):
+        observations = int(sizes.iloc[position])
+        points.append(
+            MeasurePoint(
+                instrument_id=int(instrument_id),
+                symbol=str(symbols.iloc[position]),
+                value=_windowed_value(values[position], observations, lookback),
+                observations=observations,
+                first_date=first_dates.iloc[position],
+                last_date=last_dates.iloc[position],
+            )
+        )
+    return points
+
+
+def ranking_for_instruments(
+    *,
+    measure: str = "return",
+    instrument_ids: Sequence[int] | None = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    lookback: int | None = None,
+    descending: bool = True,
+    limit: int | None = None,
+    backend: str = "python",
+) -> Ranking:
+    """Instruments ranked by one measure over one window.
+
+    The one metric that is *cross-sectional*: it reads many instruments and returns
+    one row per instrument, rather than one instrument and a row per session. That
+    changes the read -- the whole universe comes back in one query, grouped
+    (:func:`~apps.analytics.series.load_price_cross_section`) -- and it changes the
+    result, which has no ``symbol`` of its own to carry (see :class:`Ranking`).
+
+    **Two measures**, from :data:`RANKING_MEASURES`, and no third:
+
+    * ``return`` -- each instrument's price change over its window, ``(last - first)
+      / first``, which is metric 8's question asked once per instrument;
+    * ``volume`` -- each instrument's shares traded over its window, which is metric
+      7's total for it.
+
+    Both are "the same number, measured for every instrument", which is what makes
+    them rankable. Neither is a recommendation: the engine orders instruments by a
+    measure it reports in full, and says nothing about which of them to hold.
+
+    **The window is a count of observations, per instrument.** ``lookback`` is the
+    newest *n* sessions of **each** instrument -- trading days, not calendar days,
+    the engine's convention throughout -- applied after the read as a slice off the
+    end of each series. ``start_date``/``end_date`` bound which observations are
+    eligible at all, so ``lookback`` then means "the newest *n* within the range".
+    Three cases are worth stating because they are all easy to get wrong:
+
+    * ``lookback`` with **no** date bound is the newest *n* sessions of each
+      instrument's whole history. It is the useful default for "where does each
+      instrument stand", and it is also the only request this metric makes that is
+      not bounded by a date: the read is each instrument's entire history. A caller
+      ranking a large universe passes ``start_date`` -- and the read, not the
+      metric, is where that cost is.
+    * ``lookback=None`` means the window **is** the range: every observation between
+      the bounds. Totals then span whatever each instrument traded in that period,
+      which is what a "most active this month" report means, and the per-instrument
+      ``observations`` on each row is how a reader sees that the spans were equal.
+    * an instrument with **fewer than** ``lookback`` observations in the range has
+      its value reported as ``None`` and is listed unranked, with ``observations``
+      saying how many sessions it had. A partial window is not a window, which is
+      the completeness rule the moving averages and the volatility already apply.
+
+    **The universe is the instruments that have at least one observation in the
+    range**, not every instrument in the database. A ranking is over prices, and an
+    instrument with no price in the window has no measure and no place in it; asking
+    the instrument table instead would make ``universe`` a fact about reference data
+    rather than about the data being compared. A caller who passed ``instrument_ids``
+    can compare that list's length with ``universe`` to see who dropped out.
+
+    **Ranks are competition ranks** -- equal measures share a rank and the next
+    distinct value skips -- assigned by :func:`~apps.analytics.metrics.rank_measures`,
+    which states the tie-break and the ``limit`` semantics. ``descending`` is the
+    default, so a return ranking opens with the biggest gain and a volume ranking with
+    the heaviest trading; ``descending=False`` reports the other end from the same
+    code.
+
+    There is no ``sql`` backend, and the measurement that decided it is in the note
+    on :data:`RANKING_BACKENDS`: the natural row-number window is legal and
+    expressible, and it is slower in both shapes -- bounded and unbounded -- than
+    reading the range and slicing in memory, so it does not earn its place. ``python``
+    is the default because there is nothing to default to; ``pandas`` differs by
+    grouping the cross-section in one pass.
+    """
+    _reject_backend(backend, RANKING_BACKENDS)
+    if measure not in RANKING_MEASURES:
+        raise ValueError(
+            f"unknown measure {measure!r}; "
+            f"expected one of {', '.join(RANKING_MEASURES)}"
+        )
+    if lookback is not None and lookback < 1:
+        raise ValueError("lookback must be at least 1")
+    if limit is not None and limit < 0:
+        raise ValueError("limit must not be negative")
+
+    cross = load_price_cross_section(
+        instrument_ids=instrument_ids,
+        start_date=start_date,
+        end_date=end_date,
+        fields=("volume",) if measure == "volume" else (),
+    )
+
+    points = (
+        _measure_points_pandas(cross, measure=measure, lookback=lookback)
+        if backend == "pandas"
+        else _measure_points(cross, measure=measure, lookback=lookback)
+    )
+
+    return Ranking(
+        measure=measure,
+        backend=backend,
+        descending=descending,
+        start_date=start_date,
+        end_date=end_date,
+        lookback=lookback,
+        rows=tuple(rank_measures(points, descending=descending, limit=limit)),
+        universe=len(points),
+        ranked=sum(1 for point in points if point.value is not None),
     )

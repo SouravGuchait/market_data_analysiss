@@ -17,6 +17,12 @@ retrieval policy is stated once:
   ``apps/marketdata/tests/test_exercises.py``: ``WHERE`` is evaluated before the
   window, so a filtered series has no neighbour to lag to.
 
+The one exception to the second bullet's shape is the *cross-section*
+(:func:`load_price_cross_section`), which reads many instruments in the one
+query and therefore joins the instrument table for the symbols -- there is no
+``Instrument`` instance in the caller's hand to take them from. It states its own
+departures; everything else here is one instrument at a time.
+
 This module also owns the definition of a *trading day*: it is an observation --
 a row -- and never a calendar day. See :func:`missing_trading_dates` for the
 other half of that distinction.
@@ -128,6 +134,30 @@ class PriceSeries:
             padding=0,
         )
 
+    def tail(self, count: int) -> PriceSeries:
+        """The newest ``count`` observations, or the whole series if it is shorter.
+
+        The cross-section's window. A ranking measures every instrument over the
+        same *number of sessions*, so the window is a slice off the end of each
+        series rather than a date range applied to all of them -- and an instrument
+        with fewer than ``count`` observations gets all it has, which the ranking
+        then reports as a short window instead of presenting a partial window as a
+        full one.
+        """
+        if count < 1:
+            raise ValueError("count must be at least 1")
+        if count >= len(self.dates):
+            return self
+        start = len(self.dates) - count
+        return PriceSeries(
+            symbol=self.symbol,
+            dates=self.dates[start:],
+            columns={name: values[start:] for name, values in self.columns.items()},
+            # Warm-up rows live at the front, so a tail either keeps them all or
+            # drops the ones that fell off: the count is what survives the cut.
+            padding=max(0, self.padding - start),
+        )
+
     def assert_one_row_per_date(self) -> None:
         """Fails if two rows claim the same trading day, or dates are unordered.
 
@@ -161,6 +191,148 @@ class PriceSeries:
         frame = pd.DataFrame(dict(self.columns), index=pd.Index(self.dates, name="trading_date"))
         frame.index = pd.to_datetime(frame.index)
         return frame
+
+
+@dataclass(frozen=True)
+class CrossSection:
+    """Many instruments' prices, grouped, oldest first within each.
+
+    The shape a *cross-sectional* metric reads: one query for a whole universe
+    rather than one query per instrument. Keyed by instrument id rather than by
+    symbol, because a symbol is display text -- it can be renamed, and a caller's
+    filter list can name two different instruments with one -- while a ranking must
+    place the instruments it actually read.
+
+    ``series`` is the whole of the state: a caller iterates the instruments in the
+    order the query returned them (ascending id), and asks each one for its
+    observations. There is no ``padding``, because a cross-section is read without
+    warm-up -- its window is a *count of newest observations per instrument*, which
+    is decided after the read.
+    """
+
+    series: Mapping[int, PriceSeries]
+
+    def __len__(self) -> int:
+        return len(self.series)
+
+    @property
+    def instruments(self) -> tuple[int, ...]:
+        """The instrument ids, in ascending order."""
+        return tuple(self.series)
+
+    def to_frame(self):
+        """The whole cross-section as one DataFrame, one row per observation.
+
+        Imported locally, like every pandas touchpoint: a request that does not ask
+        for this backend should not pay for the import.
+
+        The instrument id is an ordinary column rather than the index, because a
+        ranking groups *by* it and an index level would only have to be reset again.
+        Dates stay ``datetime.date`` objects rather than becoming timestamps, so a
+        value taken out of a group here is the same value the other backends carry.
+        """
+        import pandas as pd
+
+        if not self.series:
+            return pd.DataFrame(columns=["instrument_id", "symbol", "trading_date"])
+
+        # Every series carries the same columns in the same order -- they come from
+        # one query -- so any one of them names the frame's columns too.
+        first = next(iter(self.series.values()))
+        names = tuple(first.columns)
+
+        records = [
+            (
+                instrument_id,
+                series.symbol,
+                trading_date,
+                *(series.columns[name][index] for name in names),
+            )
+            for instrument_id, series in self.series.items()
+            for index, trading_date in enumerate(series.dates)
+        ]
+
+        return pd.DataFrame.from_records(
+            records,
+            columns=["instrument_id", "symbol", "trading_date", *names],
+        )
+
+
+def load_price_cross_section(
+    *,
+    instrument_ids: Sequence[int] | None = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    fields: Sequence[str] = (),
+) -> CrossSection:
+    """Reads many instruments' prices in one query, grouped by instrument.
+
+    This is the ranking's read: one query for the whole universe, ordered so that
+    each instrument's observations come out oldest first. It is the same retrieval
+    discipline as :func:`load_price_series`, with two differences that follow from
+    reading many instruments at once:
+
+    * **The instrument table is joined.** The per-series loader deliberately does
+      not join it: the caller already holds the ``Instrument`` and a metric needs
+      only its symbol. A cross-section reads instruments the caller never resolved,
+      so the symbol has to come from the query. The join is on a primary key, so it
+      is a single-row index lookup per price row, and the alternative -- a second
+      query for the symbols -- would give up the one-query rule to save less than
+      the join costs.
+    * **The instrument id is part of the row.** It is the key of the returned
+      mapping, not the symbol: see :class:`CrossSection`.
+
+    There is no warm-up and no window here, unlike every other read in this module,
+    and that is the metric's shape rather than an omission. The window a ranking
+    needs is "the newest *n* observations **of each** instrument"; *n* is per
+    instrument while the read is per range, so the slice happens after the read, in
+    the metric. That makes ``start_date``/``end_date`` the hard bound on the work --
+    see :func:`apps.analytics.services.ranking_for_instruments` for what that means
+    for a request that supplies only a count.
+    """
+    unknown = sorted(set(fields) - set(ALLOWED_FIELDS))
+    if unknown:
+        raise ValueError(
+            f"unknown price fields: {', '.join(unknown)}; "
+            f"allowed: {', '.join(ALLOWED_FIELDS)}"
+        )
+
+    if start_date and end_date and start_date > end_date:
+        raise ValueError("start_date must not be after end_date")
+
+    read = [*ALWAYS_READ, *(name for name in fields if name not in ALWAYS_READ)]
+    names = ["instrument_id", "instrument__symbol", "trading_date", *read]
+
+    queryset = PriceRecord.objects.all()
+    if instrument_ids is not None:
+        queryset = queryset.filter(instrument_id__in=list(instrument_ids))
+    if start_date:
+        queryset = queryset.filter(trading_date__gte=start_date)
+    if end_date:
+        queryset = queryset.filter(trading_date__lte=end_date)
+
+    rows = list(queryset.order_by("instrument_id", "trading_date").values_list(*names))
+
+    by_instrument: dict[int, list[tuple]] = {}
+    for row in rows:
+        by_instrument.setdefault(row[0], []).append(row)
+
+    series: dict[int, PriceSeries] = {}
+    for instrument_id, group in by_instrument.items():
+        one = PriceSeries(
+            symbol=group[0][1],
+            dates=tuple(row[2] for row in group),
+            columns={
+                name: tuple(row[3 + position] for row in group)
+                for position, name in enumerate(read)
+            },
+        )
+        # The same guard as the single-instrument loader, at the same cost: the
+        # ordering this query imposes would hide a contradiction rather than fix it.
+        one.assert_one_row_per_date()
+        series[instrument_id] = one
+
+    return CrossSection(series=series)
 
 
 def _warm_up_boundary(instrument, start_date: date, pad: int):

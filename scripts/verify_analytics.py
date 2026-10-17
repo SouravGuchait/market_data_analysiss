@@ -1,8 +1,8 @@
 """Read-only check of the analytics engine against the real (MySQL) database.
 
 The unit tests run on SQLite in memory, which proves the arithmetic but not the
-SQL. Three claims in ``docs/market_analytics.md`` can only be checked on the
-production engine, and this script checks them:
+SQL. The claims in ``docs/market_analytics.md`` that can only be checked on the
+production engine are checked here:
 
 * the warm-up boundary -- an OFFSET subquery wrapped in ``COALESCE`` -- is executed
   as written, returns the rows it should, and is evaluated once rather than per
@@ -12,7 +12,10 @@ production engine, and this script checks them:
   padded range, and the three calculation backends still agree point for point;
 * the volatility figure agrees with the database's own ``STDDEV_SAMP`` over the
   same window -- and the one-level form of that query is *rejected*, which is why
-  the engine does not offer a pure-SQL volatility.
+  the engine does not offer a pure-SQL volatility;
+* the ranking reads the whole universe in one query, and the row-number form it
+  declines selects the same rows *slower*, which is the measurement behind
+  ``RANKING_BACKENDS`` having no ``sql`` member.
 
 It writes nothing. Seed the benchmark data first if the database is empty:
 
@@ -46,11 +49,15 @@ from django.test.utils import CaptureQueriesContext  # noqa: E402
 
 from apps.analytics import services  # noqa: E402
 from apps.analytics.metrics import (  # noqa: E402
+    RANKING_MEASURES,
     RATIO_DECIMAL_PLACES,
     TRADING_DAYS_PER_YEAR,
     SelectedPeriod,
 )
-from apps.analytics.series import load_price_series  # noqa: E402
+from apps.analytics.series import (  # noqa: E402
+    load_price_cross_section,
+    load_price_series,
+)
 from apps.instruments.models import Instrument  # noqa: E402
 from apps.marketdata.models import PriceRecord  # noqa: E402
 
@@ -513,6 +520,157 @@ def check_percentage_change(instrument, mid, end, dates):
     print("  and the endpoint query is two index lookups, not a scan of the period")
 
 
+def check_ranking(mid, end, window, rounds):
+    print("\n-- rankings across instruments --")
+
+    def request(measure, backend="python"):
+        return services.ranking_for_instruments(
+            measure=measure,
+            backend=backend,
+            lookback=window,
+            start_date=mid,
+            end_date=end,
+        )
+
+    def time_call(call):
+        samples = []
+        for _ in range(rounds):
+            started = time.perf_counter()
+            call()
+            samples.append((time.perf_counter() - started) * 1000)
+        return statistics.median(samples)
+
+    def raw(sql):
+        with connection.cursor() as cursor:
+            cursor.execute(sql)
+            return cursor.fetchall()
+
+    results = {}
+    for measure in RANKING_MEASURES:
+        reference = request(measure)
+        results[measure] = reference
+        for backend in services.RANKING_BACKENDS:
+            result = request(measure, backend)
+            assert result.rows == reference.rows, (
+                f"{backend} disagrees on the {measure} ranking"
+            )
+
+        print(
+            f"  {measure:>6}: universe {reference.universe}, ranked {reference.ranked}, "
+            f"unranked {reference.unranked}, lookback {reference.lookback} sessions"
+        )
+        for row in reference.rows[:5]:
+            print(
+                f"    {row.rank:>4} {row.symbol:<10} {row.value:>18} "
+                f"obs={row.observations} {row.first_date} .. {row.last_date}"
+            )
+        last = reference.rows[-1]
+        print(f"    {last.rank:>4} {last.symbol:<10} {last.value:>18}")
+
+    for backend in services.RANKING_BACKENDS:
+        captured_sql(lambda backend=backend: request("return", backend))
+    print("  one request: 1 query (asserted above)")
+
+    for measure in RANKING_MEASURES:
+        for backend in services.RANKING_BACKENDS:
+            median = time_call(
+                lambda measure=measure, backend=backend: request(measure, backend)
+            )
+            print(f"  {measure:>6} {backend:>7}: median {median:6.2f} ms")
+
+    # The universe is a fact about the prices in the range, not about the
+    # instrument table: this is the count the metric claims to be counting.
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT COUNT(DISTINCT instrument_id) FROM marketdata_pricerecord "
+            f"WHERE trading_date BETWEEN '{mid}' AND '{end}'"
+        )
+        db_instruments = cursor.fetchone()[0]
+    print(f"  MySQL: {db_instruments} instruments have prices between {mid} and {end}")
+    assert results["return"].universe == db_instruments
+
+    # Every row's measure is the per-instrument metric the engine already has:
+    # metric 8 for a return, metric 7 for a volume. This is what keeps a ranking
+    # from being a second, subtly different definition of the same number.
+    top_return = results["return"].rows[0]
+    change = services.percentage_change_for_instrument(
+        Instrument.objects.get(pk=top_return.instrument_id),
+        start_date=top_return.first_date,
+        end_date=top_return.last_date,
+    ).periods[0]
+    print(
+        f"  best return: {top_return.symbol} {top_return.value} over "
+        f"{top_return.observations} sessions; metric 8 over those two dates gives "
+        f"{change.change}"
+    )
+    assert top_return.value == change.change
+
+    top_volume = results["volume"].rows[0]
+    summary = services.volume_summaries_for_instrument(
+        Instrument.objects.get(pk=top_volume.instrument_id),
+        start_date=mid,
+        end_date=end,
+    ).summary
+    print(
+        f"  heaviest:    {top_volume.symbol} {top_volume.value} over "
+        f"{top_volume.observations} sessions; metric 7 over the same range totals "
+        f"{summary.total_volume}"
+    )
+    assert top_volume.observations == window
+    assert top_volume.value == summary.total_volume
+
+    print("\n  the read the ranking uses (one range query for the universe):")
+    cross_sql = captured_sql(
+        lambda: load_price_cross_section(start_date=mid, end_date=end)
+    )
+    print("  " + explain(cross_sql).replace("\n", "\n  "))
+
+    # The SQL form RANKING_BACKENDS declines, run for the measurement the note in
+    # ``services`` cites -- in both shapes, because the trade-off turns on whether
+    # the range bounds the read. It is legal (a partitioned row number in a derived
+    # table) and it selects exactly the rows the metric windows to.
+    def row_number_sql(bounds):
+        where = f"WHERE trading_date BETWEEN '{mid}' AND '{end}'" if bounds else ""
+        window_function = (
+            "ROW_NUMBER() OVER (PARTITION BY instrument_id "
+            "ORDER BY trading_date DESC) AS rn"
+        )
+        return (
+            "SELECT instrument_id, trading_date, close FROM ("
+            f"SELECT instrument_id, trading_date, close, {window_function} "
+            f"FROM marketdata_pricerecord {where}"
+            f") AS ranked WHERE rn <= {window}"
+        )
+
+    def compare_reads(bounds, label):
+        sql = row_number_sql(bounds)
+        kwargs = {"start_date": mid, "end_date": end} if bounds else {}
+        plain = load_price_cross_section(**kwargs)
+        plain_rows = sum(len(series) for series in plain.series.values())
+        windowed = {(row[0], row[1], Decimal(row[2])) for row in raw(sql)}
+        expected = {
+            (instrument_id, trading_date, Decimal(close))
+            for instrument_id, series in plain.series.items()
+            for trading_date, close in zip(
+                series.tail(window).dates, series.tail(window).closes
+            )
+        }
+        plain_ms = time_call(lambda: load_price_cross_section(**kwargs))
+        windowed_ms = time_call(lambda: raw(sql))
+        print(
+            f"    {label:<9} range read {plain_ms:7.2f} ms / {plain_rows:>6} rows    "
+            f"row-number {windowed_ms:7.2f} ms / {len(windowed):>6} rows"
+        )
+        assert windowed == expected, f"the row-number read returns other rows ({label})"
+
+    print("\n  the read, and the form that RANKING_BACKENDS declines for it:")
+    compare_reads(True, "bounded")
+    compare_reads(False, "unbounded")
+    print("  both select the same rows; the window has to be materialised before the")
+    print("  filter can apply, which is what the row-number form costs:")
+    print("  " + explain(row_number_sql(True)).replace("\n", "\n  "))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--instrument-id", type=int, default=None)
@@ -577,6 +735,7 @@ def main() -> int:
     check_extremes(instrument, mid, end)
     check_volume(instrument, mid, end)
     check_percentage_change(instrument, mid, end, dates)
+    check_ranking(mid, end, args.window, args.rounds)
 
     print(f"\nOK (window {mid} .. {end})")
     return 0

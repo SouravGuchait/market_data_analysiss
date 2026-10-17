@@ -1614,3 +1614,151 @@ def period_change_pandas(
     if base is None or end is None or base > end:
         return _change_at(dates, closes, None, None, label)
     return _change_at(dates, closes, base, end, label)
+
+
+# --------------------------------------------------------------------------- #
+# Rankings across instruments
+# --------------------------------------------------------------------------- #
+
+#: The ways an instrument may be ranked, as a closed vocabulary rather than a
+#: callable a caller supplies. A ranking is quoted in a report -- "the top gainers
+#: this month" -- and the phrase has to mean the same thing the next time it is
+#: used, which is the same reason the moving averages are named rather than
+#: parameterised. Each name fixes both halves of the measure: what is summed or
+#: compared (a price change, a traded volume) and which quantizer the answer is
+#: reported with (a ratio in eight places, a count in none).
+RANKING_MEASURES = ("return", "volume")
+
+
+@dataclass(frozen=True)
+class MeasurePoint:
+    """One instrument's number for the ranking, before it is ranked.
+
+    ``value`` is ``None`` when the instrument has no number for this measure, and
+    the point is still returned: a ranking that silently dropped the instruments it
+    could not measure would read as if the universe had been smaller than it was.
+    The reason a value is missing is visible in ``observations`` -- a window that
+    did not fill -- or in the prices the point was built from.
+
+    ``observations``, ``first_date`` and ``last_date`` are what make the comparison
+    auditable rather than merely ordered: instruments do not all trade on the same
+    days, so two rows of a ranking can be numbers over different spans, and this is
+    where a reader sees it.
+    """
+
+    instrument_id: int
+    symbol: str
+    value: Decimal | None
+    observations: int
+    first_date: date | None = None
+    last_date: date | None = None
+
+
+@dataclass(frozen=True)
+class RankingRow:
+    """One instrument's place in a ranking, with the inputs that gave it.
+
+    ``rank`` is *competition* ranking: one more than the number of instruments with
+    a strictly better measure. Equal measures therefore share a rank and the next
+    distinct measure skips the numbers they used (1, 2, 2, 4). That definition is
+    the whole rule -- it comes from the values alone, so a row's rank does not depend
+    on where a tie happened to land in the sort, and any two callers ranking the same
+    numbers get the same answer.
+
+    ``rank`` is ``None`` for an instrument with no measurable value. Such rows are
+    listed after the ranked ones, ordered by symbol, and are never silently dropped:
+    "the ranking has twelve entries and three instruments could not be measured" is
+    a different statement from "the ranking has twelve entries".
+    """
+
+    rank: int | None
+    instrument_id: int
+    symbol: str
+    value: Decimal | None
+    observations: int
+    first_date: date | None = None
+    last_date: date | None = None
+
+
+def rank_measures(
+    points: Sequence[MeasurePoint],
+    *,
+    descending: bool = True,
+    limit: int | None = None,
+) -> list[RankingRow]:
+    """Orders instruments by their measure and gives each one a rank.
+
+    Definitions, with ``v`` a point's value::
+
+        rank(p) = 1 + |{q : v(q) is strictly better than v(p)}|
+        better  = greater, when descending; smaller, when ascending
+
+    The ranking is **total within a direction**: the order is by the measure, and
+    ties -- which includes every unranked row, whose rank is ``None`` -- are broken
+    by symbol so that the same inputs always produce the same output. That matters
+    for a report that is diffed between two runs, and it is why the tie-break is
+    stated here rather than left to whatever order the rows arrived in.
+
+    ``limit`` truncates the returned list *after* the ranks are assigned, so a page
+    of a ranking shows absolute places -- the tenth instrument is tenth, not "tenth
+    of the ten I asked for". The rows that the limit left out are counted by the
+    caller, which knows the size of the universe and can say so.
+
+    ``descending`` is the default because the question a ranking is usually asked is
+    "which were the best", for either measure: the biggest gain, the heaviest
+    trading. Ascending gives the other end -- the worst performers, the quietest
+    sessions -- from the same code path, so the two are the same statement with the
+    direction flipped rather than two functions that could drift apart.
+    """
+    if limit is not None and limit < 0:
+        raise ValueError("limit must not be negative")
+
+    measurable = [point for point in points if point.value is not None]
+    missing = [point for point in points if point.value is None]
+
+    # One sort key for both directions: negating the value expresses "largest
+    # first" without a second comparison function, and keeps the symbol tie-break in
+    # one place. ``Decimal`` negation is exact, unlike the float tricks it replaces.
+    measurable.sort(
+        key=lambda point: (
+            -point.value if descending else point.value,
+            point.symbol,
+        )
+    )
+
+    rows: list[RankingRow] = []
+    rank = 0
+    previous: Decimal | None = None
+
+    for position, point in enumerate(measurable, start=1):
+        # A new distinct value takes the position it sits at, which is exactly the
+        # competition rank: the ties before it already consumed the lower numbers.
+        if previous is None or point.value != previous:
+            rank = position
+            previous = point.value
+        rows.append(
+            RankingRow(
+                rank=rank,
+                instrument_id=point.instrument_id,
+                symbol=point.symbol,
+                value=point.value,
+                observations=point.observations,
+                first_date=point.first_date,
+                last_date=point.last_date,
+            )
+        )
+
+    for point in sorted(missing, key=lambda point: point.symbol):
+        rows.append(
+            RankingRow(
+                rank=None,
+                instrument_id=point.instrument_id,
+                symbol=point.symbol,
+                value=None,
+                observations=point.observations,
+                first_date=point.first_date,
+                last_date=point.last_date,
+            )
+        )
+
+    return rows if limit is None else rows[:limit]

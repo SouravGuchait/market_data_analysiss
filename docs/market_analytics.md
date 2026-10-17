@@ -26,19 +26,28 @@ its edge-case policy, and its trade-offs written down before the next one starts
 | 6 | Highest and lowest prices | implemented |
 | 7 | Trading-volume summaries | implemented |
 | 8 | Percentage change over a selected period | implemented |
-| 9 | Rankings by return and trading volume | next |
+| 9 | Rankings by return and trading volume | implemented — cross-sectional, one query for the universe |
+
+The engine is served over HTTP by two read-only endpoints — one metric of one
+instrument, and the cross-sectional ranking — described under [HTTP
+surface](#http-surface) below. The routes are `apps/analytics/urls.py`; the engine
+itself has no HTTP dependency, and each metric's own section is still the definition
+of the measure.
 
 ## Where the code is
 
 | Module | Responsibility | Depends on |
 |---|---|---|
-| `apps/analytics/series.py` | The read boundary. Loads one instrument's prices: one query, only the requested columns, plus the warm-up rows a window needs. Owns the definition of a trading day. | Django ORM, `PriceRecord`, `TradingCalendar` |
-| `apps/analytics/metrics.py` | Pure arithmetic. No Django, no I/O, no queryset: a metric is a function from sequences of numbers to numbers, so it can be checked against a hand-computed series without a database. | standard library, Pandas (lazily) |
+| `apps/analytics/series.py` | The read boundary. Loads one instrument's prices — one query, only the requested columns, plus the warm-up rows a window needs — and, for the one cross-sectional metric, many instruments' prices in one query. Owns the definition of a trading day. | Django ORM, `PriceRecord`, `TradingCalendar` |
+| `apps/analytics/metrics.py` | Pure arithmetic. No Django, no I/O, no queryset: a metric is a function from sequences of numbers to numbers, so it can be checked against a hand-computed series without a database. Also the ranking arithmetic, which needs no prices at all. | standard library, Pandas (lazily) |
 | `apps/analytics/services.py` | The entry points the API calls. Chooses a loader, a range, and a calculation backend, and returns one result. Also holds the stored-snapshot reads. | `series`, `metrics`, `models` |
+| `apps/analytics/views.py`, `apps/analytics/serializers.py` | The HTTP surface. Parses a request into exactly one service call and names the fields of the frozen results; no arithmetic, and no query construction. | `services`, DRF |
 
 The split exists so that "what was read" and "what was computed" are auditable
 separately: a wrong number is either the wrong rows or the wrong arithmetic, and
-the two live in different files with different tests.
+the two live in different files with different tests. The surface adds no third
+place for a number to be wrong: it renders what the engine returned and nothing
+else.
 
 ## Conventions
 
@@ -123,6 +132,7 @@ and leaving the off-by-one to be discovered:
 | Price extremes | — (running extremes from the range start) | 1 close | — |
 | Volume summaries | — (running total from the range start) | 1 volume | — |
 | Period change | — (two chosen observations) | 2 closes | — |
+| Ranking | observations, **per instrument** (`lookback`) | `lookback` closes (or volumes) | the newest 20 sessions of *each* instrument |
 
 Both columns are right. "20-day volatility" really is the standard deviation of
 twenty daily returns, and "20-day average" really is the mean of twenty closes;
@@ -137,6 +147,13 @@ window asked for), `window` for a volatility (which needs one more close than
 return), and `1` for a daily return. It is `0` for cumulative returns, maximum
 drawdown, price extremes, volume summaries and period change — the five metrics
 whose anchor is inside the range, or narrower than it: see their sections.
+
+The ranking is the one that cannot be expressed as a `pad` at all, and that is
+worth stating rather than hiding in a `0`: its window is per *instrument*, while a
+read is per *range*. There is no row before `start_date` that would give every
+instrument the same number of sessions, so the slice is taken after the read, off
+the end of each series, and the metric counts the observations that survived — see
+Metric 9.
 
 ### Backends
 
@@ -153,8 +170,9 @@ the same points, asserted row for row:
 | Price extremes | running maximum and minimum from `MAX(close)`/`MIN(close) OVER (...)` | running scan in both directions | `Series.cummax()`/`cummin()` |
 | Volume summaries | running total from `SUM(volume) OVER (...)`, ratio in Python | running sum | `Series.cumsum()` (`int64`) |
 | Period change | — | linear scan for the two bounds | `Index.searchsorted` |
+| Rankings (return, volume) | — | one range read, sliced per instrument | one frame, `groupby().tail()` |
 
-Three of the eight have no `sql` member. Two of them share a reason: **a metric
+Four of the nine have no `sql` member. Two of them share a reason: **a metric
 whose window must be computed from *windowed values* cannot be expressed in one
 SQL query**, because a window function may not appear inside another window
 function's arguments. Cumulative returns need a *product* (no dialect has a
@@ -176,6 +194,48 @@ subtraction. The verification script *runs* that query to show the two agree, an
 indexed range scan and buys `observations` — how many sessions the period held —
 which the two-endpoint query could not report.
 
+The ranking has no `sql` member for a fourth reason, and it is the most interesting
+of the four because the SQL is *so* natural that it needs a measurement to argue
+against. Its window — the newest *n* observations **of each** instrument — has an
+obvious query:
+
+```sql
+SELECT instrument_id, trading_date, close FROM (
+    SELECT instrument_id, trading_date, close,
+           ROW_NUMBER() OVER (PARTITION BY instrument_id ORDER BY trading_date DESC) AS rn
+    FROM marketdata_pricerecord WHERE trading_date BETWEEN '…' AND '…'
+) AS ranked WHERE rn <= 31
+```
+
+That is a legal, single-level, *partitioned* window, and Django can express it (a
+`Window(RowNumber())` filtered on the annotation). It is still declined, because it
+is slower in both shapes, and `scripts/verify_analytics.py` measures both rather
+than asserting it:
+
+| Read | Rows returned | Median (MySQL, benchmark universe) |
+|---|---|---|
+| Bounded range read (used) | 3,100 | 16–21 ms |
+| Bounded row-number read | 3,100 | 21–22 ms |
+| Whole-history range read | 50,000 | 74–83 ms |
+| Whole-history row-number read | 3,100 | 115–133 ms |
+
+With a date bound the two read the same rows and the window is pure overhead; **without**
+one it does ship sixteen times fewer rows and is *still* around 60% slower, for the same
+reason in both cases — `EXPLAIN` shows the window is `Materialize`d and sorted per
+partition before `rn <= 31` can filter it, so the database pays for every row it was
+trying not to return. `sql` would be the slow path here, and a default that is slower is
+not a default.
+
+The other SQL shape — pushing the *measure* down, one row per instrument — is a
+different read shape rather than a window over the rows the loader returns, which is
+the same objection the period change raised: a `GROUP BY instrument_id` with
+`SUM(volume)` serves the volume measure only, while a return needs each instrument's
+first *and* last close, which is the two-endpoint read again, and it would have to be
+a pivot (`MAX(CASE WHEN …)` over two row numbers) that the ORM cannot express without
+raw SQL. Two backends that read the same rows and differ in the arithmetic are what
+the engine promises; a third that reads differently and computes the same thing is
+not.
+
 Maximum drawdown, price extremes and volume summaries are the test of that rule
 rather than an exception to it: each of their windows is over a column the row
 already carries — one frame, or two of them — so the database can carry the whole
@@ -187,18 +247,28 @@ derived table to get a database-computed cross-check:
 OperationalError: (3593, "You cannot use the window function 'max' in this context.'")
 ```
 
-So the engine does not offer a SQL member it cannot honestly implement. The three
+So the engine does not offer a SQL member it cannot honestly implement. The four
 without one are computed in Python over rows a single query already returned — which
 is why the choice costs nothing in queries, only in where the arithmetic runs. The
-engine's canonical path stays inside the database wherever a window is a real window.
+engine's canonical path stays inside the database wherever a window is a real window
+*and* is not slower than not pushing it.
 
 ### On demand or stored
 
 | | Computed on demand | Stored in `AnalyticSnapshot` |
 |---|---|---|
-| What | The whole per-instrument series: returns, cumulative returns, moving averages, volatility, drawdown, extremes, volume summaries, period change | The cross-sectional reads and the audit trail |
-| Why | O(n) over a series that is already in memory, and the answer depends on the requested range, so caching it by range would multiply the keys while saving microseconds | A ranking needs one comparable number per instrument (which the snapshot's `(instrument, as_of_date, metric_type, lookback_days)` grain already models), and a stored value is the answer to "what did we say on 12 March", which a recomputation cannot reproduce |
-| Cost | One query per request, bounded by the date range | A write path, and recalculation after new prices |
+| What | The whole per-instrument series — returns, cumulative returns, moving averages, volatility, drawdown, extremes, volume summaries, period change — and the cross-sectional ranking built from them | The audit trail |
+| Why | O(n) over rows that are already in memory, and the answer depends on the requested range, so caching it by range would multiply the keys while saving microseconds | A stored value is the answer to "what did we say on 12 March", which a recomputation cannot reproduce |
+| Cost | One query per request, bounded by the date range — except a ranking with no date bounds, which reads the histories it is ranking (see Metric 9) | A write path, and recalculation after new prices |
+
+A ranking's per-instrument numbers are the one place where the snapshot grain is
+already the right answer rather than a future one: the return over `n` sessions is
+`metric_type="return"` with `lookback_days=n`, so "rank the universe by the return
+over 21 sessions as of 14 March" is one indexed read of one row per instrument at
+one `as_of_date`, instead of reading every instrument's prices. The other measures
+would need new `MetricType` choices — the same gap metrics 6, 7 and 8 have — which is
+part of what the recalculation job in [Deliberately not done
+yet](#deliberately-not-done-yet) would settle.
 
 Snapshots are written by a recalculation job, never by a request, which is why
 the analytics API is read-only (`ListAPIView`).
@@ -212,6 +282,8 @@ the analytics API is read-only (`ListAPIView`).
 | **Zero mean volume** (nothing has traded yet in the range) | `relative_volume` is `None` while the running total is `0`; the running total and the session volume are still exact and still reported. | `volume / 0` is not a ratio. Same rule as a zero previous close: report no value rather than `0` (typical of nothing?) or `inf`. |
 | **Duplicate dates** | Rejected. `PriceSeries.assert_one_row_per_date()` raises rather than deduplicating. In the table it cannot happen: `uniq_price_instrument_trading_date` is unique, and re-ingestion upserts on it (the corrected price replaces the old row). | Deduplication would have to choose which of two contradictory closes for one day is real. Either choice fabricates a price; fixing the source is the only correct response. |
 | **Insufficient history** | `None`, never a partial window. Nine observations cannot produce a ten-day measure. | A "7-day average" of three days is a different statistic wearing the same name. A short series returns `None` for the early rows and a value as soon as the window is full. |
+| **A ranking window shorter than its `lookback`** | That instrument's measure is `None` and it is listed **last and unranked**, with its `observations` and the two dates it did have. The ranks of the measured instruments are unaffected. | The same rule as above: a twenty-session total computed over three sessions is a different statistic, and mixing it into one ranking compares unlike things. The row still appears, because a universe that quietly shrank would be a lie about how many instruments were compared. |
+| **An instrument with no prices in the ranking's window** | It is not in the universe at all. | A ranking is over prices: an instrument with no price in the window has no measure and no place in it. Counting reference data instead would make `universe` a fact about the instrument table rather than about the data being compared — so a caller who passed `instrument_ids` can compare that list with `universe` to see who dropped out. |
 | **A period with no observation in it** | `None` throughout — no base, no end, `observations` of `0` — and the result counts it as undefined. Not an error. | The selected bounds are calendar dates and may fall between two sessions, or before the first one, or after the last. There is no pair of prices to divide, so there is no change; the same rule as a date range with no rows. |
 | **No history at all** | An empty series, one query, no error. | A newly listed instrument is a normal state, not a failure. |
 | **Series shorter than the requested lookback** | The loader still looks back as far as there is anything to look at, so no requested row is ever dropped. | See `_warm_up_boundary`. The alternative — comparing a date against the NULL that a shorter history produces — silently returns an empty response. |
@@ -1467,6 +1539,308 @@ cheaper for one long period, and it cannot tell you how many sessions were in it
 | An empty selection (`periods=()`) | No periods, and **no query** | Asking for nothing should not read the database. |
 | An instrument with no prices | One period, `None`, counted as `undefined` | Same as every metric: a newly listed instrument is a normal state. |
 
+## Metric 9 — rankings by return and trading volume
+
+### Business meaning
+
+Every metric so far answers a question about *one* instrument: how much did this
+one move, how volatile was it, how far did it fall. A **ranking** answers a
+question about a *set* of them — which instruments moved most, which traded
+heaviest — and that is a different shape of question, not a different formula. The
+report it serves is "where does each name stand, ordered", and the two measures
+asked for are the two the other metrics already define:
+
+* **by return** — the price change over the window, which is
+  Metric 8 asked once
+  per instrument;
+* **by volume** — the shares traded over the window, which is the total from
+  Metric 7 asked once per instrument.
+
+What a ranking adds is the *comparison*: an order, a rank, and the universe the
+comparison was made over. What it does not add is a recommendation. The engine
+orders instruments by a measure it reports in full, and says nothing about which of
+them to hold — an ordering is arithmetic, and the reader brings the judgement.
+
+### Formula
+
+With `v(i)` the measure for instrument `i`:
+
+```
+v(i)          = (close(last) - close(first)) / close(first)     -- by return
+              = sum(volume(s) for s in window)                  -- by volume
+rank(i)       = 1 + |{ j : v(j) is strictly better than v(i) }|
+better        = greater, when descending (the default); smaller, when ascending
+```
+
+Two properties of that rank definition matter, and both are deliberate:
+
+* **It is computed from the values alone.** A rank is not a position in a sorted
+  list that a query happened to return; it is "how many instruments are strictly
+  ahead of this one". Equal measures therefore share a rank and the next distinct
+  measure skips the numbers they used — competition ranking, `1, 2, 2, 4` — and any
+  two callers ranking the same numbers get the same answer whatever order the rows
+  arrived in.
+* **Ties are broken by symbol, not by chance.** The *order* of two tied rows is
+  still deterministic (symbol ascending), so a report diffed between two runs is
+  stable, even though their ranks are equal.
+
+A row with no measurable value has `rank = None` and is listed after the ranked
+rows. `universe`, `ranked`, `unranked` and `truncated` are on the result, because
+"first of five" and "first of five hundred" are different statements.
+
+### The window is a count of sessions, per instrument
+
+`lookback` is the newest *n* **trading sessions of each instrument** — the engine's
+observation-counting convention, applied across instruments rather than along one.
+Instruments do not all trade on the same days, so counting sessions per instrument
+is what makes the comparison fair: a name halted for a week is ranked on the
+sessions it actually traded, and `observations` on its row says how many there were.
+
+Three cases are worth stating, because each is easy to get wrong:
+
+| Request | The window | What it means |
+|---|---|---|
+| `lookback=21`, no date bounds | each instrument's newest 21 sessions, whenever they were | "where does each name stand"; the read is each instrument's history, so a large universe wants a `start_date` |
+| `lookback=21`, `start_date`/`end_date` | the newest 21 sessions *inside* those bounds | "the last 21 sessions of this period"; the read is bounded by the dates |
+| `lookback=None` (default) | every observation between the bounds | "most active this month": totals over whatever each instrument traded in the range, with `observations` showing that the spans were equal |
+
+**A window shorter than the `lookback` is not a window.** An instrument with fewer
+than *n* observations in the range gets `value = None`, is listed unranked, and
+reports the sessions it had — the same completeness rule the moving averages and the
+volatility apply to their own windows (`sample_size == window`, or nothing), for the
+same reason: a twenty-session total computed over three sessions is a different
+statistic, and mixing the two in one list compares unlike things. A caller who wants
+that rule enforced for every row passes a `lookback`; a caller who accepts ragged
+spans passes `None` and reads `observations`.
+
+A window of exactly **one** observation is a change of `0`, which is what
+Metric 8 already says
+about a one-session period. It is a true statement, and `observations` on the row is
+what lets a reader see how narrow it was. It is also the one place where a single-session
+"return" can enter a ranking, so a caller who does not want it passes `lookback >= 2`.
+
+### Intermediate calculations
+
+The standard three-instrument sample, on the five sessions `2024-03-11 .. 2024-03-15`,
+measured over the whole range and over its newest two sessions:
+
+| Instrument | Closes | Return, 5 sessions | Return, 2 sessions | Volume, 5 sessions | Volume, 2 sessions |
+|---|---|---|---|---|---|
+| AAPL | 100, 102, 101, 103, 104 | `(104 - 100) / 100 = 0.04000000` | `(104 - 103) / 103 = 0.00970874` | `5 x 1000 = 5000` | `2 x 1000 = 2000` |
+| MSFT | 200, 190, 195, 205, 210 | `(210 - 200) / 200 = 0.05000000` | `(210 - 205) / 205 = 0.02439024` | `5 x 500 = 2500` | `2 x 500 = 1000` |
+| GOOG | 50, 51, 52, 53, 54 | `(54 - 50) / 50 = 0.08000000` | `(54 - 53) / 53 = 0.01886792` | `5 x 2000 = 10000` | `2 x 2000 = 4000` |
+
+which ranks, descending, as:
+
+| Rank | By return, 5 sessions | By return, 2 sessions | By volume, 5 sessions | By volume, 2 sessions |
+|---|---|---|---|---|
+| 1 | GOOG `0.08000000` | MSFT `0.02439024` | GOOG `10000` | GOOG `4000` |
+| 2 | MSFT `0.05000000` | GOOG `0.01886792` | AAPL `5000` | AAPL `2000` |
+| 3 | AAPL `0.04000000` | AAPL `0.00970874` | MSFT `2500` | MSFT `1000` |
+
+The window changes the *order* here, which is the point of getting it right: AAPL is
+last over five sessions and last over two, but MSFT is second over five sessions and
+**first** over two — the five-session total is dominated by its `200 → 190` fall, the
+two-session window only sees `205 → 210`. Both are true; only one is the question.
+
+A tie, to show the rank rule (values `0.05, 0.05, 0.02`, descending):
+
+| Instrument | Value | Rank | Why |
+|---|---|---|---|
+| A | `0.05` | 1 | nothing ahead of it |
+| B | `0.05` | 1 | one instrument equal, none strictly ahead |
+| C | `0.02` | 3 | two strictly ahead — so the number 2 is skipped |
+
+### The read: one query for the universe
+
+A ranking must not become one query per instrument, so it does not use the
+per-instrument loader at all. `load_price_cross_section()` reads every instrument's
+observations **in one statement**, ordered by `(instrument_id, trading_date)`, and
+returns them grouped — one `PriceSeries` per instrument, keyed by id. It is still
+the same retrieval discipline (one query, only the requested columns, no warm-up),
+with two departures that follow from reading many instruments at once:
+
+* **The instrument table is joined**, for the one thing the caller cannot supply:
+  the symbols. The per-instrument loader deliberately does not join it, because the
+  caller holds the `Instrument`; a cross-section has no such instance. The join is on
+  a primary key, so `EXPLAIN` shows a single-row index lookup per price row, and a
+  second query for the symbols would cost more than the join.
+* **The window is applied after the read**, because it is per instrument while the
+  read is per range — see the window section above. `start_date`/`end_date` are
+  therefore the hard bound on the work, and the only request that is not bounded by
+  them is `lookback` with no dates, which reads each instrument's history.
+
+The two backends differ only in how the window and the summary of it are taken:
+
+| Backend | How the window is taken | Agreed on |
+|---|---|---|
+| `python` (default) | `PriceSeries.tail(n)` per instrument, then the shared arithmetic per row | — |
+| `pandas` | one frame for the cross-section, `groupby("instrument_id").tail(n)`, then `size`/`first`/`last`/`sum` for every instrument at once | asserted row for row |
+
+`pandas` vectorises the *window and its summary*, not the ratio: `Decimal` is not a
+numpy dtype, and a float division would report a different number from the other
+backend — the one thing a reference implementation may not do. This is the metric the
+`pandas` backend was for: the work is a grouping, and one pass over a frame is what
+grouping is good at.
+
+### What the database does — and the window it declines
+
+This is the metric whose SQL form looks most obvious and is not used, so the reason
+is measured rather than asserted. The natural query is a partitioned row number in a
+derived table, filtered to the newest *n* per instrument:
+
+```sql
+SELECT instrument_id, trading_date, close FROM (
+    SELECT instrument_id, trading_date, close,
+           ROW_NUMBER() OVER (PARTITION BY instrument_id ORDER BY trading_date DESC) AS rn
+    FROM marketdata_pricerecord WHERE trading_date BETWEEN '2024-02-01' AND '2024-03-14'
+) AS ranked WHERE rn <= 31
+```
+
+It is legal, it is a real single-level window, and Django can express it — which is
+exactly why it needed to be *run* to be rejected. Against the benchmark (100 seeded
+instruments, 500 rows each, 31 sessions requested):
+
+Both reads return the same rows — the verification script asserts that set equality,
+not just the timings — and the row-number form is never the faster of the two. The
+absolute milliseconds move between runs, so they are given as ranges:
+
+| Read | Rows returned | Median |
+|---|---|---|
+| Range read, date-bounded (used) | 3,100 | 16–21 ms |
+| Row-number read, date-bounded | 3,100 | 21–22 ms |
+| Range read, no bounds | 50,000 | 74–83 ms |
+| Row-number read, no bounds | 3,100 | 115–133 ms |
+
+With a bound the two read the same rows and the window is pure overhead: a few tens
+of per cent of *extra* work for nothing. **Without** one it does ship sixteen times
+fewer rows and is *still* around 60% slower, for the same reason in both cases —
+`EXPLAIN` shows the window must `Materialize` and sort each partition before
+`rn <= 31` can filter it, so the database pays to look at every row it is trying not
+to return. There is no shape in which it wins, which is why `RANKING_BACKENDS` has no
+`sql` member: the fourth metric without one, and the only one declined on a
+stopwatch rather than an impossibility. Read the shapes, not the digits, and
+reproduce with `scripts/verify_analytics.py`.
+
+The read that *is* used, for the whole universe:
+
+```
+-> Nested loop inner join  (cost=2480 rows=3100)
+    -> Sort: marketdata_pricerecord.instrument_id, marketdata_pricerecord.trading_date
+        -> Index range scan on marketdata_pricerecord using idx_price_trading_date
+           over ('2024-02-01' <= trading_date <= '2024-03-14')
+    -> Single-row index lookup on instruments_instrument using PRIMARY
+       (id = marketdata_pricerecord.instrument_id)
+```
+
+One index range scan over the dates, one primary-key lookup per row for the symbol,
+one sort to group them. 100 instruments and 3,100 rows come back in **one** query —
+which is the property the metric had to have, since the alternative is one query per
+instrument and a universe is not a fixed size.
+
+On the seeded benchmark, the two rankings both cover all 100 instruments (every one
+of them has the full 31 sessions), and the top rows are:
+
+```
+  return: universe 100, ranked 100, unranked 0, lookback 31 sessions
+       1 BENCH0076   0.14722107 obs=31 2024-02-01 .. 2024-03-14
+       2 BENCH0081   0.11692459 obs=31 2024-02-01 .. 2024-03-14
+       3 BENCH0022   0.10895026 obs=31 2024-02-01 .. 2024-03-14
+    ...
+     100 BENCH0082  -0.08894698
+  volume: universe 100, ranked 100, unranked 0, lookback 31 sessions
+       1 BENCH0010      94440317 obs=31 2024-02-01 .. 2024-03-14
+       2 BENCH0091      93725427 obs=31 2024-02-01 .. 2024-03-14
+       3 BENCH0006      91093470 obs=31 2024-02-01 .. 2024-03-14
+```
+
+**The cross-metric check.** Each row's measure is the metric the engine already has,
+not a second definition of it, and the verification script asserts the equality on
+live data: the top return row's `0.14722107` is exactly what
+`percentage_change_for_instrument()` reports between that row's own `first_date` and
+`last_date`, and the top volume row's `94440317` is exactly
+`volume_summaries_for_instrument().summary.total_volume` over the same range. A
+ranking is a comparison; what is being compared is defined once.
+
+### Edge cases with a policy, not an accident
+
+| Situation | Behaviour | Why |
+|---|---|---|
+| A window shorter than the `lookback` | Listed unranked, `value = None`, `observations` reports the sessions it had | A partial window is a different statistic — see the window section |
+| A one-observation window | A return of `0`, ranked, `observations = 1` | Metric 8's rule for a one-session period; the count is on the row |
+| A base price of zero | Listed unranked, `value = None`, both prices and the session count still reported | `(close - 0) / 0` is not a ratio — the same rule as a zero previous close in a daily return |
+| An instrument with no prices in the window | Not in the universe | A ranking is over prices; `universe` is a fact about the data, not the instrument table |
+| A tie on the measure | Equal ranks, `1, 2, 2, 4`; order between the tied rows is by symbol | The rank comes from the values, so it cannot depend on row order |
+| `limit` cutting through the list | Returned rows keep their **absolute** ranks, and `truncated` counts what was left out | A page of a ranking must not renumber its rows |
+| An empty universe | `universe = 0`, `rows = ()`, one query, no error | A range with no prices is a normal state, not a failure |
+| `descending=False` | The same code with the direction flipped: the losers, or the quietest sessions | One implementation, two readings — they cannot drift apart |
+| An unknown measure or backend | Rejected by name, listing what is known | A typo must not silently become a default |
+
+## HTTP surface
+
+Two read-only endpoints, both under `/api/v1/analytics/`:
+
+| Endpoint | Answers |
+|---|---|
+| `GET /instruments/<id>/series/?metric=...` | One metric of one instrument, computed on demand |
+| `GET /rankings/?measure=...` | Instruments compared to one another over one window |
+
+The view is an **adapter and nothing else**: it parses the query parameters, calls
+exactly one service, and serializes the frozen result. There is no arithmetic in it
+and no query construction, so a wrong number is wrong in one place with one test.
+The strongest test of the surface is therefore the round trip — for each of the eight
+per-instrument metrics the rendered body is asserted equal to the serializer's
+rendering of the direct service call — which is what makes "the endpoint is the
+engine" a fact rather than a claim.
+
+**The envelope is the result.** The serializers read the dataclass fields, including
+its properties: `undefined`, `total`, `windows`, `unranked` and `truncated` come from
+the result that computed them rather than being derived a second time. The
+per-instrument results share `MetricResultSerializer` (`symbol`, `backend`,
+`start_date`, `end_date`, `padding`, `undefined`); the ranking stands outside it,
+because a ranking is *about* symbols rather than belonging to one — the same reason
+`Ranking` is not a `MetricResult` in the service layer.
+
+**Rendering is a decision here, not in a metric.** Money and ratios are written at
+eight places — the width of `AnalyticSnapshot.value` — so a ratio computed on demand
+and a price read from the store render alike, and the payload does not depend on which
+driver answered: a close is `Decimal('104')` from SQLite and `Decimal('104.00000000')`
+from MySQL, and both are written `104.00000000`. Counts are written whole. A ranking's
+`value` keeps the precision its measure carries — eight places under `return`, whole
+under `volume`. Every number is a JSON **string**, so no float ever stands in for an
+exact decimal; a missing value is `null`, and its count travels beside it in
+`undefined`. (Money is passed through a metric at whatever precision the store holds
+— see *Money is `Decimal`* above — precisely so this choice lives in one place.)
+
+**There is no pagination, deliberately.** A windowed metric cannot be paged without
+recomputing its warm-up for every page, and the envelope describes the series as a
+whole, so the payload is one object whose `points` are the series. The ranking's
+`limit` truncates *after* ranking, so the rows that come back keep their absolute
+places rather than being renumbered as a page.
+
+**Defaults come from the engine, not from the edge.** An omitted `start_date` or
+`end_date` is no bound — the instrument's whole stored history — which is also why a
+whole-history return series begins with one `null`: the first session of a history has
+no predecessor to return from, and that is a fact about the data rather than a
+warm-up row that was dropped. An omitted `backend` is the backend that exists for that
+metric (`sql` where there is one, else `python`); an omitted `window` is 30 sessions;
+an omitted `names` is all three conventional averages; an omitted `periods` is one
+period spanning the requested range.
+
+**A parameter the metric does not take is a 400, not a no-op.** These endpoints are
+the one place in this API that reject an unknown query parameter — including one
+belonging to a *different* metric, like `?metric=moving_averages&window=7`. The rest of
+the API ignores what it does not understand; a computed answer that silently ignored a
+window would look exactly like one that honoured it, which is the trap the README
+documents for `is_active`. The engine's own `ValueError`s (an unknown backend, an
+inverted range, a window below 2, a period passed alongside the dates it excludes) are
+mapped to `400` rather than allowed to become a `500`.
+
+**Nothing is cached.** A computed series depends on price rows, and a price write does
+not bump the analytics cache namespace, so caching it would risk serving a series
+computed before the newest session. The existing response cache covers the *stored*
+snapshot list, which is invalidated by its own writes.
+
 ## Backend timings, measured
 
 Median of 25 warm calls per cell against MySQL, on the benchmark instrument: 500
@@ -1485,6 +1859,24 @@ ordering and the gaps rather than the digits.
 | Daily returns | **1.96 ms** | 2.13 ms | 2.20 ms |
 | Moving averages (7/30/90, one read) | **2.29 ms** | 4.32 ms | 4.24 ms |
 | Rolling volatility, window 30 | **3.01 ms** | 3.67 ms | 3.99 ms |
+
+The ranking is the one cross-sectional row — a different shape, so it is measured
+separately: 100 seeded instruments, 31 sessions each, the whole universe in one
+query, and the figure covers the read, every instrument's measure, and the sort.
+
+| Ranking | `python` | `pandas` |
+|---|---|---|
+| By return (100 instruments × 31 sessions) | **20 ms** | 25 ms |
+| By volume | **21 ms** | 27 ms |
+
+There is no `sql` column because there is no `sql` backend — the measurement that
+declined it is in [Backends](#backends). `pandas` loses here for the same reason it
+loses every other row, stated plainly because this is the row it was built for: what
+it amortises is the frame, and constructing a frame for 3,100 rows from Python values
+costs more than 100 slices of an already-materialised list. What it does do is the
+*grouping* — one trailing window per instrument, in one pass — which is the shape of
+the metric; the frame cost is the price of that shape at this size, and the number to
+watch as a universe grows rather than a claim that it wins.
 
 What the table says, honestly:
 
@@ -1532,26 +1924,30 @@ What the table says, honestly:
   and the window sums that same column rather than adding a read. Its `pandas` cost
   is close to Python's (1.04 ms) because `cumsum` is a single vectorised pass, with
   no second allocation.
-* **`pandas` is the slowest per instrument and that is not its use case.** Its cost
-  is Series construction and the vectorised call over 500 rows; the same call over
-  fifty instruments in one frame amortises both to nothing, which is what the
-  cross-sectional metrics will do. It is also the independent reference every other
-  backend is asserted against, and import cost is paid once per process (284 ms for
-  the first call, ~1 ms each afterwards).
+* **`pandas` is the slowest per instrument, and it is not a per-instrument backend.**
+  Its cost is frame construction plus a vectorised call over 500 rows, and the
+  construction is a fixed cost per call rather than a per-row one. That is why it is
+  here: it is the independent reference every other backend is asserted against, and
+  it is the grouping backend — the ranking is the metric that groups, and the frame
+  is where that happens. At 100 instruments it is still behind Python (see the
+  ranking table), which is the honest reading: the frame is a cost as well as an
+  instrument, and this engine's per-request size is small. Import cost is paid once
+  per process (284 ms for the first call, ~1 ms each afterwards).
 
 ## How computation changes as the dataset grows
 
 | Growth | Effect | Why |
 |---|---|---|
-| More rows per instrument (longer history) | The loader's range scan is bounded by the requested range, not the instrument's life: `pad + observations in range`. A 20-year history costs the same per request as a 1-year one. | The bounds are pushed into `WHERE`, which uses `uniq_price_instrument_trading_date`. Warm-up padding adds `pad` rows — 1 for a daily return, the longest window minus 1 for the named moving averages, `window` for a volatility, and 0 for cumulative returns, maximum drawdown, price extremes, volume summaries and period change, whose anchors are inside the range — a constant per request, independent of how much history exists. |
-| More instruments | Per-request cost is unchanged: one instrument, one query. Ranking across instruments is the case that changes the answer — it must not become one query per instrument. | Pending: the rankings metric will read the cross-section in one frame and group by instrument, which is what the `pandas` backend is for. |
-| More metrics on the same series | Free if they share the loader call. Each additional metric over the same rows adds arithmetic, not queries. | The loader is the only thing that reads, and it returns every column a metric asked for. The three named moving averages are the case it was built for: one read, three columns, three means. |
+| More rows per instrument (longer history) | The loader's range scan is bounded by the requested range, not the instrument's life: `pad + observations in range`. A 20-year history costs the same per request as a 1-year one. | The bounds are pushed into `WHERE`, which uses `uniq_price_instrument_trading_date`. Warm-up padding adds `pad` rows — 1 for a daily return, the longest window minus 1 for the named moving averages, `window` for a volatility, and 0 for cumulative returns, maximum drawdown, price extremes, volume summaries and period change, whose anchors are inside the range — a constant per request, independent of how much history exists. The ranking has no `pad` either, and for a different reason: its window is per instrument, so it is a slice taken after the read. |
+| More instruments | Per-request cost is unchanged for every per-instrument metric: one instrument, one query. The ranking across instruments is the case that changes the shape, and it still does not become one query per instrument. | `load_price_cross_section()` reads the whole universe in one statement — an index range scan over the dates plus a primary-key lookup per row for the symbol — and groups it in memory. One instrument's request is unaffected by how many others exist; a ranking's grows with the universe it names, and its read is bounded by `start_date`/`end_date` (the one exception being a `lookback` with no dates, which reads the histories it is ranking). |
+| More metrics on the same series | Free if they share the loader call. Each additional metric over the same rows adds arithmetic, not queries. | The loader is the only thing that reads, and it returns every column a metric asked for. The three named moving averages are the case it was built for: one read, three columns, three means. Two rankings by different measures are *not* free — each has its own measure to compute and may need a different column (`volume`) — but they are still one read each. |
 | More concurrent readers | Linear in requests, with no shared mutable state in the engine. | The engine writes nothing. The API's response cache (see [api_optimisation.md](api_optimisation.md)) covers the snapshot reads, not the computed series, which depends on the requested range. |
 | A very long single series read whole | Becomes memory-bound, not query-bound, and is not the shape this engine is designed for: a range is what bounds the work. | If a full-history export is needed, that is an offline job over a DataFrame, not a request. |
+| A ranking with a `lookback` and no date bounds | Reads each instrument's whole history — the metric's one unbounded shape. | `lookback` says how many sessions to *measure*, not how many to *read*: the read is bounded only by dates. A caller ranking a large universe passes `start_date`, or accepts that the read is the histories. This is "a range is what bounds the work" read in the other direction. |
 
 ## Tests
 
-`apps/analytics/tests/test_series.py` — the read boundary, 35 tests:
+`apps/analytics/tests/test_series.py` — the read boundary, 56 tests:
 
 * the whole series in exactly one query, in date order (query count pinned);
 * only the requested columns are selected — `source`, `ingestion_job_id`,
@@ -1570,8 +1966,17 @@ What the table says, honestly:
   partial-frame mean is passed through as data (the metric applies the completeness
   rule), and a window below 1 is rejected;
 * `PriceSeries` invariants: repeated or out-of-order dates raise, `in_range()`
-  drops warm-up from every column, a missing column names what was loaded;
-* the database refuses a second row for one instrument and day.
+  drops warm-up from every column, a missing column names what was loaded,
+  `tail(n)` takes the newest observations and keeps the warm-up count that
+  survived the cut;
+* the database refuses a second row for one instrument and day;
+* the cross-section (the ranking's read): the whole universe in **one** query,
+  grouped by instrument and oldest first, keyed by id and carrying the symbol, the
+  symbol **joined** rather than fetched separately, the same only-the-requested-columns
+  assertion, the instrument filter, the date bounds, an instrument with no
+  observations in the range absent rather than empty, an empty universe, `tail` off
+  each series, unknown fields and a reversed range rejected, no warm-up, and the frame
+  built with one row per observation and the id as an ordinary column.
 
 `apps/analytics/tests/test_daily_returns.py` — the metric, 28 tests:
 
@@ -1748,26 +2153,49 @@ figures, 30 tests:
   observation count rather than a calendar span on a gapped instrument, and the absent
   `sql` backend rejected by name.
 
+`apps/analytics/tests/test_rankings.py` — the cross-section, 53 tests:
+
+* the rank arithmetic with no database at all: descending and ascending from the same
+  code, competition ranks (`1, 2, 2, 4`), the rank asserted as `1 + the number strictly
+  better` for every row, an order that does not depend on the order the points arrived
+  in, ties broken by symbol, unmeasurable points ranked `None` and listed last rather
+  than dropped, `limit` truncating without renumbering, a negative limit rejected, and
+  the inputs of the measure (id, observations, both dates) coming back on the row;
+* the entry point against the sample: the return ranking `GOOG > MSFT > AAPL` at
+  0.08/0.05/0.04 and the volume ranking `GOOG > AAPL > MSFT` at 10000/5000/2500;
+* the measures are the metrics the engine already has, asserted directly: each row's
+  volume equals `volume_summaries_for_instrument().summary.total_volume` and each row's
+  return equals `percentage_change_for_instrument()` over that row's own bounds;
+* both backends agree **row for row** on both measures, and a request is **one** query;
+* the window: `lookback=2` re-orders the sample (`MSFT` first) with the hand-computed
+  two-session values, the volume total windows with it, a `lookback` longer than the
+  history leaves every instrument unranked with its `observations`, and a
+  one-observation window is a return of `0`;
+* the range bounds the eligible observations, and the window is per instrument — an
+  instrument with a gap is measured over *its* newest two sessions and reports the two
+  dates it used;
+* the universe: an instrument filter, an unknown id absent rather than empty, an
+  instrument with no prices in the range absent, no prices at all as an empty ranking,
+  and the universe counted against `COUNT(DISTINCT instrument_id)` on live data;
+* a single-observation instrument still listed with its count, a zero base price
+  unranked with both prices reported, two equal returns sharing a rank, `limit` keeping
+  absolute ranks and `truncated`/`unranked` counting past it, lookup by symbol, and
+  `Ranking` asserted not to be a `MetricResult` (a ranking is about symbols, so it has
+  no symbol of its own);
+* validation: an unknown measure rejected with the vocabulary, an unknown backend
+  rejected, `sql` rejected by name because there is no such backend, a `lookback` below
+  1 and a negative `limit` rejected, and a reversed range rejected.
+
 ## Deliberately not done yet
 
-* **Metric 9 — the cross-sectional rankings.** The per-instrument read exists and the
-  snapshot grain models the answer; what is missing is a read that ranks many
-  instruments *without* becoming one query per instrument.
-* **No HTTP endpoint yet.** The service layer is where a metric is defined, and eight
-  metrics in it is the right moment to fix the shape rather than the moment it was
-  settled: the results now share a `MetricResult` base with a `points` list, a
-  `padding` count, an echoed `window` or set of named series, a nested summary object
-  where a metric has one, an overridable `undefined` count, and a consistent rendering
-  rule, and that is what the serializer, the filters and the query-parameter contract
-  will be written against. Until then, the metrics are called from Python and tested
-  there.
 * **No snapshot recalculation job yet.** `AnalyticSnapshot` already models the
   grain — `(instrument, as_of_date, metric_type, lookback_days)` — and the named moving
-  averages (`moving_average` with `lookback_days` 7/30/90), volatility and the period
-  change are its natural occupants, since a stored value is how a series becomes
-  rankable across instruments and how "what did we say on 12 March" becomes
-  answerable. It is needed by the rankings (metric 9) and by the audit trail, not by a
-  per-instrument series, and it is the next structural piece.
+  averages (`moving_average` with `lookback_days` 7/30/90), volatility, the period
+  change and a ranking's return are its natural occupants, since a stored value is how
+  "what did we say on 12 March" becomes answerable and how a ranking by return becomes
+  one indexed read of one row per instrument instead of reading every instrument's
+  prices. The other measures would need new `MetricType` choices, the same gap metrics
+  6, 7 and 8 have. It is the next structural piece.
 * **No caching of computed series.** The range is part of the key, so a cache would
   multiply keys to save milliseconds over rows that are already a single indexed
   scan. The existing response cache covers the stored snapshot list.
@@ -1795,8 +2223,11 @@ the engine-versus-database comparisons quoted above — including the two
 check, the volume summary against the database's own `SUM`/`AVG`/`MAX`/`MIN`/`COUNT`,
 the period change against the database's own two index lookups (with the cross-check
 that it equals the cumulative return over the same range), the three frames carried in
-the one moving-average statement, and the two nested-window rejections that explain
-why two of the three metrics without a SQL member lack one:
+the one moving-average statement, the two nested-window rejections that explain why
+two of the four metrics without a SQL member lack one, and the ranking: the whole
+universe as one read, each row's measure asserted equal to the per-instrument metric it
+reuses, and the row-number form that `RANKING_BACKENDS` declines run **twice** — bounded
+and unbounded — to show it selects the same rows and is never the faster of the two.
 
 ```powershell
 ./venv/Scripts/python.exe scripts/verify_analytics.py --rounds 30

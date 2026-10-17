@@ -32,6 +32,7 @@ from ..metrics import quantize_price
 from ..series import (
     PriceSeries,
     PriceSeriesError,
+    load_price_cross_section,
     load_price_series,
     missing_trading_dates,
 )
@@ -105,6 +106,53 @@ class PriceSeriesInvariantsTests(SimpleTestCase):
 
         self.assertIn("volume", str(caught.exception))
         self.assertIn("close", str(caught.exception))
+
+
+class PriceSeriesTailTests(SimpleTestCase):
+    """``PriceSeries.tail``: the cross-section's window, as a slice."""
+
+    def series(self):
+        return PriceSeries(
+            symbol="AAPL",
+            dates=(DAY1, DAY2, DAY3, DAY4, DAY5),
+            columns={
+                "close": tuple(
+                    Decimal(value) for value in ("100", "102", "101", "103", "104")
+                ),
+                "volume": (1, 2, 3, 4, 5),
+            },
+        )
+
+    def test_tail_takes_the_newest_observations(self):
+        tail = self.series().tail(2)
+
+        self.assertEqual(tail.dates, (DAY4, DAY5))
+        self.assertEqual(tail.closes, (Decimal("103"), Decimal("104")))
+        self.assertEqual(tail.column("volume"), (4, 5))
+
+    def test_tail_of_one_is_the_last_observation(self):
+        tail = self.series().tail(1)
+
+        self.assertEqual(tail.dates, (DAY5,))
+        self.assertEqual(tail.closes, (Decimal("104"),))
+
+    def test_tail_longer_than_the_series_is_the_whole_series(self):
+        self.assertEqual(self.series().tail(9).dates, self.series().dates)
+
+    def test_tail_of_zero_or_less_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.series().tail(0)
+
+    def test_tail_carries_no_warm_up_rows_that_it_dropped(self):
+        padded = PriceSeries(
+            symbol="AAPL",
+            dates=(DAY1, DAY2, DAY3),
+            columns={"close": (Decimal("1"), Decimal("2"), Decimal("3"))},
+            padding=2,
+        )
+
+        self.assertEqual(padded.tail(1).padding, 0)
+        self.assertEqual(padded.tail(2).padding, 1)
 
 
 class LoaderTests(TestCase):
@@ -490,3 +538,132 @@ class MissingTradingDatesTests(TestCase):
             # instrument's history; 04-03 is unscoped, so it applies here.
             [date(2024, 4, 3)],
         )
+
+
+class CrossSectionLoaderTests(TestCase):
+    """The other read boundary: many instruments, still one query.
+
+    The ranking's read, so the properties tested are the ones that make a
+    cross-section different from a series -- grouping, the id as identity, the
+    joined symbol -- plus the same retrieval discipline (one query, only the
+    requested columns, no warm-up).
+    """
+
+    def setUp(self):
+        self.instruments = load_sample_series()
+
+    def test_the_whole_universe_is_one_query(self):
+        with CaptureQueriesContext(connection) as queries:
+            cross = load_price_cross_section()
+
+        self.assertEqual(len(queries), 1)
+        self.assertEqual(len(cross), 3)
+
+    def test_every_instrument_comes_back_with_all_of_its_observations(self):
+        cross = load_price_cross_section()
+
+        for instrument in self.instruments.values():
+            series = cross.series[instrument.pk]
+            self.assertEqual(series.dates, tuple(sorted(series.dates)))
+            self.assertEqual(len(series), 5)
+
+    def test_the_series_is_keyed_by_id_and_carries_the_symbol(self):
+        cross = load_price_cross_section()
+
+        aapl = cross.series[self.instruments["AAPL"].pk]
+        self.assertEqual(aapl.symbol, "AAPL")
+        self.assertEqual(cross.instruments, tuple(sorted(cross.series)))
+
+    def test_the_symbol_is_joined_rather_than_read_by_a_second_query(self):
+        with CaptureQueriesContext(connection) as queries:
+            load_price_cross_section()
+
+        sql = queries[0]["sql"]
+        self.assertIn("instruments_instrument", sql)
+        self.assertIn("JOIN", sql.upper())
+
+    def test_only_the_columns_a_metric_reads_are_selected(self):
+        with CaptureQueriesContext(connection) as queries:
+            load_price_cross_section(fields=("volume",))
+
+        sql = queries[0]["sql"]
+        self.assertIn("close", sql)
+        self.assertIn("volume", sql)
+        for unread in ("source", "created_at", "ingestion_job_id", "adjusted_close"):
+            self.assertNotIn(unread, sql)
+
+    def test_volume_is_read_only_when_it_is_asked_for(self):
+        with CaptureQueriesContext(connection) as queries:
+            load_price_cross_section()
+
+        self.assertNotIn("volume", queries[0]["sql"])
+
+    def test_extra_columns_are_read_when_they_are_asked_for(self):
+        # The other half of "only the columns a metric uses": a column with a reader
+        # is read, and comes back aligned with the dates.
+        cross = load_price_cross_section(fields=("high", "low"))
+
+        series = cross.series[self.instruments["GOOG"].pk]
+        self.assertEqual(len(series.column("high")), 5)
+
+    def test_date_bounds_filter_the_observations(self):
+        cross = load_price_cross_section(start_date=DAY2, end_date=DAY4)
+
+        self.assertEqual(
+            cross.series[self.instruments["AAPL"].pk].dates, (DAY2, DAY3, DAY4)
+        )
+
+    def test_the_instrument_filter_limits_the_universe(self):
+        aapl = self.instruments["AAPL"]
+
+        cross = load_price_cross_section(instrument_ids=[aapl.pk])
+
+        self.assertEqual(cross.instruments, (aapl.pk,))
+
+    def test_an_instrument_with_no_observations_in_the_range_is_absent(self):
+        cross = load_price_cross_section(start_date=DAY5, end_date=DAY5)
+
+        self.assertEqual(len(cross), 3)
+        for instrument in self.instruments.values():
+            self.assertEqual(len(cross.series[instrument.pk]), 1)
+
+    def test_a_range_with_no_observations_reads_nothing_back(self):
+        cross = load_price_cross_section(
+            start_date=date(2020, 1, 1), end_date=date(2020, 1, 2)
+        )
+
+        self.assertEqual(len(cross), 0)
+        self.assertEqual(cross.instruments, ())
+
+    def test_unknown_fields_are_rejected(self):
+        with self.assertRaises(ValueError) as caught:
+            load_price_cross_section(fields=("dividend",))
+
+        self.assertIn("dividend", str(caught.exception))
+
+    def test_a_reversed_range_is_rejected(self):
+        with self.assertRaises(ValueError):
+            load_price_cross_section(start_date=DAY5, end_date=DAY1)
+
+    def test_a_cross_section_series_has_no_warm_up(self):
+        cross = load_price_cross_section(start_date=DAY3)
+
+        self.assertEqual(cross.series[self.instruments["AAPL"].pk].padding, 0)
+
+    def test_the_frame_has_one_row_per_observation_and_the_id_as_a_column(self):
+        cross = load_price_cross_section(fields=("volume",))
+
+        frame = cross.to_frame()
+
+        self.assertEqual(len(frame), 15)
+        self.assertEqual(
+            list(frame.columns),
+            ["instrument_id", "symbol", "trading_date", "close", "volume"],
+        )
+        self.assertEqual(frame["trading_date"].iloc[0], DAY1)
+        self.assertEqual(set(frame["symbol"]), {"AAPL", "MSFT", "GOOG"})
+
+    def test_the_frame_of_an_empty_cross_section_is_empty(self):
+        cross = load_price_cross_section(instrument_ids=[])
+
+        self.assertEqual(len(cross.to_frame()), 0)
