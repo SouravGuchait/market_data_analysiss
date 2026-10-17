@@ -15,6 +15,9 @@ inherits them.
 
 **Money is ``Decimal``.** Prices are ``DECIMAL(18,8)`` in MySQL and stay exact
 Decimal in Python: ``(102 - 100) / 100`` is ``0.02``, not ``0.020000000000000004``.
+Levels built from prices (a moving average) are money and are quantized as money;
+ratios are quantized as ratios. Two names, because they are eight places for two
+different reasons.
 
 **Ratios are ``Decimal``, quantized to :data:`RATIO_DECIMAL_PLACES` places.**
 That is the width of ``AnalyticSnapshot.value`` (``DECIMAL(18,8)``), so a return
@@ -39,6 +42,7 @@ a price is the serializer's decision, not a metric's.
 from __future__ import annotations
 
 import math
+from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
@@ -48,6 +52,19 @@ from decimal import ROUND_HALF_UP, Decimal
 #: Kept in step with ``AnalyticSnapshot.value`` -- see the module docstring.
 RATIO_EXPONENT = Decimal("0.00000001")
 RATIO_DECIMAL_PLACES = 8
+
+#: The quantum a *price* or a price-derived level (a moving average) is rounded
+#: to. The same eight places as a ratio today, and deliberately a separate name:
+#: they are eight places for different reasons -- the width of the price column
+#: versus the reported precision of a ratio -- and a schema that widened its
+#: prices should not silently change how a return is reported.
+MONEY_EXPONENT = Decimal("0.00000001")
+MONEY_DECIMAL_PLACES = 8
+
+#: Trading sessions in a year, for annualizing a per-session statistic: 52 weeks
+#: x 5 weekdays, less public holidays. The convention, and a model -- see
+#: :func:`rolling_volatility`.
+TRADING_DAYS_PER_YEAR = 252
 
 
 def quantize_ratio(value: Decimal) -> Decimal:
@@ -59,6 +76,25 @@ def quantize_ratio(value: Decimal) -> Decimal:
     round to the same magnitude.
     """
     return value.quantize(RATIO_EXPONENT, rounding=ROUND_HALF_UP)
+
+
+def quantize_price(value: Decimal) -> Decimal:
+    """Rounds a price -- or a level built from prices, such as a moving average
+    -- to the store's width, ``DECIMAL(18,8)``."""
+    return value.quantize(MONEY_EXPONENT, rounding=ROUND_HALF_UP)
+
+
+def format_decimal(value: Decimal | None) -> str | None:
+    """The engine's rendering of a value: fixed point, eight places.
+
+    ``str(Decimal("0.00000000"))`` is ``"0E-8"``, which is not what a report
+    should show for a zero return -- and it is what a naive JSON encoder would
+    emit. Formatting in fixed point explicitly makes a zero look like every other
+    value, so this is what a payload renders and what the tests compare. It is
+    also why the tests assert on this rather than on ``str``: a difference in
+    rendering should not be able to hide behind a test helper.
+    """
+    return None if value is None else format(value, "f")
 
 
 @dataclass(frozen=True)
@@ -203,6 +239,457 @@ def daily_returns_pandas(
                 close=Decimal(closes[index]),
                 previous_close=previous_decimal,
                 value=value,
+            )
+        )
+    return points
+
+
+# --------------------------------------------------------------------------- #
+# Cumulative returns
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class CumulativePoint:
+    """One date, and how far the range has come by then.
+
+    ``growth`` is the wealth relative -- what one unit of currency held at the
+    base has become -- and ``value`` is ``growth - 1``. Both are kept because the
+    index form is what a person checks (``1.0198``) and the return form is what a
+    report quotes (``1.98%``).
+    """
+
+    trading_date: date
+    close: Decimal
+    base_close: Decimal
+    growth: Decimal | None
+    value: Decimal | None
+
+
+def cumulative_returns(
+    dates: Sequence[date],
+    closes: Sequence[Decimal],
+) -> list[CumulativePoint]:
+    """The range's compounded return up to each observation.
+
+    Definition::
+
+        growth(t) = close(t) / close(first)
+        cumulative(t) = growth(t) - 1
+
+    **The base is the first observation of the requested range, and its
+    cumulative return is 0.** The obvious alternative -- anchoring on the last
+    close *before* the range -- is a different statement: it reports the move
+    *into* the range as if it had happened inside it, and it needs a row the
+    caller did not ask for. Anchoring inside the range keeps the answer
+    self-contained: every value is reproducible from the range's own prices, and
+    the leading 0 says where the base is. A caller who wants the move into the
+    range can read the first daily return instead, which is exactly what it is.
+
+    Why this is also "the compounded product of the daily returns": the product
+    telescopes, ``prod(1 + r_i) = close(t) / close(first)``, exactly. The engine
+    divides the two prices rather than multiplying the daily returns because the
+    returns it *reports* are rounded to eight places, and compounding ``n`` of
+    them accumulates up to ``n x 5e-9`` of rounding. Dividing the closes is exact
+    and gives the same number the product would give at full precision. The tests
+    compute the product from the reported returns anyway, as the cross-check that
+    the two agree.
+
+    A day whose return is undefined -- a zero previous close -- **breaks the
+    chain**: every point from that date onwards is ``None``. Skipping the day (as
+    if it had returned 0%) or restarting the chain from the next price would both
+    produce a number that no price supports, and a wealth index that quietly
+    rebases is worse than one that stops.
+    """
+    if len(dates) != len(closes):
+        raise ValueError("dates and closes must be the same length")
+    if not closes:
+        return []
+
+    base = Decimal(closes[0])
+    points: list[CumulativePoint] = []
+    broken = False
+
+    for index, (trading_date, close) in enumerate(zip(dates, closes)):
+        if index and not broken and simple_return(close, closes[index - 1]) is None:
+            broken = True
+
+        if broken:
+            growth = None
+            value = None
+        elif index:
+            raw = Decimal(close) / base
+            growth = quantize_ratio(raw)
+            value = quantize_ratio(raw - 1)
+        else:
+            # The base is defined even if its price is zero: one unit held there
+            # is still one unit. What a zero base price breaks is the *next*
+            # return, which is checked above. Quantized like every other ratio so
+            # that a report renders ``1.00000000`` rather than ``1``.
+            growth = quantize_ratio(Decimal(1))
+            value = quantize_ratio(Decimal(0))
+
+        points.append(
+            CumulativePoint(
+                trading_date=trading_date,
+                close=Decimal(close),
+                base_close=base,
+                growth=growth,
+                value=value,
+            )
+        )
+    return points
+
+
+def cumulative_returns_pandas(
+    dates: Sequence[date],
+    closes: Sequence[Decimal],
+) -> list[CumulativePoint]:
+    """The same result, computed by pandas/numpy.
+
+    A vectorised ratio (``close / close[0]``) for the arithmetic, and an explicit
+    walk for the break rule: the chain policy is a rule about the *series*, not a
+    per-element operation, so it is stated rather than expressed as a mask. The
+    walk is over rows already in memory, so it costs nothing that the vectorised
+    step saved.
+    """
+    import pandas as pd
+
+    if not closes:
+        return []
+
+    close = pd.Series([float(value) for value in closes], dtype="float64")
+    growth = close / close.iloc[0]
+    steps = (close - close.shift(1)) / close.shift(1)
+
+    broken_from = None
+    for index in range(1, len(close)):
+        step = steps.iloc[index]
+        if pd.isna(step) or not math.isfinite(step):
+            broken_from = index
+            break
+
+    points: list[CumulativePoint] = []
+    for index, trading_date in enumerate(dates):
+        defined = broken_from is None or index < broken_from
+        raw = growth.iloc[index]
+
+        if index == 0:
+            growth_decimal, value = quantize_ratio(Decimal(1)), quantize_ratio(Decimal(0))
+        elif defined and math.isfinite(raw):
+            growth_decimal = quantize_ratio(Decimal(str(raw)))
+            value = quantize_ratio(Decimal(str(raw)) - 1)
+        else:
+            growth_decimal, value = None, None
+
+        points.append(
+            CumulativePoint(
+                trading_date=trading_date,
+                close=Decimal(closes[index]),
+                base_close=Decimal(closes[0]),
+                growth=growth_decimal,
+                value=value,
+            )
+        )
+    return points
+
+
+# --------------------------------------------------------------------------- #
+# Moving averages
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class MovingAveragePoint:
+    """One date, the mean of the trailing window, and how full that window was."""
+
+    trading_date: date
+    close: Decimal
+    value: Decimal | None
+    window: int
+    sample_size: int
+
+
+def moving_average(
+    dates: Sequence[date],
+    closes: Sequence[Decimal],
+    window: int,
+    *,
+    values: Sequence[Decimal | None] | None = None,
+) -> list[MovingAveragePoint]:
+    """The arithmetic mean of the trailing ``window`` observations.
+
+    Window semantics, stated once, because "7-day average" is ambiguous and the
+    ambiguity is silent:
+
+    * the window is ``window`` **observations** -- rows -- the current one
+      included. A trading-day window, not a calendar-day one: a holiday does not
+      shorten it, and a gap does not become a member of it. So a "7-day" average
+      over a week containing a holiday spans eight calendar days, and that is the
+      intended reading;
+    * it is **trailing and right-aligned**: ``mean(close(t - window + 1) .. close(t))``,
+      so the value at ``t`` uses no price after ``t``. A centred average would put
+      a future price into a past value, which is not usable in a report about a
+      date;
+    * a **full window is required**. Until ``window`` observations exist the value
+      is ``None``, never the mean of whatever there was: a three-observation mean
+      labelled a seven-observation mean is a different statistic with the same
+      name. ``sample_size`` is reported so a caller can see how far along a young
+      series is.
+
+    ``values`` lets the caller supply the means from the database -- ``AVG(close)
+    OVER (ROWS BETWEEN window - 1 PRECEDING AND CURRENT ROW)`` -- instead of
+    computing them here. A database frame averages however many rows it has, so
+    the supplied values are subject to the same completeness rule as the computed
+    ones (the first ``window - 1`` rows are reported as ``None``), which is what
+    keeps the two routes in agreement.
+
+    The running sum is the implementation: the close that entered the window is
+    added, the one that left it is subtracted, so the cost is O(observations)
+    rather than O(observations x window). That is exact here and would not be with
+    binary floats, where a rolling add/subtract drifts; ``Decimal`` addition is
+    exact, so the incremental sum is *identical* to re-adding the window, which a
+    test asserts.
+    """
+    if window < 1:
+        raise ValueError("window must be at least 1")
+    if len(dates) != len(closes):
+        raise ValueError("dates and closes must be the same length")
+    if values is not None and len(values) != len(closes):
+        raise ValueError("values must be the same length as closes")
+
+    points: list[MovingAveragePoint] = []
+    running = Decimal(0)
+    entering: deque[Decimal] = deque()
+
+    for index, (trading_date, close) in enumerate(zip(dates, closes)):
+        price = Decimal(close)
+        running += price
+        entering.append(price)
+        if len(entering) > window:
+            running -= entering.popleft()
+
+        sample_size = min(index + 1, window)
+        if sample_size < window:
+            value = None
+        elif values is not None:
+            value = None if values[index] is None else quantize_price(Decimal(values[index]))
+        else:
+            value = quantize_price(running / window)
+
+        points.append(
+            MovingAveragePoint(
+                trading_date=trading_date,
+                close=price,
+                value=value,
+                window=window,
+                sample_size=sample_size,
+            )
+        )
+    return points
+
+
+def moving_average_pandas(
+    dates: Sequence[date],
+    closes: Sequence[Decimal],
+    window: int,
+) -> list[MovingAveragePoint]:
+    """The same series through ``Series.rolling(window).mean()``."""
+    import pandas as pd
+
+    if window < 1:
+        raise ValueError("window must be at least 1")
+
+    close = pd.Series([float(value) for value in closes], dtype="float64")
+    # min_periods defaults to the window, which is the completeness rule above.
+    average = close.rolling(window).mean()
+
+    points: list[MovingAveragePoint] = []
+    for index, trading_date in enumerate(dates):
+        value = average.iloc[index]
+        points.append(
+            MovingAveragePoint(
+                trading_date=trading_date,
+                close=Decimal(closes[index]),
+                value=None if pd.isna(value) else quantize_price(Decimal(str(value))),
+                window=window,
+                sample_size=min(index + 1, window),
+            )
+        )
+    return points
+
+
+# --------------------------------------------------------------------------- #
+# Rolling volatility
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class VolatilityPoint:
+    """One date, the standard deviation of the returns ending there, and the
+    working that produced it."""
+
+    trading_date: date
+    value: Decimal | None
+    daily: Decimal | None
+    mean: Decimal | None
+    window: int
+    sample_size: int
+
+
+def rolling_volatility(
+    dates: Sequence[date],
+    returns: Sequence[Decimal | None],
+    window: int,
+    *,
+    periods_per_year: int = TRADING_DAYS_PER_YEAR,
+) -> list[VolatilityPoint]:
+    """The sample standard deviation of the trailing ``window`` daily returns,
+    annualized.
+
+    Definition::
+
+        sigma(t)  = sqrt( sum((r_i - mean(r))^2) / (window - 1) )
+        value(t)  = sigma(t) * sqrt(periods_per_year)
+
+    The window is given as a **count of returns**, so ``window=20`` is the
+    conventional "20-day volatility": twenty daily returns, which needs
+    twenty-one closes. A moving-average window of 20 counts twenty *prices*. The
+    engine keeps each metric's own standard unit and says which it uses, rather
+    than forcing one convention on both and leaving the off-by-one to be
+    discovered; ``sample_size`` is in the response so the difference is visible at
+    a glance.
+
+    Conventions, each one a choice that another engine could make differently:
+
+    * **sample standard deviation, ``ddof = 1``**, dividing by ``window - 1``. The
+      returns in a window are a sample of the process that generated them, not the
+      population, and the choice is not cosmetic: with two observations the two
+      conventions differ by 41%. This also matches ``pandas.rolling().std()``,
+      whose default is ``ddof=1``; the population form is ``ddof=0``.
+    * **simple returns**, the same ones :func:`daily_returns` reports, not log
+      returns. One definition of "return" in the engine is worth more than the
+      small statistical advantage of log returns, which differ at first order for
+      small moves and materially for large ones. A log-return variant would change
+      this function's input, not its arithmetic.
+    * **annualized with ``sqrt(252)``**, 252 sessions a year. This is a model, not
+      a fact: it assumes returns are independent and identically distributed, so
+      that variance grows linearly with time. Real returns cluster -- a quiet week
+      follows a quiet week -- so an annualized figure derived from a quiet window
+      overstates the risk and one from a violent window understates it. The
+      per-session figure is returned as ``daily`` so a reader can annualize
+      differently, or not at all.
+    * **a full window of *defined* returns is required.** A zero previous close
+      inside the window leaves it incomplete and the value is ``None``. A window
+      of identical returns is not incomplete: zero volatility is a value, and it is
+      reported as ``0``.
+
+    ``window`` must be at least 2, because a sample standard deviation of one
+    observation is a division by zero, not a small number.
+    """
+    if window < 2:
+        raise ValueError("a sample standard deviation needs at least 2 returns")
+    if len(dates) != len(returns):
+        raise ValueError("dates and returns must be the same length")
+
+    annualizer = Decimal(periods_per_year).sqrt()
+    points: list[VolatilityPoint] = []
+
+    for index, trading_date in enumerate(dates):
+        start = max(0, index - window + 1)
+        sample = returns[start : index + 1]
+        defined = [value for value in sample if value is not None]
+        sample_size = len(defined)
+
+        if index + 1 < window or sample_size < window:
+            points.append(
+                VolatilityPoint(
+                    trading_date=trading_date,
+                    value=None,
+                    daily=None,
+                    mean=None,
+                    window=window,
+                    sample_size=sample_size,
+                )
+            )
+            continue
+
+        values = [Decimal(value) for value in defined]
+        mean = sum(values, Decimal(0)) / window
+        variance = sum(((value - mean) ** 2 for value in values), Decimal(0)) / (window - 1)
+        sigma = variance.sqrt()
+
+        points.append(
+            VolatilityPoint(
+                trading_date=trading_date,
+                value=quantize_ratio(sigma * annualizer),
+                daily=quantize_ratio(sigma),
+                mean=quantize_ratio(mean),
+                window=window,
+                sample_size=window,
+            )
+        )
+    return points
+
+
+def rolling_volatility_pandas(
+    dates: Sequence[date],
+    returns: Sequence[Decimal | None],
+    window: int,
+    *,
+    periods_per_year: int = TRADING_DAYS_PER_YEAR,
+) -> list[VolatilityPoint]:
+    """The same series through ``Series.rolling(window).std()`` and ``.mean()``.
+
+    ``rolling().std()`` is already ``ddof=1``, which is the convention this module
+    documents; passing its default is the point of comparing against it. An
+    undefined return is carried in as ``NaN``, which makes every window that
+    contains it ``NaN`` -- the same answer as the ``None`` the decimal
+    implementation gives, for the same reason.
+    """
+    import numpy as np
+    import pandas as pd
+
+    if window < 2:
+        raise ValueError("a sample standard deviation needs at least 2 returns")
+
+    series = pd.Series(
+        [np.nan if value is None else float(value) for value in returns], dtype="float64"
+    )
+    deviation = series.rolling(window).std()
+    mean = series.rolling(window).mean()
+    annualizer = math.sqrt(periods_per_year)
+
+    points: list[VolatilityPoint] = []
+    for index, trading_date in enumerate(dates):
+        # How many defined returns were available for this window, whether or not
+        # it was full -- the same number the decimal implementation reports.
+        defined = sum(
+            1 for value in returns[max(0, index - window + 1) : index + 1] if value is not None
+        )
+        sigma = deviation.iloc[index]
+
+        if pd.isna(sigma):
+            points.append(
+                VolatilityPoint(
+                    trading_date=trading_date,
+                    value=None,
+                    daily=None,
+                    mean=None,
+                    window=window,
+                    sample_size=defined,
+                )
+            )
+            continue
+
+        points.append(
+            VolatilityPoint(
+                trading_date=trading_date,
+                value=quantize_ratio(Decimal(str(sigma * annualizer))),
+                daily=quantize_ratio(Decimal(str(sigma))),
+                mean=quantize_ratio(Decimal(str(mean.iloc[index]))),
+                window=window,
+                sample_size=window,
             )
         )
     return points

@@ -28,6 +28,7 @@ from apps.marketdata.tests.helpers import (
     load_sample_series,
 )
 
+from ..metrics import quantize_price
 from ..series import (
     PriceSeries,
     PriceSeriesError,
@@ -217,6 +218,56 @@ class LoaderTests(TestCase):
         # partitioned by instrument even though this query reads one of them.
         self.assertEqual(series.column("previous_close")[0], None)
         self.assertEqual(series.column("previous_close")[1], Decimal("50"))
+
+    def test_the_moving_average_column_is_the_trailing_mean(self):
+        series = load_price_series(
+            self.aapl,
+            start_date=DAY3,
+            end_date=DAY5,
+            pad=2,
+            moving_average_window=3,
+        )
+
+        # (100 + 102 + 101) / 3, then (102 + 101 + 103) / 3, then
+        # (101 + 103 + 104) / 3. Quantized, not compared raw: what the driver
+        # hands back for an average has whatever scale the backend chose for it
+        # (SQLite returned twelve places here), and normalising that is the
+        # engine's job, not the loader's.
+        self.assertEqual(
+            [quantize_price(value) for value in series.column("moving_average")[2:]],
+            [Decimal("101"), Decimal("102"), Decimal("102.66666667")],
+        )
+        self.assertEqual(series.padding, 2)
+
+    def test_a_database_average_of_a_partial_frame_is_still_returned_as_data(self):
+        """The loader does not hide it; the *metric* applies the completeness rule.
+
+        The database's frame averages however many rows it has, so the first rows
+        come back as partial means. Passing them through unchanged is what lets
+        the metric decide -- and what makes a supplied mean comparable with a
+        computed one.
+        """
+        series = load_price_series(self.aapl, moving_average_window=7)
+
+        self.assertEqual(quantize_price(series.column("moving_average")[0]), Decimal("100"))
+        self.assertEqual(quantize_price(series.column("moving_average")[1]), Decimal("101"))
+
+    def test_both_window_columns_can_be_read_together_in_one_query(self):
+        with self.assertNumQueries(1):
+            series = load_price_series(
+                self.aapl,
+                start_date=DAY2,
+                pad=1,
+                with_previous_close=True,
+                moving_average_window=2,
+            )
+
+        self.assertEqual(series.column("previous_close")[1], Decimal("100"))
+        self.assertEqual(series.column("moving_average")[1], Decimal("101"))
+
+    def test_a_moving_average_window_below_one_is_rejected(self):
+        with self.assertRaises(ValueError):
+            load_price_series(self.aapl, moving_average_window=0)
 
     # ----------------------------------------------------------------- #
     # Arguments

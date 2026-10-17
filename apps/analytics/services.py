@@ -10,10 +10,25 @@ in one place instead of spread through a view.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date
 
-from .metrics import ReturnPoint, daily_returns, daily_returns_pandas
+from .metrics import (
+    TRADING_DAYS_PER_YEAR,
+    CumulativePoint,
+    MovingAveragePoint,
+    ReturnPoint,
+    VolatilityPoint,
+    cumulative_returns,
+    cumulative_returns_pandas,
+    daily_returns,
+    daily_returns_pandas,
+    moving_average,
+    moving_average_pandas,
+    rolling_volatility,
+    rolling_volatility_pandas,
+)
 from .models import AnalyticSnapshot
 from .series import load_price_series
 
@@ -69,50 +84,125 @@ def get_latest_snapshot(instrument, metric_type, *, lookback_days=None):
 
 
 # --------------------------------------------------------------------------- #
-# Daily simple returns
+# Metric results and entry points
 # --------------------------------------------------------------------------- #
 
 #: The interchangeable calculation backends.
 #:
-#: * ``sql``    -- the previous close comes from ``LAG(close)`` in the database;
-#: * ``python`` -- the previous close is the previous item of a list;
-#: * ``pandas`` -- the previous close is ``Series.shift(1)``.
+#: * ``sql``    -- the window comes from the database: ``LAG(close)`` for the
+#:                 previous session, ``AVG(close) OVER (...)`` for a trailing
+#:                 mean;
+#: * ``python`` -- the window is computed over a list already in memory;
+#: * ``pandas`` -- the window is a vectorised ``shift`` / ``rolling``.
 #:
-#: All three produce the same points; the tests assert it row for row. ``sql`` is
-#: the default because the engine's canonical path keeps the window in the
-#: database -- but note the honest limit of that claim: for a single instrument
-#: the rows are in memory either way, so the shift is the same work and the SQL
-#: path even returns one extra column. ``LAG`` earns its place as the series
-#: grows, when the windowed value is consumed in the database (a rank, a filter
-#: on the change) or when the alternative would be shipping the rows to compute a
-#: shift -- which is the cross-sectional case, not this one.
+#: Every backend produces the same points, and the tests assert it row for row.
+#: ``sql`` is the default wherever it exists because the engine's canonical path
+#: keeps the window in the database -- with the honest limit stated per metric:
+#: for one small instrument the rows are in memory either way, so the window is
+#: the same work and the SQL path even returns an extra column. ``LAG`` and
+#: ``AVG() OVER`` earn their place as the series or the read shape grows, when the
+#: windowed value is consumed in the database (a rank, a filter on the level) or
+#: when the alternative would be shipping every row to Python to compute a window.
+#:
+#: Two metric families have no ``sql`` member, and both for the same reason -- the
+#: window would have to be computed *from other windowed values*, which SQL does
+#: not allow:
+#:
+#: * cumulative returns need a product, and no SQL dialect has a windowed
+#:   product. ``EXP(SUM(LN(1 + r)))`` is the usual workaround, and it is both
+#:   numerically unstable and undefined for ``r <= -100%``;
+#: * rolling volatility needs the standard deviation *of the returns*, and the
+#:   returns themselves are ``LAG(close)``; a window function may not appear
+#:   inside another window function's arguments.
+#:
+#: Both are computed over rows the loader has already returned, which costs one
+#: query either way.
 DAILY_RETURN_BACKENDS = ("sql", "python", "pandas")
+CUMULATIVE_RETURN_BACKENDS = ("python", "pandas")
+MOVING_AVERAGE_BACKENDS = ("sql", "python", "pandas")
+VOLATILITY_BACKENDS = ("sql", "python", "pandas")
 
 
 @dataclass(frozen=True)
-class DailyReturns:
+class MetricResult:
+    """What every metric entry point returns, beyond its own point type.
+
+    The shared part is small and deliberate: which instrument, which backend
+    produced the arithmetic, which range was answered, how many leading rows were
+    warm-up, and the points themselves. ``undefined`` is defined once here rather
+    than four times, because "how many values are missing" must not mean something
+    slightly different per metric.
+    """
+
+    symbol: str
+    backend: str
+    start_date: date | None = None
+    end_date: date | None = None
+    padding: int = 0
+    points: list = field(default_factory=list)
+
+    @property
+    def undefined(self) -> int:
+        """How many points carry no value.
+
+        Reported rather than dropped: a hole in a series is a fact about the data
+        (the first day, a zero denominator, a window that has not filled yet), and
+        a count is how a caller notices it without inspecting every row.
+        """
+        return sum(1 for point in self.points if point.value is None)
+
+
+@dataclass(frozen=True)
+class DailyReturns(MetricResult):
     """One daily-returns answer, with the inputs that produced it.
 
     ``points`` covers the requested range only: the warm-up row the loader read
     is accounted for by ``padding`` rather than returned as if it were an answer.
     """
 
-    symbol: str
-    backend: str
-    start_date: date | None
-    end_date: date | None
-    padding: int
     points: list[ReturnPoint] = field(default_factory=list)
 
-    @property
-    def undefined(self) -> int:
-        """How many points have no value, and therefore no return.
 
-        Reported rather than dropped: a hole in a series is a fact about the data
-        (the first day, a zero denominator), and a count is how a caller notices
-        it without inspecting every row.
-        """
-        return sum(1 for point in self.points if point.value is None)
+@dataclass(frozen=True)
+class CumulativeReturns(MetricResult):
+    """One cumulative-returns answer.
+
+    ``total`` is the number a report quotes: the range's return by its last
+    observation. It is ``None`` when the chain broke before the end, because the
+    total is then genuinely unknown -- and a value computed from part of the range
+    would be worse than no value at all.
+    """
+
+    points: list[CumulativePoint] = field(default_factory=list)
+
+    @property
+    def total(self):
+        return self.points[-1].value if self.points else None
+
+
+@dataclass(frozen=True)
+class MovingAverages(MetricResult):
+    """One moving-average answer, and the window it was asked for."""
+
+    window: int = 0
+    points: list[MovingAveragePoint] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class RollingVolatility(MetricResult):
+    """One volatility answer, and the conventions it was computed under."""
+
+    window: int = 0
+    periods_per_year: int = 0
+    points: list[VolatilityPoint] = field(default_factory=list)
+
+
+def _reject_backend(backend: str, allowed: Sequence[str]) -> None:
+    """Fails loudly on a backend name that is not interchangeable."""
+    if backend not in allowed:
+        raise ValueError(
+            f"unknown backend {backend!r}; expected one of {', '.join(allowed)}"
+        )
 
 
 def daily_returns_for_instrument(
@@ -133,11 +223,7 @@ def daily_returns_for_instrument(
     One query, whatever the backend: the choice of arithmetic does not change how
     the data is fetched, which is what keeps the backends comparable.
     """
-    if backend not in DAILY_RETURN_BACKENDS:
-        raise ValueError(
-            f"unknown backend {backend!r}; expected one of "
-            f"{', '.join(DAILY_RETURN_BACKENDS)}"
-        )
+    _reject_backend(backend, DAILY_RETURN_BACKENDS)
 
     series = load_price_series(
         instrument,
@@ -162,5 +248,176 @@ def daily_returns_for_instrument(
         start_date=start_date,
         end_date=end_date,
         padding=series.padding,
+        points=points[series.padding :],
+    )
+
+
+def cumulative_returns_for_instrument(
+    instrument,
+    *,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    backend: str = "python",
+) -> CumulativeReturns:
+    """The range's compounded return up to each observation, for one instrument.
+
+    No warm-up row is read, and that is the difference between this metric and
+    the daily returns above: the base of the accumulation is the **first
+    observation inside the range**, whose cumulative return is ``0``. Reading the
+    row before it would move the base outside the range and turn the first answer
+    into the move *into* the period -- a different question, answered by the daily
+    return of that date. So ``pad=0``, and ``padding`` is always ``0`` here.
+
+    Because the base is inside the range, the total the range reports
+    (``result.total``) is ``close(last) / close(first) - 1``: the period's return,
+    computed from the period's own prices.
+
+    ``python`` is the default because there is no SQL backend to default to: SQL
+    has no windowed product -- see the note on
+    :data:`CUMULATIVE_RETURN_BACKENDS`.
+    """
+    _reject_backend(backend, CUMULATIVE_RETURN_BACKENDS)
+
+    series = load_price_series(instrument, start_date=start_date, end_date=end_date)
+
+    if backend == "pandas":
+        points = cumulative_returns_pandas(series.dates, series.closes)
+    else:
+        points = cumulative_returns(series.dates, series.closes)
+
+    return CumulativeReturns(
+        symbol=series.symbol,
+        backend=backend,
+        start_date=start_date,
+        end_date=end_date,
+        padding=series.padding,
+        points=points,
+    )
+
+
+def moving_average_for_instrument(
+    instrument,
+    *,
+    window: int,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    backend: str = "sql",
+) -> MovingAverages:
+    """The trailing mean of ``window`` observations, for one instrument.
+
+    The loader reads ``window - 1`` observations before ``start_date``, so the
+    first requested date has a full window rather than a ``null`` that the
+    database could have answered. This is the metric that makes the loader's
+    general ``pad`` worth having: one row of warm-up was enough for a return, a
+    90-day average needs 89.
+
+    In the ``sql`` backend the mean itself comes from
+    ``AVG(close) OVER (ROWS BETWEEN window - 1 PRECEDING AND CURRENT ROW)``, so
+    the number is computed where the rows are; the other two compute it in Python
+    over the same rows. All three agree, including on the partial windows at the
+    start of a history shorter than the lookback, because the completeness rule
+    (``sample_size == window``) is applied identically to a supplied mean.
+    """
+    _reject_backend(backend, MOVING_AVERAGE_BACKENDS)
+    if window < 1:
+        raise ValueError("window must be at least 1")
+
+    series = load_price_series(
+        instrument,
+        start_date=start_date,
+        end_date=end_date,
+        pad=window - 1,
+        moving_average_window=window if backend == "sql" else None,
+    )
+
+    if backend == "sql":
+        points = moving_average(
+            series.dates,
+            series.closes,
+            window,
+            values=series.column("moving_average"),
+        )
+    elif backend == "pandas":
+        points = moving_average_pandas(series.dates, series.closes, window)
+    else:
+        points = moving_average(series.dates, series.closes, window)
+
+    return MovingAverages(
+        symbol=series.symbol,
+        backend=backend,
+        start_date=start_date,
+        end_date=end_date,
+        padding=series.padding,
+        window=window,
+        points=points[series.padding :],
+    )
+
+
+def rolling_volatility_for_instrument(
+    instrument,
+    *,
+    window: int,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    backend: str = "sql",
+    periods_per_year: int = TRADING_DAYS_PER_YEAR,
+) -> RollingVolatility:
+    """The annualized standard deviation of the last ``window`` returns.
+
+    ``window`` counts returns here, not observations, which is the convention for
+    this statistic ("20-day volatility" means twenty daily returns). It therefore
+    needs ``window + 1`` closes, and the loader reads ``window`` warm-up rows so
+    that the first requested date already has a full window of returns ending on
+    it.
+
+    The ``sql`` backend gets the returns from ``LAG(close)`` in the database and
+    computes the standard deviation in Python; there is no pure-SQL route, because
+    a window function cannot be an argument to another window function -- see the
+    note on :data:`VOLATILITY_BACKENDS`. The other two backends differ only in
+    where the returns came from, which is what makes the three comparable.
+    """
+    _reject_backend(backend, VOLATILITY_BACKENDS)
+    if window < 2:
+        raise ValueError("a sample standard deviation needs at least 2 returns")
+
+    series = load_price_series(
+        instrument,
+        start_date=start_date,
+        end_date=end_date,
+        pad=window,
+        with_previous_close=backend == "sql",
+    )
+
+    if backend == "sql":
+        returns = [
+            point.value
+            for point in daily_returns(
+                series.dates, series.closes, previous_closes=series.column("previous_close")
+            )
+        ]
+    elif backend == "pandas":
+        returns = [
+            point.value for point in daily_returns_pandas(series.dates, series.closes)
+        ]
+    else:
+        returns = [point.value for point in daily_returns(series.dates, series.closes)]
+
+    if backend == "pandas":
+        points = rolling_volatility_pandas(
+            series.dates, returns, window, periods_per_year=periods_per_year
+        )
+    else:
+        points = rolling_volatility(
+            series.dates, returns, window, periods_per_year=periods_per_year
+        )
+
+    return RollingVolatility(
+        symbol=series.symbol,
+        backend=backend,
+        start_date=start_date,
+        end_date=end_date,
+        padding=series.padding,
+        window=window,
+        periods_per_year=periods_per_year,
         points=points[series.padding :],
     )

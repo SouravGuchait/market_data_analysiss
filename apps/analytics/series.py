@@ -30,10 +30,12 @@ from datetime import date
 from decimal import Decimal
 
 from django.db.models import (
+    Avg,
     DateField,
     DecimalField,
     F,
     Q,
+    RowRange,
     Subquery,
     Window,
 )
@@ -49,10 +51,13 @@ ALLOWED_FIELDS = ("open", "high", "low", "adjusted_close", "volume")
 #: one extra column does.
 ALWAYS_READ = ("close",)
 
-#: The output field of the ``LAG(close)`` window. Declared explicitly because
-#: MySQL and SQLite disagree about the type of an undeclared window expression,
-#: and Django would have to guess.
-PREVIOUS_CLOSE_FIELD = DecimalField(max_digits=18, decimal_places=8)
+#: The output field of the window annotations. Declared explicitly because MySQL
+#: and SQLite disagree about the type of an undeclared window expression, and
+#: Django would have to guess.
+PRICE_FIELD = DecimalField(max_digits=18, decimal_places=8)
+
+#: The output field of ``LAG(close)``: a price, like the column it reads.
+PREVIOUS_CLOSE_FIELD = PRICE_FIELD
 
 
 class PriceSeriesError(ValueError):
@@ -198,6 +203,7 @@ def load_price_series(
     pad: int = 0,
     fields: Sequence[str] = (),
     with_previous_close: bool = False,
+    moving_average_window: int | None = None,
 ) -> PriceSeries:
     """Reads one instrument's prices as an ordered, gap-tolerant series.
 
@@ -220,6 +226,18 @@ def load_price_series(
         *session*, not the previous row of some other instrument. Note that the
         window is computed over the rows this query returns -- which is exactly
         why ``pad`` exists.
+    moving_average_window
+        Add ``AVG(close) OVER (ROWS BETWEEN window - 1 PRECEDING AND CURRENT ROW)``
+        as a ``moving_average`` column: the trailing mean the metric would
+        otherwise compute in Python, computed by the database instead.
+
+    The two window columns are parameters of *this* function rather than SQL
+    handed in by a caller, because a window and the padding that makes it correct
+    are one decision. A caller who supplied the expression separately could ask
+    for a 90-row average with ``pad=1`` and get a number that is quietly wrong at
+    the start of the range; here the boundary and the frame come from the same
+    call. They are the two shapes the engine needs -- the previous session, and
+    the trailing mean -- and neither is general-purpose.
 
     Returns
     -------
@@ -245,8 +263,29 @@ def load_price_series(
         raise ValueError("start_date must not be after end_date")
 
     read = [*ALWAYS_READ, *(name for name in fields if name not in ALWAYS_READ)]
-    names = ["trading_date", *read, *(["previous_close"] if with_previous_close else [])]
 
+    window_columns: dict[str, Window] = {}
+    if with_previous_close:
+        window_columns["previous_close"] = Window(
+            expression=Lag("close", output_field=PRICE_FIELD),
+            partition_by=[F("instrument_id")],
+            order_by=F("trading_date").asc(),
+        )
+    if moving_average_window is not None:
+        if moving_average_window < 1:
+            raise ValueError("moving_average_window must be at least 1")
+        window_columns["moving_average"] = Window(
+            expression=Avg("close", output_field=PRICE_FIELD),
+            partition_by=[F("instrument_id")],
+            order_by=F("trading_date").asc(),
+            # The trailing mean, the current row included. A database frame
+            # averages however many rows it has, so the first rows of a range are
+            # a partial mean; the metric applies the completeness rule, and the
+            # two routes agree because that rule is stated in one place.
+            frame=RowRange(start=-(moving_average_window - 1), end=0),
+        )
+
+    names = ["trading_date", *read, *window_columns]
     queryset = PriceRecord.objects.filter(instrument=instrument)
 
     if end_date:
@@ -258,14 +297,8 @@ def load_price_series(
         lower = _warm_up_boundary(instrument, start_date, pad) if pad else start_date
         queryset = queryset.filter(trading_date__gte=lower)
 
-    if with_previous_close:
-        queryset = queryset.annotate(
-            previous_close=Window(
-                expression=Lag("close", output_field=PREVIOUS_CLOSE_FIELD),
-                partition_by=[F("instrument_id")],
-                order_by=F("trading_date").asc(),
-            )
-        )
+    if window_columns:
+        queryset = queryset.annotate(**window_columns)
 
     rows = list(queryset.order_by("trading_date").values_list(*names))
 
@@ -274,8 +307,8 @@ def load_price_series(
         name: tuple(row[position] for row in rows)
         for position, name in enumerate(read, start=1)
     }
-    if with_previous_close:
-        columns["previous_close"] = tuple(row[len(read) + 1] for row in rows)
+    for offset, name in enumerate(window_columns, start=1):
+        columns[name] = tuple(row[len(read) + offset] for row in rows)
 
     series = PriceSeries(
         symbol=instrument.symbol,

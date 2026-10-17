@@ -19,10 +19,10 @@ its edge-case policy, and its trade-offs written down before the next one starts
 | # | Metric | State |
 |---|---|---|
 | 1 | Daily simple returns | implemented |
-| 2 | Cumulative returns | next |
-| 3 | Moving averages (7/30/90) | planned |
-| 4 | Rolling volatility | planned |
-| 5 | Maximum drawdown | planned |
+| 2 | Cumulative returns | implemented |
+| 3 | Moving averages (7/30/90) | implemented |
+| 4 | Rolling volatility | implemented |
+| 5 | Maximum drawdown | next |
 | 6 | Highest and lowest prices | planned |
 | 7 | Trading-volume summaries | planned |
 | 8 | Percentage change over a selected period | planned |
@@ -92,6 +92,60 @@ observations to return; they never invent an observation. A range that spans a
 holiday returns the sessions in it, not a padded series of one row per calendar
 day. `test_a_range_bounded_by_calendar_dates_returns_only_trading_days` pins
 this down.
+
+### Window units: observations, and returns
+
+A window is a count, and *what it counts* differs between the metrics that
+measure a level and the ones that measure a rate. The engine keeps each metric's
+standard unit and states it, rather than forcing one convention on all of them
+and leaving the off-by-one to be discovered:
+
+| Metric | `window` counts | Needs | A "20" window means |
+|---|---|---|---|
+| Moving average | observations (prices) | `window` closes | the mean of 20 closes |
+| Rolling volatility | returns | `window + 1` closes | the deviation of 20 returns |
+| Cumulative returns | — (anchored at the range start) | 1 close | — |
+
+Both columns are right. "20-day volatility" really is the standard deviation of
+twenty daily returns, and "20-day average" really is the mean of twenty closes;
+they differ by one observation, and every response carries `sample_size` (or the
+`window` it was asked for) so the difference is visible rather than assumed.
+
+All windows are **trailing and right-aligned** — a value dated `t` uses no price
+after `t` — and all of them count **observations**, not calendar days, so a
+holiday does not shorten a window and a gap does not become one of its members.
+`pad` is `window - 1` for a moving average, `window` for a volatility (which
+needs one more close than return), and `1` for a daily return. It is `0` for
+cumulative returns, which is the one metric whose anchor is inside the range: see
+its section.
+
+### Backends
+
+Every metric exposes the same interchangeable backends, and every backend returns
+the same points, asserted row for row:
+
+| Metric | `sql` | `python` | `pandas` |
+|---|---|---|---|
+| Daily returns | `LAG(close)` | list shift | `Series.shift(1)` |
+| Moving average | `AVG(close) OVER (...)` | running sum | `Series.rolling` |
+| Rolling volatility | returns from `LAG`, deviation in Python | returns from a shift, deviation in Python | `Series.rolling().std()` |
+| Cumulative returns | — | direct ratio | direct ratio, vectorised |
+
+The two gaps are the same gap. **A metric whose window must be computed from
+*windowed values* cannot be expressed in one SQL query**, because a window
+function may not appear inside another window function's arguments. Cumulative
+returns need a *product* (no dialect has a windowed product), and rolling
+volatility needs the deviation of the *returns*, which are themselves `LAG`s.
+MySQL states the second one outright:
+
+```
+OperationalError: (3593, "You cannot use the window function 'lag' in this context.'")
+```
+
+So the engine does not offer a SQL member it cannot honestly implement. Both are
+computed in Python over rows a single query already returned — which is why the
+choice costs nothing in queries, only in where the arithmetic runs. The engine's
+canonical path stays inside the database wherever a window is a real window.
 
 ### On demand or stored
 
@@ -231,17 +285,10 @@ fallback is only reachable when there is less than `pad` rows of history.
 | `pandas` | `Series.shift(1)`, vectorised | Bulk and offline work: one frame, many instruments, many columns at once. Also the reference implementation. |
 
 All three produce the same points, and the tests assert it row for row on the
-sample series and on real MySQL data. Measured by `scripts/verify_analytics.py`
-on the benchmark instrument (500 rows of history, a 31-observation window, warm,
-median of 30 calls):
+sample series and on real MySQL data. They are timed together with the other
+metrics, in [Backend timings](#backend-timings-measured) below.
 
-| Backend | Median |
-|---|---|
-| `python` | 1.16 ms |
-| `sql` | 1.35 ms |
-| `pandas` | 1.48 ms |
-
-The honest reading of that table is that **for one small instrument the SQL
+The honest reading of those numbers is that **for one small instrument the SQL
 window is not the fastest of the three**, and it is worth saying why rather than
 presenting the canonical path as the fast one. All three pay the same single
 query and the same warm-up boundary; `sql` additionally has MySQL compute a
@@ -279,11 +326,430 @@ worker that only answers from the SQL backend should not pay for them at start-u
 data, and the 1.48 ms above is what the call itself costs once the import has
 been paid for once.
 
+## Metric 2 — cumulative returns
+
+### Business meaning
+
+How far the price has come since the start of the range, as a fraction of where it
+started. It answers "what would one unit held at the start of this period be worth
+by each date", which is the sentence a period return is made of. It is the metric a
+performance report quotes as a single number ("the period returned +4.0%") and the
+one a chart draws as a cumulative curve.
+
+### Formula
+
+```
+growth(t)     = close(t) / close(base)
+cumulative(t) = growth(t) - 1
+```
+
+`base` is the first observation of the requested range. Both forms are reported:
+`growth` is the wealth relative (`1.04`) and `value` is the return (`+4%`), and they
+are the same fact in the two notations a reader might want.
+
+This is also "the compounded product of the daily returns", because the product
+telescopes:
+
+```
+prod(1 + r_i) = close(t) / close(base)
+```
+
+The engine divides the two prices instead of multiplying the returns, and that is
+a deliberate precision choice rather than a shortcut. The returns it *reports* are
+rounded to eight places, so compounding `n` of them accumulates up to `n x 5e-9` of
+rounding — on a 500-day range, more than the value's own last place. Dividing the
+closes is exact and gives the number the product would give at full precision. The
+tests compute the product from the reported returns anyway, bounded by that
+`n x 5e-9`, so the identity is checked rather than assumed.
+
+### The base is inside the range
+
+The obvious alternative is to anchor on the last close *before* the range. That is
+a different statement, and it is worth being explicit about which one this is:
+
+* **inside (this engine)** — the range's return is a statement about the range. The
+  first value is `0`, which says where the base is, and every value is reproducible
+  from the range's own prices;
+* **prior** — the first value is the move *into* the range, computed from a row the
+  caller did not ask for. A caller who wants it can read the daily return of the
+  first date of the range, which is exactly that number (metric 1 reads it with
+  `pad = 1` for this reason).
+
+The consequence is worth stating plainly, because it looks like an inconsistency and
+is not: for the same request, metric 1's first returned value is the move into the
+range while metric 2's is `0`. They are answering different questions — "how did
+this session move" and "how has this period gone" — and the difference is the one
+session at the boundary, which belongs to the previous period.
+
+### Intermediate calculations
+
+| Trading day | Close | Calculation | Growth | Cumulative |
+|---|---|---|---|---|
+| 2024-03-11 | 100 | base | `1.00000000` | `0.00000000` |
+| 2024-03-12 | 102 | `102 / 100` | `1.02000000` | `0.02000000` |
+| 2024-03-13 | 101 | `101 / 100` | `1.01000000` | `0.01000000` |
+| 2024-03-14 | 103 | `103 / 100` | `1.03000000` | `0.03000000` |
+| 2024-03-15 | 104 | `104 / 100` | `1.04000000` | `0.04000000` |
+
+The last figure — `4%`, the range's total — is the number
+`apps/marketdata/tests/helpers.py` already documents as `EXPECTED_RETURN` (`0.04`
+for AAPL, `0.05` for MSFT, `0.08` for GOOG). That fixture was written for the
+period return, this metric must reproduce it, and a test asserts it for all three:
+the same question asked two ways, from two independent pieces of code.
+
+A falling series, because it exercises the sign handling and the rounding of a
+loss:
+
+| Trading day | Close | Growth | Cumulative |
+|---|---|---|---|
+| 2024-03-11 | 200 | `1.00000000` | `0.00000000` |
+| 2024-03-12 | 190 | `0.95000000` | `-0.05000000` |
+| 2024-03-13 | 195 | `0.97500000` | `-0.02500000` |
+| 2024-03-14 | 205 | `1.02500000` | `0.02500000` |
+| 2024-03-15 | 210 | `1.05000000` | `0.05000000` |
+
+### What breaks the chain
+
+A zero close is reachable data, and the day whose return divides by it has no
+return. Every cumulative value from that date onwards is `None` — not `0`, and not
+a chain restarted from the next price. The alternatives and why they lose:
+
+| Behaviour | What it claims | Why not |
+|---|---|---|
+| Skip the day (as if it returned 0%) | That a 100% loss and a recovery did not happen | The wealth relative cannot cross it; the number is fabricated |
+| Restart the chain | That the range's return is measured from a new base | Silently changes what "cumulative" is measured from, and the value is no longer comparable across the break |
+| Propagate `None` (chosen) | That the chain is broken | The only statement the prices support |
+
+The base is the one place a zero price is *fine*: one unit held at a price of zero
+is still one unit, so the first value is `0` even then. What breaks is the *next*
+return, which is checked separately. `CumulativeReturns.total` is the last point's
+value, so a broken chain has no total — and reporting the total of a partial range
+would be worse than reporting nothing.
+
+### Implementations
+
+Two, because there is no third: SQL has no windowed product, so `sql` is not in
+`CUMULATIVE_RETURN_BACKENDS` and asking for it raises rather than silently falling
+back. The `python` backend divides the closes; the `pandas` backend does the same
+with a vectorised ratio (`close / close[0]`) and an explicit walk for the break
+rule. The walk is Python rather than a vector mask because the chain policy is a
+statement about the series, not a per-element operation, and it runs over rows
+already in memory.
+
+## Metric 3 — moving averages (7, 30, 90)
+
+### Business meaning
+
+A smoothed level: the average price over the last week, month, or quarter of
+sessions. It is the reference line a report compares a price against, and it is
+less jumpy than the price itself because a single session moves it by only `1/N` of
+its own move. Three windows are asked for — 7, 30 and 90 sessions — because they
+read as a week, a month and a quarter **of trading**, which is what a market
+participant means by those periods.
+
+The engine reports the level. It does not cross a price over an average, score the
+crossing, or call it a signal; a crossing is a fact about two numbers, and what to
+do about it is a reader's judgement, not this engine's.
+
+### Formula and window semantics
+
+```
+SMA_N(t) = ( close(t-N+1) + … + close(t) ) / N
+```
+
+Three properties, each of which a reader could reasonably have assumed differently,
+so each is pinned by a test:
+
+* **the window is `N` observations**, the current one included. Not calendar days:
+  a "7-day average" over a week containing a holiday spans eight calendar days, and
+  a gap in the ingest does not become a day inside the window. This is what makes
+  the window gap-tolerant by construction;
+* **trailing and right-aligned**: the value at `t` uses no price after `t`. A centred
+  average would put a future price into a past value, which is not usable in a
+  report about a date;
+* **a full window is required.** Until `N` observations exist the value is `None`,
+  never the mean of what there is — a three-observation mean labelled a seven-
+  observation mean is a different statistic with a more impressive name.
+  `sample_size` reports how full the window is, so a young series can be told apart
+  from a hole in the data.
+
+### Intermediate calculations
+
+Closes 10, 12, 11, 13, 15, window 3:
+
+| Trading day | Close | Window | Calculation | Mean |
+|---|---|---|---|---|
+| 2024-03-11 | 10 | 10 | not full (1 of 3) | `null` |
+| 2024-03-12 | 12 | 10, 12 | not full (2 of 3) | `null` |
+| 2024-03-13 | 11 | 10, 12, 11 | `33 / 3` | `11.00000000` |
+| 2024-03-14 | 13 | 12, 11, 13 | `36 / 3` | `12.00000000` |
+| 2024-03-15 | 15 | 11, 13, 15 | `39 / 3` | `13.00000000` |
+
+A mean that needs more than eight places, closes 1, 2, 2 with window 3:
+`5 / 3 = 1.66666…` → `1.66666667` (half up).
+
+The sample series, window 3, requested from 2024-03-13 — the table that shows the
+warm-up paying off:
+
+| Trading day | Close | Window | Calculation | Mean |
+|---|---|---|---|---|
+| 2024-03-13 | 101 | 100, 102, 101 | `303 / 3` | `101.00000000` |
+| 2024-03-14 | 103 | 102, 101, 103 | `306 / 3` | `102.00000000` |
+| 2024-03-15 | 104 | 101, 103, 104 | `308 / 3` | `102.66666667` |
+
+Read without the warm-up, the same three dates give `null`, `null`, and only the
+last mean — which is the contrast a test asserts directly.
+
+### The metric that justifies the loader's `pad`
+
+One row of warm-up was enough for a return. A 90-observation average needs **89**,
+and the loader's boundary subquery takes the offset as a parameter, so nothing about
+the loader changes: `pad=window-1` and the same single query. On the benchmark
+instrument a `window=30` request resolves the boundary 29 rows back and reads 60
+rows — 29 warm-up plus 31 requested — in one round trip. A test asserts the padding
+is exactly `window - 1` and that the first requested date carries a value.
+
+### What the database does with the window
+
+The `sql` backend pushes the whole mean into the query:
+
+```sql
+AVG(close) OVER (PARTITION BY instrument_id ORDER BY trading_date
+                 ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS moving_average
+```
+
+and `EXPLAIN FORMAT=TREE` on it, against MySQL, reads:
+
+```
+-> Sort: marketdata_pricerecord.trading_date
+    -> Table scan on <temporary>  (cost=13.9..17.1 rows=60)
+        -> Temporary table
+            -> Window aggregate with buffering:
+                 avg(marketdata_pricerecord.close) OVER (
+                   PARTITION BY instrument_id ORDER BY trading_date
+                   ROWS BETWEEN 29 PRECEDING AND CURRENT ROW)
+                -> Filter: (trading_date >= <cache>(coalesce((select #2),(select #3))))
+                    -> Index range scan ... over (instrument_id = 13 AND
+                         '2023-12-22' <= trading_date <= '2024-03-14')
+                    -> Select #2 (subquery in condition; run only once)
+                        -> Limit/Offset: 1/28 row(s)
+                    -> Select #3 (subquery in condition; run only once)
+```
+
+Three things in that plan are the design, visible rather than asserted: the frame
+is `29 PRECEDING AND CURRENT ROW`; the boundary subquery is `Limit/Offset: 1/28`,
+i.e. the 29th prior date, computed once (`run only once`) and cached; and the index
+range scan *starts* at the resolved warm-up date (`2023-12-22`), so the padding is
+part of the range rather than a filter applied to a result.
+
+The honest cost is the first line: MySQL implements the window with a **buffer and a
+temporary table**, because a frame aggregate is not streamable in general. That is
+work the Python rolling sum does not do — it is a single pass over rows that are
+already in memory — which is the trade-off the timing table below records.
+
+### Trade-offs
+
+**A rolling sum is exact in `Decimal`, and that is not a small thing.** The
+implementation adds the close that entered the window and subtracts the one that
+left it, so the cost is `O(observations)` rather than `O(observations x window)`.
+With binary floats that optimisation drifts — the classic rolling-sum error, where
+repeated add/subtract leaves a residue — and the shortcut would have to be
+abandoned or corrected. `Decimal` addition is exact, so the incremental sum is
+*identical* to re-adding the window, and a test asserts that identity on prices
+that have no exact binary representation.
+
+**Two routes, one rule about completeness.** The database's `ROWS BETWEEN` frame
+averages *however many rows it has*, so the first rows of a short history come back
+as partial means. Rather than trusting the frame, the engine applies the same
+completeness rule to a supplied mean as to a computed one and reports `None`. The
+rule lives in one place (`sample_size == window`), and the three backends are
+asserted equal on a series shorter than its window — the case where an off-by-one
+would hide.
+
+**A moving average is not a smoothed *return*.** It is a mean of prices, so it is
+denominated in currency and its rounding is money rounding
+(`quantize_price`, eight places) rather than ratio rounding. The two happen to be
+the same width today, which is exactly why they have different names in
+`metrics.py`.
+
+## Metric 4 — rolling volatility
+
+### Business meaning
+
+How much the return moves, i.e. risk as it is conventionally quantified: two
+instruments with the same average return and different volatility are not the same
+investment, and the second number is this one. It is reported per date as a rolling
+statistic, so a report can say "volatility over the last month" as a series rather
+than one number for all time.
+
+### Formula and conventions
+
+```
+sigma(t) = sqrt( sum((r_i - mean(r))^2) / (window - 1) )      over the window's returns
+value(t) = sigma(t) * sqrt(periods_per_year)
+```
+
+Each choice in that pair of lines could reasonably go the other way, so each is
+documented and tested:
+
+* **sample standard deviation, `ddof = 1`**, dividing by `window - 1`. The returns
+  in a window are a sample of the process that generated them, not the population.
+  The choice is not cosmetic: with two observations the population form is 41.4%
+  smaller than the sample form, and a test asserts the sample answer for a window
+  whose two returns are `+10%` and `-10%` (`sigma = 0.1 x sqrt(2) = 0.14142136`, not
+  `0.1`). It also matches `pandas.rolling().std()`, whose default is `ddof=1`;
+* **simple returns**, the same ones metric 1 reports, not log returns. One
+  definition of "return" in the engine is worth more than the modest statistical
+  advantage of log returns, which differ at first order for small moves and
+  materially for large ones. A log-return variant would change the input to the
+  deviation, not the deviation;
+* **annualized by `sqrt(252)`**, 252 sessions a year. This is a model, not a fact,
+  and it is the part of this metric most often quoted without its caveat: it assumes
+  returns are independent and identically distributed so that variance grows
+  linearly with time. Real returns cluster — quiet weeks follow quiet weeks — so an
+  annualized figure taken from a quiet window **overstates** the risk and one taken
+  from a violent window **understates** it. `periods_per_year` is a parameter, the
+  per-session figure is reported alongside as `daily`, and the mean return of the
+  window is reported as `mean`, so the working is in the response and a reader can
+  annualize differently or not at all;
+* **a full window of defined returns is required.** A zero previous close inside the
+  window leaves it incomplete and the value is `None`. A window of *identical*
+  returns is not incomplete: zero volatility is a value, and it is reported as `0`.
+
+`window` must be at least 2, because the sample deviation of one observation is a
+division by zero rather than a small number.
+
+### Intermediate calculations
+
+**Returns 1%, 2%, 3%, window 3.** Mean 2%, deviations -1%, 0, +1%, sum of squares
+`2e-4`, variance `2e-4 / 2 = 1e-4`, so sigma is exactly `0.01`:
+
+| Quantity | Value |
+|---|---|
+| `mean` | `0.02000000` |
+| `daily` | `0.01000000` |
+| Calculation | `0.01 x sqrt(252) = 0.01 x 15.874507866…` |
+| `value` | `0.15874508` |
+
+**Returns +10%, -10%, window 2.** Mean 0, sum of squares `0.02`, variance
+`0.02 / 1 = 0.02`:
+
+| Quantity | Value |
+|---|---|
+| `daily` | `0.14142136` (`0.1 x sqrt(2)`) |
+| Calculation | `0.1 x sqrt(2) x sqrt(252) = 0.1 x sqrt(504)` |
+| `value` | `2.24499443` |
+| The `ddof = 0` answer would be | `0.10000000` — 41.4% smaller |
+
+**Returns 10%, 10%, 10%, window 3.** No deviation at all: `daily = 0.00000000` and
+`value = 0.00000000`, reported as values, not as `null`.
+
+On the sample series with window 3:
+
+| Trading day | Returns in the window | `mean` | `daily` | `value` |
+|---|---|---|---|---|
+| 2024-03-14 | 2.000%, -0.980%, 1.980% | `0.00999935` | `0.01715042` | `0.27225453` |
+| 2024-03-15 | -0.980%, 1.980%, 0.971% | `0.00656893` | `0.01505062` | `0.23892116` |
+
+Reproducibility is a property the tests assert rather than a hope: the deviation is
+computed from the **reported** returns, so a reader can recompute a window's sigma
+from the JSON of metric 1 alone. A test writes the definition out by hand from those
+reported returns and compares.
+
+### Implementations, and the SQL that does not exist
+
+Three backends, but only two kinds of arithmetic: the `sql` backend takes the
+returns from `LAG(close)` — a window function doing exactly the job it is for — and
+then computes the deviation in Python, and `python`/`pandas` differ only in where
+the returns came from and whether the deviation is vectorised. The three agreeing
+point-for-point is therefore a statement about the *implementations* rather than
+about the plumbing: they share their inputs (the reported returns) and their
+convention (`ddof = 1`), so the comparison is between a hand-written decimal loop
+and `Series.rolling().std()` rather than between two spellings of the same loop.
+
+There is no pure-SQL volatility, and the reason is a hard limit rather than a
+preference: the deviation is over the *returns*, the returns are `LAG(close)`, and
+**a window function may not appear inside another window function's arguments**.
+MySQL says so directly:
+
+```
+mysql> SELECT STDDEV_SAMP((close - LAG(close) OVER (...)) / LAG(close) OVER (...))
+              OVER (PARTITION BY instrument_id ORDER BY trading_date ROWS BETWEEN ...);
+ERROR 3593 (HY000): You cannot use the window function 'lag' in this context.
+```
+
+It *is* expressible as a derived table — compute the returns in an inner query, take
+the deviation in an outer window — and the verification script does exactly that as
+a cross-check, which is where this metric gets its strongest piece of evidence.
+MySQL's `STDDEV_SAMP` is the **sample** deviation, i.e. `ddof = 1`, so it is the
+engine's convention computed by a different implementation on a different side of the
+connection, and the two agree. On the benchmark instrument, window 30, last
+available date:
+
+| Quantity | Engine | MySQL `STDDEV_SAMP` in a derived table |
+|---|---|---|
+| `daily` | `0.00831893` | `0.00831892589489335` |
+| `value` | `0.13205884` | `0.13205885` |
+
+The daily figures agree exactly at eight places, and the annualized figures differ by
+one unit in the last place — because the engine deviates the reported returns (eight
+places) while MySQL deviates raw double-precision ratios, and the `sqrt(252)` factor
+multiplies that difference by sixteen. The one-place difference is the honest
+measure of computing from published values rather than from raw ones.
+
+The engine still keeps the deviation in Python for the ordinary path. A derived
+table means a second level of query, a materialised inner result set, and a float
+returned across the connection — three things the engine avoids everywhere else, and
+all three for a movement of one unit in the last place.
+
+## Backend timings, measured
+
+Median of 25 warm calls per cell against MySQL, on the benchmark instrument: 500
+rows of history, 31 observations requested, a 30-observation window where the metric
+takes one. Reproduce with `scripts/verify_analytics.py`; absolute values drift with
+machine load, so read the ordering and the gaps rather than the digits.
+
+| Metric | `python` | `sql` | `pandas` |
+|---|---|---|---|
+| Cumulative returns | **0.67 ms** | — | 1.24 ms |
+| Daily returns | **1.52 ms** | 2.22 ms | 2.22 ms |
+| Moving average, window 30 | **1.52 ms** | 2.19 ms | 2.95 ms |
+| Rolling volatility, window 30 | **3.25 ms** | 3.34 ms | 3.96 ms |
+
+What the table says, honestly:
+
+* **The Python backend wins every row at this size, and the default is still `sql`
+  for three of the four metrics.** This is the trade-off being stated rather than
+  hidden: a single instrument's rows are in memory either way, so the arithmetic is
+  the same work, and the database path adds either an extra column (`LAG`) or a
+  buffer and a temporary table (`AVG() OVER`). The SQL path is the default because it
+  is the one that scales in the direction this engine is built to grow — many
+  instruments, and windows consumed inside the database — and because a metric whose
+  canonical form is a SQL window should not have a Python default that quietly
+  becomes the only implementation.
+* **The moving average shows the widest gap (1.52 vs 2.19 ms)** because its SQL form
+  is the only one that makes the database build a temporary table: a frame aggregate
+  cannot be streamed. The Python rolling sum is a single pass with no allocation.
+* **Volatility is the one row where the gap closes** (`sql` 3.34 vs `python` 3.25):
+  both compute the deviation in Python, so the SQL backend's extra work is just
+  `LAG` instead of a list shift, and the deviation dominates the total. That is the
+  clearest statement of what the `sql` backend actually buys here — the *returns*,
+  not the statistic.
+* **Cumulative returns is the cheapest metric** (0.67 ms) and has no SQL member: it
+  reads no warm-up row and computes a ratio, so the request is one query returning
+  exactly the requested range.
+* **`pandas` is the slowest per instrument and that is not its use case.** Its cost
+  is Series construction and the vectorised call over 500 rows; the same call over
+  fifty instruments in one frame amortises both to nothing, which is what the
+  cross-sectional metrics will do. It is also the independent reference every other
+  backend is asserted against, and import cost is paid once per process (284 ms for
+  the first call, ~1 ms each afterwards).
+
 ## How computation changes as the dataset grows
 
 | Growth | Effect | Why |
 |---|---|---|
-| More rows per instrument (longer history) | The loader's range scan is bounded by the requested range, not the instrument's life: `pad + observations in range`. A 20-year history costs the same per request as a 1-year one. | The bounds are pushed into `WHERE`, which uses `uniq_price_instrument_trading_date`. Warm-up padding adds `pad` rows — a fixed 1 for this metric, 89 for a 90-day average, independent of history length. |
+| More rows per instrument (longer history) | The loader's range scan is bounded by the requested range, not the instrument's life: `pad + observations in range`. A 20-year history costs the same per request as a 1-year one. | The bounds are pushed into `WHERE`, which uses `uniq_price_instrument_trading_date`. Warm-up padding adds `pad` rows — 1 for a daily return, `window - 1` for a moving average, `window` for a volatility, 0 for cumulative returns — a constant per request, independent of how much history exists. |
 | More instruments | Per-request cost is unchanged: one instrument, one query. Ranking across instruments is the case that changes the answer — it must not become one query per instrument. | Pending: the rankings metric will read the cross-section in one frame and group by instrument, which is what the `pandas` backend is for. |
 | More metrics on the same series | Free if they share the loader call. Each additional metric over the same rows adds arithmetic, not queries. | The loader is the only thing that reads, and it returns every column a metric asked for. |
 | More concurrent readers | Linear in requests, with no shared mutable state in the engine. | The engine writes nothing. The API's response cache (see [api_optimisation.md](api_optimisation.md)) covers the snapshot reads, not the computed series, which depends on the requested range. |
@@ -291,7 +757,7 @@ been paid for once.
 
 ## Tests
 
-`apps/analytics/tests/test_series.py` — the read boundary, 22 tests:
+`apps/analytics/tests/test_series.py` — the read boundary, 26 tests:
 
 * the whole series in exactly one query, in date order (query count pinned);
 * only the requested columns are selected — `source`, `ingestion_job_id`,
@@ -300,6 +766,10 @@ been paid for once.
 * warm-up: one row before the range is read, `pad` larger than the available
   history still returns every requested row, `pad` without a `start_date` is a
   no-op, and the window does not lag across instruments;
+* the window columns: `previous_close` is the previous session, the moving-average
+  column is the trailing mean, both can be read in the same single query, a
+  database partial-frame mean is passed through as data (the metric applies the
+  completeness rule), and a window below 1 is rejected;
 * `PriceSeries` invariants: repeated or out-of-order dates raise, `in_range()`
   drops warm-up from every column, a missing column names what was loaded;
 * the database refuses a second row for one instrument and day.
@@ -320,20 +790,82 @@ been paid for once.
 * gaps: returns span a five-day hole, and a calendar-bounded range returns only
   trading days.
 
+`apps/analytics/tests/test_cumulative_returns.py` — the chain, 20 tests:
+
+* the growth and return of the hand-computed series, and that the base itself is
+  `0` rather than `null` (nothing has happened yet, which is a value);
+* the identity that makes the two definitions one: the compounded product of the
+  *reported* returns reproduces the growth within `n x 5e-9`;
+* the break rule: a zero previous close leaves `None` from that date onwards, a
+  series starting at zero is defined at the base and nowhere after, and a broken
+  chain has no `total`;
+* the two backends agree, including on a series whose chain breaks;
+* the service: the base is the first *requested* date (starting at DAY3, the chain
+  starts at `0` on DAY3), `padding` is always `0`, the total equals the
+  `EXPECTED_RETURN` fixture for all three sample instruments, and `backend="sql"`
+  is rejected by name because there is no such backend.
+
+`apps/analytics/tests/test_moving_average.py` — the window, 23 tests:
+
+* the hand-computed series, the `5/3` rounding, a window of 1 (the price itself),
+  and a window exactly as long as the series (one value, on the last date);
+* incompleteness: a window longer than the history is `None` for every date with
+  `sample_size` counting up, rather than a partial mean;
+* the running sum is asserted **exactly** equal to a fresh per-window sum, on
+  prices with no exact binary representation — the claim that `Decimal` makes the
+  `O(n)` shortcut exact;
+* supplied (database) means are used, obey the same completeness rule, and agree
+  with the computed ones when they are the true means;
+* the three backends agree, including when the history is shorter than the window
+  (where a `ROWS BETWEEN` frame would quietly return a partial mean);
+* the service: `padding == window - 1` and the first requested date carries a
+  value; the same dates read without warm-up leave holes; the window counts
+  observations rather than calendar days (prices on DAY1, DAY2 and DAY5 with a
+  window of 3 have a mean on DAY5 across a four-day hole); one query; a window
+  below 1 is rejected.
+
+`apps/analytics/tests/test_rolling_volatility.py` — the deviation, 21 tests:
+
+* three hand-computed cases: exactly `0.01` for returns 1/2/3%, `0.1 x sqrt(2)`
+  for `+10%`/`-10%` written as the assertion that the divisor is `window - 1` and
+  not `window`, and exactly `0` for a flat window;
+* the annualizer: the value is the daily figure times `sqrt(252)`, within the
+  quantum carried through it, and `periods_per_year` is a parameter (a test uses
+  52 and expects `0.1 x sqrt(104)`);
+* incompleteness: an undefined return makes every window containing it `None`,
+  with `sample_size` reporting how many defined returns there were; too little
+  history is `None`, not a short window; a window below 2 is rejected;
+* reproducibility: the deviation is recomputed by hand from metric 1's *reported*
+  returns and compared, so a window's sigma can be recovered from the payload;
+* the three backends agree point for point, and across the warm-up boundary where
+  an off-by-one in `pad` would show (`padding == window`, exact expected values);
+* the service: the window and annualizer are echoed back, one query per request,
+  the young-series holes, a zero close, a flat series (zero volatility on every
+  covered date), an empty instrument, and backend validation.
+
 ## Deliberately not done yet
 
-* Metrics 2–9, each with its own sample, edge-case policy and trade-off note.
+* Metrics 5–9, each with its own sample, edge-case policy and trade-off note:
+  maximum drawdown, price extremes, volume summaries, percentage change over a
+  period, and the cross-sectional rankings.
 * **No HTTP endpoint yet.** The service layer is where a metric is defined, and
-  its shape is still settling (the `points` list, the `padding` count, the
-  backend choice). A serializer written now would be rewritten at metric 3. The
-  endpoint, its filters, and the query-parameter contract arrive once the metric
-  set is stable.
+  four metrics in it is the right moment to fix the shape rather than the moment it
+  was settled: the results now share a `MetricResult` base with a `points` list, a
+  `padding` count, an echoed `window`, and a consistent rendering rule, and that is
+  what the serializer, the filters and the query-parameter contract will be written
+  against. Until then, the metrics are called from Python and tested there.
 * **No snapshot recalculation job yet.** `AnalyticSnapshot` already models the
-  grain and the CLI/service to write it is designed but not built; it is needed
-  by the cross-sectional rankings (metric 9), not by a per-instrument series.
-* **No caching of computed series.** The range is part of the key, so a cache
-  would multiply keys to save milliseconds over rows that are already a single
-  indexed scan. The existing response cache covers the stored snapshot list.
+  grain — `(instrument, as_of_date, metric_type, lookback_days)` — and the moving
+  averages and volatility are its natural occupants, since a stored value is how a
+  series becomes rankable across instruments and how "what did we say on 12 March"
+  becomes answerable. It is needed by the rankings (metric 9) and by the audit
+  trail, not by a per-instrument series, and it is the next structural piece.
+* **No caching of computed series.** The range is part of the key, so a cache would
+  multiply keys to save milliseconds over rows that are already a single indexed
+  scan. The existing response cache covers the stored snapshot list.
+* **No total-return variant.** These metrics read `close`. A total-return series
+  would read `adjusted_close` through the loader's `fields` parameter, which exists
+  for exactly this; the arithmetic above does not change, only the column.
 
 ## Reproducing the verification
 
@@ -347,15 +879,16 @@ been paid for once.
 
 The MySQL checks in this document run read-only against the development database
 and the benchmark instrument seeded by `scripts/bench_api.py` — 500 rows of
-history, of which the request asks for a 31-observation window. They are
-`scripts/verify_analytics.py`, which prints the plan below and asserts the
-padding, backend agreement and single-query properties:
+history, of which the request asks for a 31-observation window. They are all in
+`scripts/verify_analytics.py`, which asserts, per metric, that the request is a
+single query and that the backends agree point for point, and prints the plans and
+the engine-versus-database comparison quoted above:
 
 ```powershell
 ./venv/Scripts/python.exe scripts/verify_analytics.py --rounds 30
 ```
 
-`EXPLAIN FORMAT=TREE` for that request:
+`EXPLAIN FORMAT=TREE` for a `pad = 1` daily-returns request:
 
 ```
 -> Filter: (marketdata_pricerecord.trading_date >= <cache>(coalesce((select #2),(select #3))))  (cost=14.7 rows=32)
