@@ -269,6 +269,53 @@ class LoaderTests(TestCase):
         with self.assertRaises(ValueError):
             load_price_series(self.aapl, moving_average_window=0)
 
+    def test_the_running_max_column_is_the_highest_close_so_far(self):
+        series = load_price_series(
+            self.aapl, start_date=DAY1, end_date=DAY5, with_running_max=True
+        )
+
+        # 100, then max(100, 102), then max(..., 101) = 102, then 103, then 104.
+        self.assertEqual(
+            series.column("running_max"),
+            (
+                Decimal("100"),
+                Decimal("102"),
+                Decimal("102"),
+                Decimal("103"),
+                Decimal("104"),
+            ),
+        )
+
+    def test_the_running_max_starts_at_the_ranges_first_row(self):
+        """The frame is unbounded *preceding within the rows returned*, so the
+        date range is what anchors it -- the property the drawdown's ``pad=0``
+        depends on. DAY2's 102 is the highest close in the table, and a range
+        starting on DAY3 must not see it.
+        """
+        series = load_price_series(
+            self.aapl, start_date=DAY3, end_date=DAY5, with_running_max=True
+        )
+
+        self.assertEqual(
+            series.column("running_max"),
+            (Decimal("101"), Decimal("103"), Decimal("104")),
+        )
+
+    def test_all_three_window_columns_can_be_read_together_in_one_query(self):
+        with self.assertNumQueries(1):
+            series = load_price_series(
+                self.aapl,
+                start_date=DAY2,
+                pad=1,
+                with_previous_close=True,
+                moving_average_window=2,
+                with_running_max=True,
+            )
+
+        self.assertEqual(series.column("previous_close")[1], Decimal("100"))
+        self.assertEqual(series.column("moving_average")[1], Decimal("101"))
+        self.assertEqual(series.column("running_max")[1], Decimal("102"))
+
     # ----------------------------------------------------------------- #
     # Arguments
     # ----------------------------------------------------------------- #

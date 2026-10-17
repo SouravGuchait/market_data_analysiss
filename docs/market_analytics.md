@@ -22,8 +22,8 @@ its edge-case policy, and its trade-offs written down before the next one starts
 | 2 | Cumulative returns | implemented |
 | 3 | Moving averages (7/30/90) | implemented |
 | 4 | Rolling volatility | implemented |
-| 5 | Maximum drawdown | next |
-| 6 | Highest and lowest prices | planned |
+| 5 | Maximum drawdown | implemented |
+| 6 | Highest and lowest prices | next |
 | 7 | Trading-volume summaries | planned |
 | 8 | Percentage change over a selected period | planned |
 | 9 | Rankings by return and trading volume | planned |
@@ -105,6 +105,7 @@ and leaving the off-by-one to be discovered:
 | Moving average | observations (prices) | `window` closes | the mean of 20 closes |
 | Rolling volatility | returns | `window + 1` closes | the deviation of 20 returns |
 | Cumulative returns | — (anchored at the range start) | 1 close | — |
+| Maximum drawdown | — (running maximum from the range start) | 1 close | — |
 
 Both columns are right. "20-day volatility" really is the standard deviation of
 twenty daily returns, and "20-day average" really is the mean of twenty closes;
@@ -116,8 +117,8 @@ after `t` — and all of them count **observations**, not calendar days, so a
 holiday does not shorten a window and a gap does not become one of its members.
 `pad` is `window - 1` for a moving average, `window` for a volatility (which
 needs one more close than return), and `1` for a daily return. It is `0` for
-cumulative returns, which is the one metric whose anchor is inside the range: see
-its section.
+cumulative returns and maximum drawdown, the two metrics whose anchor is inside
+the range: see their sections.
 
 ### Backends
 
@@ -130,21 +131,33 @@ the same points, asserted row for row:
 | Moving average | `AVG(close) OVER (...)` | running sum | `Series.rolling` |
 | Rolling volatility | returns from `LAG`, deviation in Python | returns from a shift, deviation in Python | `Series.rolling().std()` |
 | Cumulative returns | — | direct ratio | direct ratio, vectorised |
+| Maximum drawdown | running maximum from `MAX(close) OVER (...)`, ratio in Python | running maximum scan | `Series.cummax()` |
 
-The two gaps are the same gap. **A metric whose window must be computed from
-*windowed values* cannot be expressed in one SQL query**, because a window
-function may not appear inside another window function's arguments. Cumulative
-returns need a *product* (no dialect has a windowed product), and rolling
-volatility needs the deviation of the *returns*, which are themselves `LAG`s.
-MySQL states the second one outright:
+Two of the five have no `sql` member, and both for the same reason: **a metric
+whose window must be computed from *windowed values* cannot be expressed in one
+SQL query**, because a window function may not appear inside another window
+function's arguments. Cumulative returns need a *product* (no dialect has a
+windowed product), and rolling volatility needs the deviation of the *returns*,
+which are themselves `LAG`s. MySQL states the second one outright:
 
 ```
 OperationalError: (3593, "You cannot use the window function 'lag' in this context.'")
 ```
 
-So the engine does not offer a SQL member it cannot honestly implement. Both are
-computed in Python over rows a single query already returned — which is why the
-choice costs nothing in queries, only in where the arithmetic runs. The engine's
+Maximum drawdown is the test of that rule rather than an exception to it: its
+window is over the *closes*, one legal frame, so the database can carry the whole
+scan — and only the ratio on top of it is computed in Python. Asking the same
+question of a nested window is what fails, which is why the verification script
+writes it as a derived table to get a database-computed cross-check:
+
+```
+OperationalError: (3593, "You cannot use the window function 'max' in this context.'")
+```
+
+So the engine does not offer a SQL member it cannot honestly implement. The two
+without one are computed in Python over rows a single query already returned —
+which is why the choice costs nothing in queries, only in where the arithmetic
+runs. The engine's
 canonical path stays inside the database wherever a window is a real window.
 
 ### On demand or stored
@@ -702,6 +715,160 @@ table means a second level of query, a materialised inner result set, and a floa
 returned across the connection — three things the engine avoids everywhere else, and
 all three for a movement of one unit in the last place.
 
+## Metric 5 — maximum drawdown
+
+### Business meaning
+
+The worst a holder of the instrument could have felt: the largest fall from a
+prior high, and whether it came back. A return says where a price ended up; a
+drawdown says what the path did on the way, which is the difference between two
+instruments that arrive at the same place with very different experience — and it
+is the number a risk limit is usually written against. It is reported per date
+(the decline from the high so far) *and* as one summary episode: how deep, from
+which date to which date, and whether the peak was regained inside the range.
+
+### Formula
+
+```
+peak(t)  = max(close(s) for s <= t)      # the running maximum, s in the range
+value(t) = close(t) / peak(t) - 1        # <= 0; exactly 0 on a new high
+```
+
+The summary is the minimum of `value` over the range, with the pair of dates that
+produced it. The sign is the engine's: a decline is negative, so a report that
+quotes a drawdown as a magnitude reads `-value`. Nothing reports both, because two
+signs for one statistic is how a number gets inverted in a report.
+
+### The peak is inside the range
+
+This is the same decision metric 2 makes about its base, and here it is forced
+rather than chosen. The alternative — the **all-time** high, so that a request
+starting mid-decline reports the decline it inherited — needs the running maximum
+to see every row before `start_date`. The other metrics' warm-up is a *fixed*
+`pad` (`1`, `window - 1`, `window`), and the all-time peak is not fixed: it is
+however far back the instrument's first row is, which turns a bounded range scan
+into an unbounded read and makes the response change as history accumulates.
+
+So the peak starts at the range's first observation, and a caller who wants a
+decline that began earlier asks for a range that starts earlier. The consequence
+is the sharpest version of the point made in metric 2, and a test asserts it as
+the difference between two requests:
+
+| Request | Closes | Peak at the first date | `max_drawdown` |
+|---|---|---|---|
+| whole series | 100, 102, 101, 103, 104 | 100 | `-0.00980392` |
+| from 2024-03-13 | 101, 103, 104 | 101 | `0.00000000` |
+
+The 102 of 2024-03-12 is the highest close in the table, and the second request
+does not see it — not because it is hidden, but because the request is about the
+range from 2024-03-13. `padding` is `0`, so the read is exactly the requested rows.
+
+### Intermediate calculations
+
+The running maximum, and the decline below it, on a series with room for several
+episodes (closes 100, 120, 90, 110, 80, 130):
+
+| Trading day | Close | Peak | Peak date | Calculation | Drawdown |
+|---|---|---|---|---|---|
+| 2024-03-11 | 100 | 100 | 2024-03-11 | new high | `0.00000000` |
+| 2024-03-12 | 120 | 120 | 2024-03-12 | new high | `0.00000000` |
+| 2024-03-13 | 90 | 120 | 2024-03-12 | `90 / 120 - 1` | `-0.25000000` |
+| 2024-03-14 | 110 | 120 | 2024-03-12 | `110 / 120 - 1 = -0.08333…` | `-0.08333333` |
+| 2024-03-15 | 80 | 120 | 2024-03-12 | `80 / 120 - 1 = -0.33333…` | `-0.33333333` |
+| 2024-03-16 | 130 | 130 | 2024-03-16 | new high | `0.00000000` |
+
+The worst episode is the `-0.33333333` of 2024-03-15, measured from the 120 of
+2024-03-12, and it is made back on 2024-03-16 (130 ≥ 120). Every point names its
+own peak, so a reader can check any row of the response rather than only the worst
+one — which is why `peak` and `peak_date` are per point and not just in the
+summary.
+
+The sample series, where the drawdown is small and the recovery immediate:
+
+| Trading day | Close | Peak | Calculation | Drawdown |
+|---|---|---|---|---|
+| 2024-03-11 | 100 | 100 | new high | `0.00000000` |
+| 2024-03-12 | 102 | 102 | new high | `0.00000000` |
+| 2024-03-13 | 101 | 102 | `101 / 102 - 1 = -0.00980392…` | `-0.00980392` |
+| 2024-03-14 | 103 | 103 | new high | `0.00000000` |
+| 2024-03-15 | 104 | 104 | new high | `0.00000000` |
+
+### Edge cases with a policy, not an accident
+
+| Situation | Behaviour | Why |
+|---|---|---|
+| New high | Drawdown `0`, and the peak moves with the price | Nothing was given up. `0` is a value, and it is the only date whose peak is the price itself. |
+| A second date at the same high | The peak date stays at the **first** date that reached it | "The episode starts at the high" means the first high. Otherwise the same decline would date itself from a later row that gave nothing up. |
+| Peak of zero | The drawdown is `None` until the price exceeds zero | `close / 0` is not a ratio. Reporting `0` would claim the price equals its high; `inf` is not a drawdown. The next close above zero is a new high, so the metric resumes. |
+| Series that never fell | `max_drawdown = 0`, `peak_date`/`trough_date` `None`, `recovered` `None` | There is no peak-to-trough episode to name, and nothing was given up to be made back. Naming the first and last dates would invent an episode. |
+| The worst decline twice | The **earliest** episode is reported | A 20% drawdown twice is one number. The earlier one is what a report means, and a recovery search from the later trough would mis-date it. |
+| Still under water at the range's end | `recovered = False`, `recovery_date = None` | A statement about the data, not a forecast: the peak was not regained *by the last observation in the range*. |
+| A gap between sessions | The trough is the next *observation*, however many calendar days later | Windows and episodes count observations, as everywhere else in the engine. |
+
+### What the database does, and why this one has a SQL backend
+
+The running maximum is a scan, and a scan is a window SQL already has:
+
+```sql
+MAX(close) OVER (PARTITION BY instrument_id ORDER BY trading_date
+                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_max
+```
+
+The difference from volatility is the whole point of the rule stated in the
+backends section: this window is over the *closes*, so it is one legal frame, and
+the database can carry the entire scan. Only the ratio on top is arithmetic.
+
+`EXPLAIN FORMAT=TREE` on it, against MySQL, over a request bounded to
+2024-02-01 … 2024-03-14:
+
+```
+-> Sort: marketdata_pricerecord.trading_date
+    -> Table scan on <temporary>
+        -> Temporary table
+            -> Window aggregate: max(marketdata_pricerecord.close) OVER (
+                 PARTITION BY instrument_id ORDER BY trading_date
+                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                -> Sort: instrument_id, trading_date
+                    -> Index range scan ... over (instrument_id = 13 AND
+                         '2024-02-01' <= trading_date <= '2024-03-14')
+```
+
+Two things are visible in that plan and both are the design. The frame is
+`UNBOUNDED PRECEDING AND CURRENT ROW`, so the peak has no ceiling but does have a
+floor — the first row returned. And the range scan **starts at the requested
+date**: there is no offset subquery and no warm-up row in this query at all,
+because the anchoring is by construction rather than by padding.
+
+The honest cost is the same temporary table the moving average pays for, for the
+same reason: a frame aggregate is buffered. The Python and Pandas backends do the
+same scan over rows already in memory, which the timing table below measures.
+
+The database can also produce the *whole* metric — but only one level up, because
+a window function cannot be an argument to another window function. MySQL refuses
+the direct form and accepts the derived one, which is what the verification script
+uses as a cross-check:
+
+```sql
+-- refused, with the same error the volatility section quotes for its own reason
+SELECT MIN(close / MAX(close) OVER (...)) OVER (...);
+
+-- accepted: the running maximum inside, the worst ratio outside
+SELECT MIN(ratio) FROM (
+    SELECT close / MAX(close) OVER (ORDER BY trading_date
+                                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) - 1 AS ratio
+    FROM marketdata_pricerecord
+    WHERE instrument_id = 13 AND trading_date BETWEEN '2024-02-01' AND '2024-03-14'
+) AS peak;
+```
+
+On the benchmark instrument, the derived query returns `-0.025169249869` and the
+engine returns `-0.02516925`: the same number at the engine's eight places, which
+is the strongest check available for a statistic whose "worst row" is a date and
+not a value. The engine still computes the ratio in Python, because the date of
+the worst point — the thing a drawdown report is actually about — is not a SQL
+aggregate, and shipping a float across the connection to recover a date that is
+already in the rows would be the wrong trade.
+
 ## Backend timings, measured
 
 Median of 25 warm calls per cell against MySQL, on the benchmark instrument: 500
@@ -712,6 +879,7 @@ machine load, so read the ordering and the gaps rather than the digits.
 | Metric | `python` | `sql` | `pandas` |
 |---|---|---|---|
 | Cumulative returns | **0.67 ms** | — | 1.24 ms |
+| Maximum drawdown | **0.66 ms** | 1.18 ms | 0.85 ms |
 | Daily returns | **1.52 ms** | 2.22 ms | 2.22 ms |
 | Moving average, window 30 | **1.52 ms** | 2.19 ms | 2.95 ms |
 | Rolling volatility, window 30 | **3.25 ms** | 3.34 ms | 3.96 ms |
@@ -738,6 +906,12 @@ What the table says, honestly:
 * **Cumulative returns is the cheapest metric** (0.67 ms) and has no SQL member: it
   reads no warm-up row and computes a ratio, so the request is one query returning
   exactly the requested range.
+* **Maximum drawdown is the cheapest metric with a `sql` member** (1.18 ms against
+  Python's 0.66 ms), and it is the clearest case of what the SQL path costs at this
+  size: the whole scan is pushed into the database, a `ROWS BETWEEN UNBOUNDED
+  PRECEDING` frame over 31 rows, buffered through a temporary table to return one
+  float per row that Python then divides. `pandas` sits between the two because
+  `cummax` is genuinely vectorised — this is the one metric where it beats `sql`.
 * **`pandas` is the slowest per instrument and that is not its use case.** Its cost
   is Series construction and the vectorised call over 500 rows; the same call over
   fifty instruments in one frame amortises both to nothing, which is what the
@@ -749,7 +923,7 @@ What the table says, honestly:
 
 | Growth | Effect | Why |
 |---|---|---|
-| More rows per instrument (longer history) | The loader's range scan is bounded by the requested range, not the instrument's life: `pad + observations in range`. A 20-year history costs the same per request as a 1-year one. | The bounds are pushed into `WHERE`, which uses `uniq_price_instrument_trading_date`. Warm-up padding adds `pad` rows — 1 for a daily return, `window - 1` for a moving average, `window` for a volatility, 0 for cumulative returns — a constant per request, independent of how much history exists. |
+| More rows per instrument (longer history) | The loader's range scan is bounded by the requested range, not the instrument's life: `pad + observations in range`. A 20-year history costs the same per request as a 1-year one. | The bounds are pushed into `WHERE`, which uses `uniq_price_instrument_trading_date`. Warm-up padding adds `pad` rows — 1 for a daily return, `window - 1` for a moving average, `window` for a volatility, and 0 for cumulative returns and maximum drawdown, whose anchors are inside the range — a constant per request, independent of how much history exists. |
 | More instruments | Per-request cost is unchanged: one instrument, one query. Ranking across instruments is the case that changes the answer — it must not become one query per instrument. | Pending: the rankings metric will read the cross-section in one frame and group by instrument, which is what the `pandas` backend is for. |
 | More metrics on the same series | Free if they share the loader call. Each additional metric over the same rows adds arithmetic, not queries. | The loader is the only thing that reads, and it returns every column a metric asked for. |
 | More concurrent readers | Linear in requests, with no shared mutable state in the engine. | The engine writes nothing. The API's response cache (see [api_optimisation.md](api_optimisation.md)) covers the snapshot reads, not the computed series, which depends on the requested range. |
@@ -757,7 +931,7 @@ What the table says, honestly:
 
 ## Tests
 
-`apps/analytics/tests/test_series.py` — the read boundary, 26 tests:
+`apps/analytics/tests/test_series.py` — the read boundary, 29 tests:
 
 * the whole series in exactly one query, in date order (query count pinned);
 * only the requested columns are selected — `source`, `ingestion_job_id`,
@@ -767,9 +941,10 @@ What the table says, honestly:
   history still returns every requested row, `pad` without a `start_date` is a
   no-op, and the window does not lag across instruments;
 * the window columns: `previous_close` is the previous session, the moving-average
-  column is the trailing mean, both can be read in the same single query, a
-  database partial-frame mean is passed through as data (the metric applies the
-  completeness rule), and a window below 1 is rejected;
+  column is the trailing mean, the running-max column is the highest close so far
+  *within the rows returned* (so the date range anchors it), all three can be read
+  in the same single query, a database partial-frame mean is passed through as data
+  (the metric applies the completeness rule), and a window below 1 is rejected;
 * `PriceSeries` invariants: repeated or out-of-order dates raise, `in_range()`
   drops warm-up from every column, a missing column names what was loaded;
 * the database refuses a second row for one instrument and day.
@@ -843,17 +1018,40 @@ What the table says, honestly:
   the young-series holes, a zero close, a flat series (zero volatility on every
   covered date), an empty instrument, and backend validation.
 
+`apps/analytics/tests/test_maximum_drawdown.py` — the peak, 25 tests:
+
+* the running maximum and the decline it produces, row by row, on a six-session
+  series with several episodes, and the summary episode recovered from them;
+* every point names the peak it is measured from, so any row is checkable and not
+  only the worst one;
+* a new high is a `0` drawdown rather than a missing one, and a tie does not
+  restart the peak date;
+* a zero peak is `None` (`close / 0`), and the metric resumes at the next close
+  above zero; a supplied peak of zero obeys the same rule;
+* supplied (database) peaks are used, obey the length check, and agree with the
+  scan when they are the running maximum;
+* the summary: an unrecovered decline, a series that never fell (`0`, no dates, no
+  `recovered`), equal-depth episodes resolving to the earliest, and an all-`None`
+  series summarising to all-`None`;
+* the three backends agree on the points *and* on the summary, including on a
+  series with a zero peak;
+* the service: the range's own peak as the difference between two requests (the
+  whole series against one starting after the high), `padding == 0` and no warm-up
+  row read, one query, the date bounds, a four-day gap spanned by observation, and
+  backend validation.
+
 ## Deliberately not done yet
 
-* Metrics 5–9, each with its own sample, edge-case policy and trade-off note:
-  maximum drawdown, price extremes, volume summaries, percentage change over a
-  period, and the cross-sectional rankings.
+* Metrics 6–9, each with its own sample, edge-case policy and trade-off note:
+  highest and lowest prices, volume summaries, percentage change over a period,
+  and the cross-sectional rankings.
 * **No HTTP endpoint yet.** The service layer is where a metric is defined, and
-  four metrics in it is the right moment to fix the shape rather than the moment it
+  five metrics in it is the right moment to fix the shape rather than the moment it
   was settled: the results now share a `MetricResult` base with a `points` list, a
-  `padding` count, an echoed `window`, and a consistent rendering rule, and that is
-  what the serializer, the filters and the query-parameter contract will be written
-  against. Until then, the metrics are called from Python and tested there.
+  `padding` count, an echoed `window`, a nested summary object where a metric has
+  one, and a consistent rendering rule, and that is what the serializer, the
+  filters and the query-parameter contract will be written against. Until then, the
+  metrics are called from Python and tested there.
 * **No snapshot recalculation job yet.** `AnalyticSnapshot` already models the
   grain — `(instrument, as_of_date, metric_type, lookback_days)` — and the moving
   averages and volatility are its natural occupants, since a stored value is how a
@@ -882,7 +1080,9 @@ and the benchmark instrument seeded by `scripts/bench_api.py` — 500 rows of
 history, of which the request asks for a 31-observation window. They are all in
 `scripts/verify_analytics.py`, which asserts, per metric, that the request is a
 single query and that the backends agree point for point, and prints the plans and
-the engine-versus-database comparison quoted above:
+the engine-versus-database comparisons quoted above — including the two
+`STDDEV_SAMP` and derived-table `MIN` cross-checks, and the two nested-window
+rejections that explain why two metrics have no SQL member:
 
 ```powershell
 ./venv/Scripts/python.exe scripts/verify_analytics.py --rounds 30

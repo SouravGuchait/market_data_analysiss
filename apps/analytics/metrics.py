@@ -693,3 +693,184 @@ def rolling_volatility_pandas(
             )
         )
     return points
+
+
+@dataclass(frozen=True)
+class DrawdownPoint:
+    """One observation, the peak it is measured against, and the decline.
+
+    ``value`` is the drawdown ``close / peak - 1``: ``0`` on a new high and
+    negative below one. ``peak`` and ``peak_date`` are carried *per point* rather
+    than only in the summary, because "measured from which peak" is the question a
+    drawdown raises, and answering it for the worst date alone would leave every
+    other row of the response uncheckable.
+    """
+
+    trading_date: date
+    close: Decimal
+    peak: Decimal | None
+    peak_date: date | None
+    value: Decimal | None
+
+
+@dataclass(frozen=True)
+class DrawdownSummary:
+    """The worst peak-to-trough decline in a series, and where it happened.
+
+    ``value`` is signed like every other ratio in the engine: negative for a
+    decline, ``0`` for a series that never fell. A report that quotes a drawdown
+    as a magnitude reads ``-value``; the engine does not report both, because two
+    signs for one statistic is how a number gets inverted.
+    """
+
+    value: Decimal | None = None
+    peak_date: date | None = None
+    trough_date: date | None = None
+    peak_close: Decimal | None = None
+    trough_close: Decimal | None = None
+    recovered: bool | None = None
+    recovery_date: date | None = None
+
+
+def drawdown_series(
+    dates: Sequence[date],
+    closes: Sequence[Decimal],
+    *,
+    peaks: Sequence[Decimal | None] | None = None,
+) -> list[DrawdownPoint]:
+    """The decline from the highest close so far, at every observation.
+
+    Definitions::
+
+        peak(t)   = max(close(s) for s <= t)      # the running maximum, s in range
+        value(t)  = close(t) / peak(t) - 1        # <= 0; 0 exactly on a new high
+
+    **The peak is anchored inside the requested range**, at its first
+    observation, which is the same decision :func:`cumulative_returns` makes. The
+    alternative -- the peak of the instrument's whole history, so that a request
+    starting mid-decline reports the decline it inherited -- is a different and
+    also legitimate statistic, and it is *not* available from a bounded read: the
+    running maximum would have to see every row before ``start_date``, where the
+    other metrics read a fixed ``pad``. Anchoring inside the range keeps the read
+    one bounded query and makes the answer reproducible from the range's own
+    prices, which is the property the rest of the engine is built on. A caller who
+    wants a decline that starts earlier requests a range that starts earlier.
+
+    **The peak must be positive for a drawdown to exist.** ``peak = 0`` is
+    reachable (a zero close is permitted by the table), and ``close / 0`` is not a
+    ratio, so the value is ``None`` there rather than ``0`` or ``inf`` -- the
+    engine-wide rule. ``0`` would claim a price equal to its high, and the high is
+    not a number this can divide by.
+
+    ``peaks`` lets a caller supply the running maximum computed elsewhere (the
+    database, in the ``sql`` backend) instead of scanning for it here. The *date*
+    of the peak is derived from the closes in every backend, because the loader
+    carries the level of the running maximum and not the row that first reached
+    it; the supplied values and the derived date agree because the running maximum
+    only moves when a close exceeds it.
+
+    A tie -- a second date reaching the same high -- does not restart the peak:
+    the peak date stays at the first date that reached the level, which is what
+    makes the reported episode start where a reader would say it started.
+    """
+    if len(dates) != len(closes):
+        raise ValueError("dates and closes must be the same length")
+    if peaks is not None and len(peaks) != len(closes):
+        raise ValueError("peaks and closes must be the same length")
+
+    points: list[DrawdownPoint] = []
+    running_peak: Decimal | None = None
+    running_peak_date: date | None = None
+
+    for index, (trading_date, close) in enumerate(zip(dates, closes)):
+        close = Decimal(close)
+
+        if running_peak is None or close > running_peak:
+            running_peak, running_peak_date = close, trading_date
+
+        supplied = peaks[index] if peaks is not None else None
+        peak = running_peak if supplied is None else Decimal(supplied)
+
+        points.append(
+            DrawdownPoint(
+                trading_date=trading_date,
+                close=close,
+                peak=peak,
+                peak_date=running_peak_date,
+                value=None if peak <= 0 else quantize_ratio(close / peak - 1),
+            )
+        )
+    return points
+
+
+def drawdown_series_pandas(
+    dates: Sequence[date],
+    closes: Sequence[Decimal],
+) -> list[DrawdownPoint]:
+    """The same series, with the running maximum taken by ``Series.cummax()``.
+
+    ``cummax`` is the vectorised form of "the highest close so far", and it is the
+    only part of a drawdown that is a scan: the ratio, the peak date and the
+    summary are then the shared code path, so this backend agrees with the others
+    by construction rather than by two implementations happening to match. That
+    matters more here than in most places, because a drawdown has no window to
+    parameterise -- the whole question is *which* row the maximum came from, which
+    is exactly what a cumulative series encodes.
+    """
+    import pandas as pd
+
+    if len(dates) != len(closes):
+        raise ValueError("dates and closes must be the same length")
+
+    peaks = pd.Series([float(value) for value in closes], dtype="float64").cummax()
+    return drawdown_series(dates, closes, peaks=[Decimal(str(value)) for value in peaks])
+
+
+def summarize_drawdown(points: Sequence[DrawdownPoint]) -> DrawdownSummary:
+    """The worst drawdown in a series of points, and whether it was made back.
+
+    The summary is derived from the points rather than computed alongside them, so
+    every backend reports the same episode by construction -- the alternative is
+    three implementations of "which minimum, and was the peak regained", which is
+    three chances to disagree about a date.
+
+    Two ties worth naming, because a reader will eventually hit one:
+
+    * **equal-depth episodes** -- the earliest is reported. A drawdown of 20% twice
+      is one number; the first occurrence is the one a report means by "the
+      drawdown", and it is also the one a recovery search from the later trough
+      would mis-date;
+    * **a series that never fell** -- ``value`` is ``0`` and the dates are ``None``,
+      because there is no peak-to-trough episode to name. ``recovered`` is ``None``
+      for the same reason: nothing was given up, so nothing was made back.
+
+    ``recovered`` is scoped to the range: it says the peak was regained *by the
+    last observation in the range*, not that it ever will be. A drawdown still
+    under water at the end of the range is ``False`` with no ``recovery_date``,
+    which is a fact about the data rather than a judgement about the instrument.
+    """
+    defined = [index for index, point in enumerate(points) if point.value is not None]
+    if not defined:
+        return DrawdownSummary()
+
+    trough_index = min(defined, key=lambda index: points[index].value)
+    worst = points[trough_index]
+
+    if worst.value == 0:
+        return DrawdownSummary(value=quantize_ratio(Decimal(0)))
+
+    recovery_date = None
+    for point in points[trough_index + 1 :]:
+        if worst.peak is not None and point.close >= worst.peak:
+            recovery_date = point.trading_date
+            break
+
+    return DrawdownSummary(
+        value=worst.value,
+        peak_date=worst.peak_date,
+        trough_date=worst.trading_date,
+        peak_close=worst.peak,
+        trough_close=worst.close,
+        recovered=recovery_date is not None,
+        recovery_date=recovery_date,
+    )

@@ -227,6 +227,68 @@ def check_cumulative(instrument):
     )
 
 
+def check_drawdown(instrument, mid, end):
+    print("\n-- maximum drawdown --")
+
+    def request(backend="sql"):
+        return services.maximum_drawdown_for_instrument(
+            instrument, start_date=mid, end_date=end, backend=backend
+        )
+
+    print(explain(captured_sql(request)))
+
+    reference = request("python")
+    for backend in services.DRAWDOWN_BACKENDS:
+        result = request(backend)
+        assert result.points == reference.points, f"{backend} disagrees on the drawdown"
+        assert result.summary == reference.summary, f"{backend} disagrees on the episode"
+        print(
+            f"  {backend:>7}: {len(result.points)} points, padding={result.padding}, "
+            f"max {result.summary.value} from {result.summary.peak_date} "
+            f"to {result.summary.trough_date}, recovered={result.summary.recovered}"
+        )
+    print("  one request: 1 query (asserted above)")
+
+    # The same statistic, written by hand against the database: the running maximum
+    # in an inner query, the worst ratio outside it. The nesting is what the derived
+    # table is for -- a window function cannot be an argument to another window
+    # function, which the first statement proves rather than asserts.
+    instrument_id = instrument.pk
+    nested = f"""
+        SELECT MIN(close / MAX(close) OVER (ORDER BY trading_date
+                                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) - 1)
+               OVER (ORDER BY trading_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+        FROM marketdata_pricerecord WHERE instrument_id = {instrument_id}
+    """
+    derived = f"""
+        SELECT MIN(peak.ratio) FROM (
+            SELECT close / MAX(close) OVER (ORDER BY trading_date
+                                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) - 1
+                   AS ratio
+            FROM marketdata_pricerecord
+            WHERE instrument_id = {instrument_id}
+              AND trading_date BETWEEN '{mid}' AND '{end}'
+        ) AS peak
+    """
+    with connection.cursor() as cursor:
+        try:
+            cursor.execute(nested)
+            raise AssertionError("a window inside a window was accepted, unexpectedly")
+        except Exception as error:  # noqa: BLE001 - the message is the evidence
+            print(f"  one level: {type(error).__name__}: {error}")
+        cursor.execute(derived)
+        worst_raw = cursor.fetchone()[0]
+
+    worst_from_mysql = float(worst_raw)
+    engine_worst = float(reference.summary.value)
+    print(f"  derived table: worst ratio={worst_raw}")
+    print(
+        f"    database={worst_from_mysql:.8f}  engine={engine_worst:.8f}  "
+        f"difference={abs(worst_from_mysql - engine_worst):.2e}"
+    )
+    assert abs(engine_worst - worst_from_mysql) < 1e-7, "MySQL and the engine disagree"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--instrument-id", type=int, default=None)
@@ -287,6 +349,7 @@ def main() -> int:
     check_moving_average(instrument, mid, end)
     check_volatility(instrument, mid, end)
     check_cumulative(instrument)
+    check_drawdown(instrument, mid, end)
 
     print(f"\nOK (window {mid} .. {end})")
     return 0

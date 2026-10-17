@@ -34,6 +34,7 @@ from django.db.models import (
     DateField,
     DecimalField,
     F,
+    Max,
     Q,
     RowRange,
     Subquery,
@@ -204,6 +205,7 @@ def load_price_series(
     fields: Sequence[str] = (),
     with_previous_close: bool = False,
     moving_average_window: int | None = None,
+    with_running_max: bool = False,
 ) -> PriceSeries:
     """Reads one instrument's prices as an ordered, gap-tolerant series.
 
@@ -230,14 +232,20 @@ def load_price_series(
         Add ``AVG(close) OVER (ROWS BETWEEN window - 1 PRECEDING AND CURRENT ROW)``
         as a ``moving_average`` column: the trailing mean the metric would
         otherwise compute in Python, computed by the database instead.
+    with_running_max
+        Add ``MAX(close) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)``
+        as a ``running_max`` column: the highest close so far, which is the peak a
+        drawdown is measured from. Its frame is unbounded to the start of the rows
+        returned, so with ``pad=0`` the peak is the range's own -- which is the
+        anchoring :func:`apps.analytics.metrics.drawdown_series` documents.
 
-    The two window columns are parameters of *this* function rather than SQL
-    handed in by a caller, because a window and the padding that makes it correct
-    are one decision. A caller who supplied the expression separately could ask
-    for a 90-row average with ``pad=1`` and get a number that is quietly wrong at
-    the start of the range; here the boundary and the frame come from the same
-    call. They are the two shapes the engine needs -- the previous session, and
-    the trailing mean -- and neither is general-purpose.
+    The window columns are parameters of *this* function rather than SQL handed in
+    by a caller, because a window and the padding that makes it correct are one
+    decision. A caller who supplied the expression separately could ask for a
+    90-row average with ``pad=1`` and get a number that is quietly wrong at the
+    start of the range; here the boundary and the frame come from the same call.
+    They are the shapes the engine needs -- the previous session, the trailing
+    mean, and the running maximum -- and none is general-purpose.
 
     Returns
     -------
@@ -283,6 +291,17 @@ def load_price_series(
             # a partial mean; the metric applies the completeness rule, and the
             # two routes agree because that rule is stated in one place.
             frame=RowRange(start=-(moving_average_window - 1), end=0),
+        )
+    if with_running_max:
+        window_columns["running_max"] = Window(
+            expression=Max("close", output_field=PRICE_FIELD),
+            partition_by=[F("instrument_id")],
+            order_by=F("trading_date").asc(),
+            # Unbounded to the start of the rows this query returns, which with
+            # ``pad=0`` is the start of the requested range. It is a real window
+            # -- a running maximum is a scan -- so unlike the deviation it can be
+            # had from the database in one level.
+            frame=RowRange(start=None, end=0),
         )
 
     names = ["trading_date", *read, *window_columns]

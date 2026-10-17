@@ -17,6 +17,8 @@ from datetime import date
 from .metrics import (
     TRADING_DAYS_PER_YEAR,
     CumulativePoint,
+    DrawdownPoint,
+    DrawdownSummary,
     MovingAveragePoint,
     ReturnPoint,
     VolatilityPoint,
@@ -24,10 +26,13 @@ from .metrics import (
     cumulative_returns_pandas,
     daily_returns,
     daily_returns_pandas,
+    drawdown_series,
+    drawdown_series_pandas,
     moving_average,
     moving_average_pandas,
     rolling_volatility,
     rolling_volatility_pandas,
+    summarize_drawdown,
 )
 from .models import AnalyticSnapshot
 from .series import load_price_series
@@ -117,10 +122,17 @@ def get_latest_snapshot(instrument, metric_type, *, lookback_days=None):
 #:
 #: Both are computed over rows the loader has already returned, which costs one
 #: query either way.
+#:
+#: Maximum drawdown *does* have a SQL member, which is the test of that rule
+#: rather than an exception to it: its window -- the running maximum -- is a
+#: plain frame over the closes, so ``MAX(close) OVER (ROWS BETWEEN UNBOUNDED
+#: PRECEDING AND CURRENT ROW)`` is one legal window, and only the ratio on top of
+#: it is arithmetic.
 DAILY_RETURN_BACKENDS = ("sql", "python", "pandas")
 CUMULATIVE_RETURN_BACKENDS = ("python", "pandas")
 MOVING_AVERAGE_BACKENDS = ("sql", "python", "pandas")
 VOLATILITY_BACKENDS = ("sql", "python", "pandas")
+DRAWDOWN_BACKENDS = ("sql", "python", "pandas")
 
 
 @dataclass(frozen=True)
@@ -195,6 +207,19 @@ class RollingVolatility(MetricResult):
     window: int = 0
     periods_per_year: int = 0
     points: list[VolatilityPoint] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class MaximumDrawdown(MetricResult):
+    """One drawdown answer: the per-date decline, and the worst episode in it.
+
+    The summary is a field rather than seven more attributes on the result, so
+    that the flat part of the result stays the shared part and the episode stays
+    one object with its own docstring.
+    """
+
+    summary: DrawdownSummary = field(default_factory=DrawdownSummary)
+    points: list[DrawdownPoint] = field(default_factory=list)
 
 
 def _reject_backend(backend: str, allowed: Sequence[str]) -> None:
@@ -419,5 +444,60 @@ def rolling_volatility_for_instrument(
         padding=series.padding,
         window=window,
         periods_per_year=periods_per_year,
+        points=points[series.padding :],
+    )
+
+
+def maximum_drawdown_for_instrument(
+    instrument,
+    *,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    backend: str = "sql",
+) -> MaximumDrawdown:
+    """The worst peak-to-trough decline in the range, for one instrument.
+
+    No warm-up row is read, for the same reason as the cumulative returns above:
+    the peak is anchored at the **first observation inside the range**, so the
+    first point's drawdown is ``0`` and the answer is reproducible from the
+    range's own prices. Reading the rows before ``start_date`` would move the peak
+    outside the range and report a decline the caller did not ask about -- and it
+    cannot be a fixed ``pad`` anyway, since the all-time peak is however far back
+    the instrument's first row is. A caller who wants a decline from an earlier
+    peak asks for a range that starts earlier, which is the same answer for one
+    query instead of an unbounded one.
+
+    The ``sql`` backend gets the running maximum -- the whole of the scan -- from
+    ``MAX(close) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)`` and
+    computes only the ratio on top of it. That this metric has a SQL member while
+    volatility does not is the point of the rule in
+    :data:`DRAWDOWN_BACKENDS`: the window here is over the closes, not over another
+    window's output.
+    """
+    _reject_backend(backend, DRAWDOWN_BACKENDS)
+
+    series = load_price_series(
+        instrument,
+        start_date=start_date,
+        end_date=end_date,
+        with_running_max=backend == "sql",
+    )
+
+    if backend == "sql":
+        points = drawdown_series(
+            series.dates, series.closes, peaks=series.column("running_max")
+        )
+    elif backend == "pandas":
+        points = drawdown_series_pandas(series.dates, series.closes)
+    else:
+        points = drawdown_series(series.dates, series.closes)
+
+    return MaximumDrawdown(
+        symbol=series.symbol,
+        backend=backend,
+        start_date=start_date,
+        end_date=end_date,
+        padding=series.padding,
+        summary=summarize_drawdown(points),
         points=points[series.padding :],
     )
