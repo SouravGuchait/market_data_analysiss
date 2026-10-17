@@ -316,6 +316,38 @@ class LoaderTests(TestCase):
         self.assertEqual(series.column("moving_average")[1], Decimal("101"))
         self.assertEqual(series.column("running_max")[1], Decimal("102"))
 
+    def test_the_running_extremes_columns_come_back_from_one_query(self):
+        with self.assertNumQueries(1):
+            series = load_price_series(
+                self.aapl, start_date=DAY1, end_date=DAY5, with_running_extremes=True
+            )
+
+        # 100, 102, 101, 103, 104: the max only moves up, the min never moves.
+        self.assertEqual(
+            series.column("running_max"),
+            (
+                Decimal("100"),
+                Decimal("102"),
+                Decimal("102"),
+                Decimal("103"),
+                Decimal("104"),
+            ),
+        )
+        self.assertEqual(series.column("running_min"), (Decimal("100"),) * 5)
+
+    def test_a_two_direction_series_anchors_both_extremes_at_the_range_start(self):
+        """The minimum is anchored by the same date bound as the maximum, so a low
+        that happened before the range is invisible -- the property the extreme
+        metric's ``pad=0`` depends on."""
+        series = load_price_series(
+            self.aapl, start_date=DAY2, end_date=DAY5, with_running_extremes=True
+        )
+
+        self.assertEqual(
+            series.column("running_min"),
+            (Decimal("102"), Decimal("101"), Decimal("101"), Decimal("101")),
+        )
+
     # ----------------------------------------------------------------- #
     # Arguments
     # ----------------------------------------------------------------- #

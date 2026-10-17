@@ -23,8 +23,8 @@ its edge-case policy, and its trade-offs written down before the next one starts
 | 3 | Moving averages (7/30/90) | implemented |
 | 4 | Rolling volatility | implemented |
 | 5 | Maximum drawdown | implemented |
-| 6 | Highest and lowest prices | next |
-| 7 | Trading-volume summaries | planned |
+| 6 | Highest and lowest prices | implemented |
+| 7 | Trading-volume summaries | next |
 | 8 | Percentage change over a selected period | planned |
 | 9 | Rankings by return and trading volume | planned |
 
@@ -62,7 +62,9 @@ the same magnitude, and it is what a reader of a reported percentage expects
 here — the first day of a series genuinely has no return — and `0` would be a
 claim that the price did not move. It is represented as JSON `null` once an
 endpoint renders it, and every result counts its undefined points so a caller can
-see a hole without reading every row.
+see a hole without reading every row. A metric whose points *cannot* be missing a
+value — the price extremes, where every row has a close — still answers the count,
+with `0` and a reason rather than by raising.
 
 **Inputs are normalised through `Decimal(...)`.** What a driver hands back for a
 `DECIMAL(18,8)` column is not one type: MySQL returns `Decimal('100.00000000')`,
@@ -106,6 +108,7 @@ and leaving the off-by-one to be discovered:
 | Rolling volatility | returns | `window + 1` closes | the deviation of 20 returns |
 | Cumulative returns | — (anchored at the range start) | 1 close | — |
 | Maximum drawdown | — (running maximum from the range start) | 1 close | — |
+| Price extremes | — (running extremes from the range start) | 1 close | — |
 
 Both columns are right. "20-day volatility" really is the standard deviation of
 twenty daily returns, and "20-day average" really is the mean of twenty closes;
@@ -117,8 +120,8 @@ after `t` — and all of them count **observations**, not calendar days, so a
 holiday does not shorten a window and a gap does not become one of its members.
 `pad` is `window - 1` for a moving average, `window` for a volatility (which
 needs one more close than return), and `1` for a daily return. It is `0` for
-cumulative returns and maximum drawdown, the two metrics whose anchor is inside
-the range: see their sections.
+cumulative returns, maximum drawdown and price extremes — the three metrics whose
+anchor is inside the range: see their sections.
 
 ### Backends
 
@@ -132,8 +135,9 @@ the same points, asserted row for row:
 | Rolling volatility | returns from `LAG`, deviation in Python | returns from a shift, deviation in Python | `Series.rolling().std()` |
 | Cumulative returns | — | direct ratio | direct ratio, vectorised |
 | Maximum drawdown | running maximum from `MAX(close) OVER (...)`, ratio in Python | running maximum scan | `Series.cummax()` |
+| Price extremes | running maximum and minimum from `MAX(close)`/`MIN(close) OVER (...)` | running scan in both directions | `Series.cummax()`/`cummin()` |
 
-Two of the five have no `sql` member, and both for the same reason: **a metric
+Two of the six have no `sql` member, and both for the same reason: **a metric
 whose window must be computed from *windowed values* cannot be expressed in one
 SQL query**, because a window function may not appear inside another window
 function's arguments. Cumulative returns need a *product* (no dialect has a
@@ -144,11 +148,12 @@ which are themselves `LAG`s. MySQL states the second one outright:
 OperationalError: (3593, "You cannot use the window function 'lag' in this context.'")
 ```
 
-Maximum drawdown is the test of that rule rather than an exception to it: its
-window is over the *closes*, one legal frame, so the database can carry the whole
-scan — and only the ratio on top of it is computed in Python. Asking the same
-question of a nested window is what fails, which is why the verification script
-writes it as a derived table to get a database-computed cross-check:
+Maximum drawdown and price extremes are the test of that rule rather than an
+exception to it: their windows are over the *closes* — one legal frame, or two of
+them — so the database can carry the whole scan, and only the arithmetic on top of
+it is computed in Python. Asking for two levels is what fails, which is why the
+verification script writes the drawdown as a derived table to get a
+database-computed cross-check:
 
 ```
 OperationalError: (3593, "You cannot use the window function 'max' in this context.'")
@@ -157,8 +162,8 @@ OperationalError: (3593, "You cannot use the window function 'max' in this conte
 So the engine does not offer a SQL member it cannot honestly implement. The two
 without one are computed in Python over rows a single query already returned —
 which is why the choice costs nothing in queries, only in where the arithmetic
-runs. The engine's
-canonical path stays inside the database wherever a window is a real window.
+runs. The engine's canonical path stays inside the database wherever a window is a
+real window.
 
 ### On demand or stored
 
@@ -869,6 +874,177 @@ the worst point — the thing a drawdown report is actually about — is not a S
 aggregate, and shipping a float across the connection to recover a date that is
 already in the rows would be the wrong trade.
 
+## Metric 6 — highest and lowest prices
+
+### Business meaning
+
+What the period actually contained. A moving average or a return compresses a
+range into one number; the extremes say how far the price travelled, which is what
+a support level, a limit order or a stop is set against, and what a reader means by
+"it traded between X and Y". Both the date and the price are reported, because a
+high without a date cannot be checked or plotted.
+
+### Formula
+
+```
+highest_close(t) = max(close(s) for s <= t)
+lowest_close(t)  = min(close(s) for s <= t)     # s in the range
+```
+
+and, over the whole range, two more pairs from the traded columns:
+
+```
+highest_high = max(high(s))      lowest_low = min(low(s))
+traded_range = highest_high - lowest_low
+```
+
+### "The highest price" is two different questions
+
+This is the one metric where the requirement is ambiguous, and the engine reports
+both readings rather than choosing one silently:
+
+* the extremes of the **closes** — the reference price every other metric is built
+  on, and the price a return, a moving average or a drawdown is made of;
+* the extremes of the **traded range**, from the `high` and `low` columns — what
+  the market actually *touched* intraday.
+
+They are different numbers and neither implies the other. On the benchmark
+instrument over 2024-02-01 … 2024-03-14:
+
+| | price | date |
+|---|---|---|
+| highest close | `41.84570000` | 2024-03-14 |
+| highest **high** | `42.21780000` | 2024-03-14 |
+| lowest close | `39.89900000` | 2024-02-09 |
+| lowest **low** | `39.21960000` | 2024-02-09 |
+| traded range | `2.99820000` | — |
+
+The price reached 42.2178 intraday but never closed above 41.8457, and touched
+39.2196 but never closed below 39.899. A reader who asked for "the highest price"
+and got the close would be short by 0.37; one who got the high and assumed it was a
+close would carry a price that never existed at the close. Reporting both, named,
+is the only answer that cannot be misread.
+
+**`traded_range` is not any row's range.** `high >= low` holds within a row (the
+table constrains it), but the highest high and the lowest low of a period generally
+come from different sessions, so this is the width of the *period*, not of a day. On
+the hand series below, no single row spans the 12 the period does.
+
+### The extremes are inside the range
+
+Anchored at the first observation of the requested range, as the drawdown's peak
+and the cumulative base are, and for the same reason: the all-time high is however
+far back the instrument's first row is, which is not a fixed `pad`. `padding` is
+`0`, the read is exactly the requested rows, and the first point is — correctly —
+both the highest and the lowest close seen so far.
+
+### Intermediate calculations
+
+Closes 100, 102, 101, 103, 104 with traded highs 105, 106, 103, 107, 105 and lows
+98, 99, 95, 101, 100 — chosen so the two readings disagree:
+
+| Trading day | Close | High | Low | Highest so far | Lowest so far |
+|---|---|---|---|---|---|
+| 2024-03-11 | 100 | 105 | 98 | `100` (new) | `100` (new) |
+| 2024-03-12 | 102 | 106 | 99 | `102` (new) | `100` |
+| 2024-03-13 | 101 | 103 | **95** | `102` | `100` |
+| 2024-03-14 | 103 | **107** | 101 | `103` (new) | `100` |
+| 2024-03-15 | 104 | 105 | 100 | `104` (new) | `100` |
+
+| Quantity | Value | Date |
+|---|---|---|
+| `highest_close` | `104` | 2024-03-15 |
+| `lowest_close` | `100` | 2024-03-11 |
+| `highest_high` | `107` | 2024-03-14 |
+| `lowest_low` | `95` | 2024-03-13 |
+| `traded_range` (`107 - 95`) | `12` | — |
+
+The highest **close** and the highest **high** fall on different days — the 107 of
+the 14th gave back to 105 on the 15th — and the lowest close of the period (100) is
+*higher* than the lowest low (95), which belongs to the 13th. Every point carries
+its own running extremes and a `is_new_high`/`is_new_low` flag, so the rows that
+moved the answer are visible rather than inferred.
+
+On the sample series (where the fixture stores `high = low = close`) the two
+readings coincide, and the test asserts that rather than assuming it:
+
+| Trading day | Close | Highest so far | Lowest so far |
+|---|---|---|---|
+| 2024-03-11 | 100 | `100` (new) | `100` (new) |
+| 2024-03-12 | 102 | `102` (new) | `100` |
+| 2024-03-13 | 101 | `102` | `100` |
+| 2024-03-14 | 103 | `103` (new) | `100` |
+| 2024-03-15 | 104 | `104` (new) | `100` |
+
+### Edge cases with a policy, not an accident
+
+| Situation | Behaviour | Why |
+|---|---|---|
+| First observation | Both a new high and a new low | It is the only price seen, so it is the highest and the lowest. `0` or a null would both be wrong. |
+| A repeated extreme | The date stays at the **first** date that reached it | The same rule as the drawdown's peak: the extreme "happened" when it first happened, and a later row that reached it again gave nothing new. |
+| `high`/`low` not read | `highest_high`/`lowest_low`/`traded_range` are `None` | A close-only series has no traded extremes. Reporting the closes under that name would be the worst available answer. |
+| An empty range | Every field `None`, no points | There is no extreme of nothing, and inventing the first or last date of a range with no rows would be a fabrication. |
+| Ties for an extreme | The earliest date | Consistent with every other dated extreme in the engine. |
+| A four-day holiday | The extremes span *observations*, not calendar days | The price that "lasted" across a closure is the same price; the engine does not invent a session. |
+
+### What the database does
+
+Two single windows, both over the closes, can be had in one query:
+
+```sql
+MAX(close) OVER (PARTITION BY instrument_id ORDER BY trading_date
+                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_max,
+MIN(close) OVER (PARTITION BY instrument_id ORDER BY trading_date
+                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_min
+```
+
+`EXPLAIN FORMAT=TREE` against MySQL shows both frames, and shows the range scan
+starting at the requested date — no offset subquery, no warm-up row:
+
+```
+-> Sort: trading_date
+    -> Table scan on <temporary>
+        -> Temporary table
+            -> Window aggregate: min(close) OVER (PARTITION BY instrument_id
+                 ORDER BY trading_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                -> Temporary table
+                    -> Window aggregate: max(close) OVER (PARTITION BY instrument_id
+                         ORDER BY trading_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                        -> Sort: instrument_id, trading_date
+                            -> Index range scan ... over (instrument_id = 13 AND
+                                 '2024-02-01' <= trading_date <= '2024-03-14')
+```
+
+MySQL materialises the second window over the temporary table of the first: two
+buffered stages, which is the cost of asking a second question of the same frame
+and is why the timing table puts `sql` last on this metric. It is still one query,
+and it is still one round trip.
+
+The four extremes are checked against the database's own aggregates, which cannot
+be wrong in the same way:
+
+```sql
+SELECT MAX(close), MIN(close), MAX(high), MIN(low)
+FROM marketdata_pricerecord
+WHERE instrument_id = 13 AND trading_date BETWEEN '2024-02-01' AND '2024-03-14';
+```
+
+```
+MySQL: MAX(close)=41.84570000 MIN(close)=39.89900000 MAX(high)=42.21780000 MIN(low)=39.21960000
+the engine's four extremes equal the database's four aggregates
+```
+
+A value check, not a date check — the date an extreme happened is the part SQL
+cannot return, and it is the part the rows are kept for.
+
+### `undefined` on this metric
+
+Every metric's result reports how many values were missing. A price-extremes point
+has *two* prices and no single `value` field, so the count is overridden to `0` with
+a docstring saying why, rather than being inherited and raising: a point here cannot
+be missing a value, because every row has a close. The traded pair can be `None`,
+but only when there is no range at all, in which case there are no points to count.
+
 ## Backend timings, measured
 
 Median of 25 warm calls per cell against MySQL, on the benchmark instrument: 500
@@ -880,18 +1056,19 @@ machine load, so read the ordering and the gaps rather than the digits.
 |---|---|---|---|
 | Cumulative returns | **0.67 ms** | — | 1.24 ms |
 | Maximum drawdown | **0.66 ms** | 1.18 ms | 0.85 ms |
+| Price extremes | **0.76 ms** | 1.48 ms | 0.90 ms |
 | Daily returns | **1.52 ms** | 2.22 ms | 2.22 ms |
 | Moving average, window 30 | **1.52 ms** | 2.19 ms | 2.95 ms |
 | Rolling volatility, window 30 | **3.25 ms** | 3.34 ms | 3.96 ms |
 
 What the table says, honestly:
 
-* **The Python backend wins every row at this size, and the default is still `sql`
-  for three of the four metrics.** This is the trade-off being stated rather than
-  hidden: a single instrument's rows are in memory either way, so the arithmetic is
-  the same work, and the database path adds either an extra column (`LAG`) or a
-  buffer and a temporary table (`AVG() OVER`). The SQL path is the default because it
-  is the one that scales in the direction this engine is built to grow — many
+* **The Python backend wins every row at this size, and `sql` is still the default
+  wherever it exists.** This is the trade-off being stated rather than hidden: a
+  single instrument's rows are in memory either way, so the arithmetic is the same
+  work, and the database path adds either an extra column (`LAG`) or a buffer and a
+  temporary table (`AVG() OVER`, `MAX() OVER`). The SQL path is the default because
+  it is the one that scales in the direction this engine is built to grow — many
   instruments, and windows consumed inside the database — and because a metric whose
   canonical form is a SQL window should not have a Python default that quietly
   becomes the only implementation.
@@ -912,6 +1089,12 @@ What the table says, honestly:
   PRECEDING` frame over 31 rows, buffered through a temporary table to return one
   float per row that Python then divides. `pandas` sits between the two because
   `cummax` is genuinely vectorised — this is the one metric where it beats `sql`.
+* **Price extremes is the slowest `sql` row relative to its Python form** (1.48 vs
+  0.76 ms, roughly double) because it asks *two* questions of the same frame: MySQL
+  materialises the running minimum over the temporary table of the running maximum,
+  so the row pays two buffered stages rather than one. The Python scan answers both
+  in a single pass. It is also the only metric that reads columns other than
+  `close`, so its query carries `high` and `low` as well.
 * **`pandas` is the slowest per instrument and that is not its use case.** Its cost
   is Series construction and the vectorised call over 500 rows; the same call over
   fifty instruments in one frame amortises both to nothing, which is what the
@@ -923,7 +1106,7 @@ What the table says, honestly:
 
 | Growth | Effect | Why |
 |---|---|---|
-| More rows per instrument (longer history) | The loader's range scan is bounded by the requested range, not the instrument's life: `pad + observations in range`. A 20-year history costs the same per request as a 1-year one. | The bounds are pushed into `WHERE`, which uses `uniq_price_instrument_trading_date`. Warm-up padding adds `pad` rows — 1 for a daily return, `window - 1` for a moving average, `window` for a volatility, and 0 for cumulative returns and maximum drawdown, whose anchors are inside the range — a constant per request, independent of how much history exists. |
+| More rows per instrument (longer history) | The loader's range scan is bounded by the requested range, not the instrument's life: `pad + observations in range`. A 20-year history costs the same per request as a 1-year one. | The bounds are pushed into `WHERE`, which uses `uniq_price_instrument_trading_date`. Warm-up padding adds `pad` rows — 1 for a daily return, `window - 1` for a moving average, `window` for a volatility, and 0 for cumulative returns, maximum drawdown and price extremes, whose anchors are inside the range — a constant per request, independent of how much history exists. |
 | More instruments | Per-request cost is unchanged: one instrument, one query. Ranking across instruments is the case that changes the answer — it must not become one query per instrument. | Pending: the rankings metric will read the cross-section in one frame and group by instrument, which is what the `pandas` backend is for. |
 | More metrics on the same series | Free if they share the loader call. Each additional metric over the same rows adds arithmetic, not queries. | The loader is the only thing that reads, and it returns every column a metric asked for. |
 | More concurrent readers | Linear in requests, with no shared mutable state in the engine. | The engine writes nothing. The API's response cache (see [api_optimisation.md](api_optimisation.md)) covers the snapshot reads, not the computed series, which depends on the requested range. |
@@ -931,7 +1114,7 @@ What the table says, honestly:
 
 ## Tests
 
-`apps/analytics/tests/test_series.py` — the read boundary, 29 tests:
+`apps/analytics/tests/test_series.py` — the read boundary, 31 tests:
 
 * the whole series in exactly one query, in date order (query count pinned);
 * only the requested columns are selected — `source`, `ingestion_job_id`,
@@ -941,10 +1124,11 @@ What the table says, honestly:
   history still returns every requested row, `pad` without a `start_date` is a
   no-op, and the window does not lag across instruments;
 * the window columns: `previous_close` is the previous session, the moving-average
-  column is the trailing mean, the running-max column is the highest close so far
-  *within the rows returned* (so the date range anchors it), all three can be read
-  in the same single query, a database partial-frame mean is passed through as data
-  (the metric applies the completeness rule), and a window below 1 is rejected;
+  column is the trailing mean, the running-max and running-min columns are the highest
+  and lowest close so far *within the rows returned* (so the date range anchors them),
+  the one-direction and two-direction reads are each a single query, a database
+  partial-frame mean is passed through as data (the metric applies the completeness
+  rule), and a window below 1 is rejected;
 * `PriceSeries` invariants: repeated or out-of-order dates raise, `in_range()`
   drops warm-up from every column, a missing column names what was loaded;
 * the database refuses a second row for one instrument and day.
@@ -1040,18 +1224,41 @@ What the table says, honestly:
   row read, one query, the date bounds, a four-day gap spanned by observation, and
   backend validation.
 
+`apps/analytics/tests/test_price_extremes.py` — the running high and low, 30 tests:
+
+* the running extremes and the new-high/new-low flags, row by row, on a series whose
+  traded high/low are chosen to differ from its closes, and the summary built from
+  them;
+* every point's extreme carries the date it was first reached, and its last row is
+  the summary's close pair;
+* the first point is both the highest and the lowest close so far, a repeated extreme
+  is not a new one, and a tie reports the earliest date;
+* supplied (database) extremes are used, obey the length checks, agree with the scan
+  when they are the running extremes, and cannot turn a non-event into a flag;
+* the summary: the close pair equals a direct `max`/`min` of the closes, the traded
+  pair comes from the `high`/`low` columns, a close-only series has no traded pair,
+  `traded_range` is a width no single row spans, and an empty series summarises to
+  all-`None`;
+* the two readings disagree on purpose — the highest close and the highest high fall
+  on different dates, and the lowest close is not the lowest low;
+* the three backends agree on the points *and* the summary, including where the
+  traded pair differs from the close pair;
+* the service: the range's own extremes as the difference between two requests,
+  `padding == 0`, one query, the date bounds, `undefined == 0` (the overridden count),
+  the traded pair read from the columns, an empty instrument, and backend validation.
+
 ## Deliberately not done yet
 
-* Metrics 6–9, each with its own sample, edge-case policy and trade-off note:
-  highest and lowest prices, volume summaries, percentage change over a period,
-  and the cross-sectional rankings.
+* Metrics 7–9, each with its own sample, edge-case policy and trade-off note:
+  volume summaries, percentage change over a period, and the cross-sectional
+  rankings.
 * **No HTTP endpoint yet.** The service layer is where a metric is defined, and
-  five metrics in it is the right moment to fix the shape rather than the moment it
+  six metrics in it is the right moment to fix the shape rather than the moment it
   was settled: the results now share a `MetricResult` base with a `points` list, a
   `padding` count, an echoed `window`, a nested summary object where a metric has
-  one, and a consistent rendering rule, and that is what the serializer, the
-  filters and the query-parameter contract will be written against. Until then, the
-  metrics are called from Python and tested there.
+  one, an overridable `undefined` count, and a consistent rendering rule, and that is
+  what the serializer, the filters and the query-parameter contract will be written
+  against. Until then, the metrics are called from Python and tested there.
 * **No snapshot recalculation job yet.** `AnalyticSnapshot` already models the
   grain — `(instrument, as_of_date, metric_type, lookback_days)` — and the moving
   averages and volatility are its natural occupants, since a stored value is how a
@@ -1081,8 +1288,9 @@ history, of which the request asks for a 31-observation window. They are all in
 `scripts/verify_analytics.py`, which asserts, per metric, that the request is a
 single query and that the backends agree point for point, and prints the plans and
 the engine-versus-database comparisons quoted above — including the two
-`STDDEV_SAMP` and derived-table `MIN` cross-checks, and the two nested-window
-rejections that explain why two metrics have no SQL member:
+`STDDEV_SAMP` and derived-table `MIN` cross-checks, the four-aggregate extremes
+check, and the two nested-window rejections that explain why two metrics have no
+SQL member:
 
 ```powershell
 ./venv/Scripts/python.exe scripts/verify_analytics.py --rounds 30

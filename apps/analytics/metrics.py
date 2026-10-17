@@ -874,3 +874,225 @@ def summarize_drawdown(points: Sequence[DrawdownPoint]) -> DrawdownSummary:
         recovered=recovery_date is not None,
         recovery_date=recovery_date,
     )
+
+
+@dataclass(frozen=True)
+class ExtremePoint:
+    """The highest and lowest close *so far* in the range, at one date.
+
+    ``is_new_high`` and ``is_new_low`` say whether this row moved the running
+    extreme, which is what makes the series checkable by eye: exactly the rows
+    where the flag is set are the rows that changed the answer, and the last row's
+    ``highest_close``/``lowest_close`` are the range's.
+    """
+
+    trading_date: date
+    close: Decimal
+    highest_close: Decimal
+    highest_close_date: date
+    lowest_close: Decimal
+    lowest_close_date: date
+    is_new_high: bool
+    is_new_low: bool
+
+
+@dataclass(frozen=True)
+class ExtremesSummary:
+    """The highest and lowest prices of a range, and when each occurred.
+
+    Two pairs, because "the highest price" is two different questions and a report
+    will ask both:
+
+    * ``highest_close`` / ``lowest_close`` -- the extremes of the closes, the
+      reference price every other metric is built on;
+    * ``highest_high`` / ``lowest_low`` -- the extremes the market actually
+      *touched*, from the ``high`` and ``low`` columns.
+
+    They are not the same number and neither implies the other: a session can print
+    a new high without closing at one, and the highest close of a range can be
+    lower than a high from an earlier session that gave it all back. The date is
+    reported with every extreme, and a tie reports the **first** date that reached
+    it -- the same rule the drawdown's peak date follows.
+    """
+
+    highest_close: Decimal | None = None
+    highest_close_date: date | None = None
+    lowest_close: Decimal | None = None
+    lowest_close_date: date | None = None
+    highest_high: Decimal | None = None
+    highest_high_date: date | None = None
+    lowest_low: Decimal | None = None
+    lowest_low_date: date | None = None
+    traded_range: Decimal | None = None
+
+
+def extreme_series(
+    dates: Sequence[date],
+    closes: Sequence[Decimal],
+    *,
+    highest: Sequence[Decimal | None] | None = None,
+    lowest: Sequence[Decimal | None] | None = None,
+) -> list[ExtremePoint]:
+    """The running highest and lowest close, at every observation.
+
+    Definitions::
+
+        highest_close(t) = max(close(s) for s <= t)
+        lowest_close(t)  = min(close(s) for s <= t)     # s in the range
+
+    The range is the anchor, as with the drawdown's peak: both extremes start at the
+    first requested observation, so the first point is both the highest and the
+    lowest close of what has been seen, and ``padding`` is ``0``. The alternative --
+    the highest price of the instrument's whole history -- is the same unbounded read
+    that metric 5 rejects, and a caller who wants it asks for a longer range.
+
+    A new extreme is a **strict** improvement, so a repeat of the current high does
+    not restart its date; the first date that reached the level is the one reported,
+    for the same reason as the drawdown's peak.
+
+    ``highest``/``lowest`` let the database supply the running extremes (the ``sql``
+    backend) instead of scanning for them here. The dates are derived from the closes
+    in every backend, as they are for the drawdown, because the loader carries the
+    level of a running extreme and not the row that first reached it.
+    """
+    if len(dates) != len(closes):
+        raise ValueError("dates and closes must be the same length")
+    if highest is not None and len(highest) != len(closes):
+        raise ValueError("highest and closes must be the same length")
+    if lowest is not None and len(lowest) != len(closes):
+        raise ValueError("lowest and closes must be the same length")
+
+    points: list[ExtremePoint] = []
+    running_high: Decimal | None = None
+    running_high_date: date | None = None
+    running_low: Decimal | None = None
+    running_low_date: date | None = None
+
+    for index, (trading_date, close) in enumerate(zip(dates, closes)):
+        close = Decimal(close)
+
+        is_new_high = running_high is None or close > running_high
+        if is_new_high:
+            running_high, running_high_date = close, trading_date
+
+        is_new_low = running_low is None or close < running_low
+        if is_new_low:
+            running_low, running_low_date = close, trading_date
+
+        supplied_high = highest[index] if highest is not None else None
+        supplied_low = lowest[index] if lowest is not None else None
+
+        points.append(
+            ExtremePoint(
+                trading_date=trading_date,
+                close=close,
+                highest_close=running_high if supplied_high is None else Decimal(supplied_high),
+                highest_close_date=running_high_date,
+                lowest_close=running_low if supplied_low is None else Decimal(supplied_low),
+                lowest_close_date=running_low_date,
+                is_new_high=is_new_high,
+                is_new_low=is_new_low,
+            )
+        )
+    return points
+
+
+def extreme_series_pandas(
+    dates: Sequence[date],
+    closes: Sequence[Decimal],
+) -> list[ExtremePoint]:
+    """The same series, with the running extremes taken by ``cummax``/``cummin``.
+
+    The pair is the vectorised form of a running maximum and minimum, and as with
+    the drawdown it is the whole of the scan; the dates, the flags and the summary
+    are the shared code path, so the backends agree by construction.
+    """
+    import pandas as pd
+
+    if len(dates) != len(closes):
+        raise ValueError("dates and closes must be the same length")
+
+    series = pd.Series([float(value) for value in closes], dtype="float64")
+    return extreme_series(
+        dates,
+        closes,
+        highest=[Decimal(str(value)) for value in series.cummax()],
+        lowest=[Decimal(str(value)) for value in series.cummin()],
+    )
+
+
+def _first_extreme(
+    dates: Sequence[date],
+    values: Sequence[Decimal | None],
+    *,
+    largest: bool,
+) -> tuple[Decimal | None, date | None]:
+    """The extreme of a column and the first date that reached it.
+
+    ``max(range(...), key=...)`` returns the *first* position holding the largest
+    value, which is the tie rule this engine uses everywhere an extreme has a date:
+    the first time it happened.
+    """
+    defined = [
+        (index, Decimal(value)) for index, value in enumerate(values) if value is not None
+    ]
+    if not defined:
+        return None, None
+
+    pick = max if largest else min
+    index, chosen = pick(defined, key=lambda pair: pair[1])
+    return chosen, dates[index]
+
+
+def summarize_extremes(
+    dates: Sequence[date],
+    points: Sequence[ExtremePoint],
+    *,
+    highs: Sequence[Decimal | None] | None = None,
+    lows: Sequence[Decimal | None] | None = None,
+) -> ExtremesSummary:
+    """The range's extremes, from the running series and the traded columns.
+
+    The close pair comes from the **last point's** running extremes rather than from
+    a second pass over the closes: the series and the summary are then the same
+    computation seen twice, and a test asserts they equal a direct ``max``/``min``
+    rather than assuming it.
+
+    The traded pair comes from the ``high``/``low`` columns, and is ``None`` when they
+    were not read -- a close-only series has no traded extremes, and reporting the
+    closes under that name would be the worst possible answer.
+
+    ``traded_range`` is the distance between the two traded extremes, and it is **not
+    any row's range**: the highest high and the lowest low of a period generally come
+    from different sessions, so this is the width of the period rather than of a day.
+    """
+    if not points:
+        return ExtremesSummary()
+
+    last = points[-1]
+    summary = ExtremesSummary(
+        highest_close=last.highest_close,
+        highest_close_date=last.highest_close_date,
+        lowest_close=last.lowest_close,
+        lowest_close_date=last.lowest_close_date,
+    )
+
+    if highs is None or lows is None:
+        return summary
+
+    highest_high, highest_high_date = _first_extreme(dates, highs, largest=True)
+    lowest_low, lowest_low_date = _first_extreme(dates, lows, largest=False)
+
+    return ExtremesSummary(
+        highest_close=summary.highest_close,
+        highest_close_date=summary.highest_close_date,
+        lowest_close=summary.lowest_close,
+        lowest_close_date=summary.lowest_close_date,
+        highest_high=highest_high,
+        highest_high_date=highest_high_date,
+        lowest_low=lowest_low,
+        lowest_low_date=lowest_low_date,
+        traded_range=(
+            None if highest_high is None or lowest_low is None else highest_high - lowest_low
+        ),
+    )

@@ -289,6 +289,63 @@ def check_drawdown(instrument, mid, end):
     assert abs(engine_worst - worst_from_mysql) < 1e-7, "MySQL and the engine disagree"
 
 
+def check_extremes(instrument, mid, end):
+    print("\n-- price extremes --")
+
+    def request(backend="sql"):
+        return services.price_extremes_for_instrument(
+            instrument, start_date=mid, end_date=end, backend=backend
+        )
+
+    print(explain(captured_sql(request)))
+
+    reference = request("python")
+    for backend in services.EXTREME_BACKENDS:
+        result = request(backend)
+        assert result.points == reference.points, (
+            f"{backend} disagrees on the running extremes"
+        )
+        assert result.summary == reference.summary, f"{backend} disagrees on the summary"
+
+    summary = reference.summary
+    print(
+        f"  {len(reference.points)} points, padding={reference.padding}, "
+        f"undefined={reference.undefined}"
+    )
+    print(
+        f"  closing:  high {summary.highest_close} on {summary.highest_close_date}, "
+        f"low {summary.lowest_close} on {summary.lowest_close_date}"
+    )
+    print(
+        f"  traded:   high {summary.highest_high} on {summary.highest_high_date}, "
+        f"low {summary.lowest_low} on {summary.lowest_low_date}, "
+        f"range {summary.traded_range}"
+    )
+    print("  one request: 1 query (asserted above)")
+
+    # The database's own aggregates, from the same columns the metric reads. This is
+    # the closest thing to a cross-check for an extreme: the *date* it happened is the
+    # part SQL cannot return, which is why the engine keeps the rows.
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT MAX(close), MIN(close), MAX(high), MIN(low) "
+            "FROM marketdata_pricerecord "
+            f"WHERE instrument_id = {instrument.pk} "
+            f"AND trading_date BETWEEN '{mid}' AND '{end}'"
+        )
+        db_high_close, db_low_close, db_high_high, db_low_low = cursor.fetchone()
+
+    print(
+        f"  MySQL: MAX(close)={db_high_close} MIN(close)={db_low_close} "
+        f"MAX(high)={db_high_high} MIN(low)={db_low_low}"
+    )
+    assert Decimal(db_high_close) == summary.highest_close
+    assert Decimal(db_low_close) == summary.lowest_close
+    assert Decimal(db_high_high) == summary.highest_high
+    assert Decimal(db_low_low) == summary.lowest_low
+    print("  the engine's four extremes equal the database's four aggregates")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--instrument-id", type=int, default=None)
@@ -350,6 +407,7 @@ def main() -> int:
     check_volatility(instrument, mid, end)
     check_cumulative(instrument)
     check_drawdown(instrument, mid, end)
+    check_extremes(instrument, mid, end)
 
     print(f"\nOK (window {mid} .. {end})")
     return 0

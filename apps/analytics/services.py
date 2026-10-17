@@ -19,6 +19,8 @@ from .metrics import (
     CumulativePoint,
     DrawdownPoint,
     DrawdownSummary,
+    ExtremePoint,
+    ExtremesSummary,
     MovingAveragePoint,
     ReturnPoint,
     VolatilityPoint,
@@ -28,11 +30,14 @@ from .metrics import (
     daily_returns_pandas,
     drawdown_series,
     drawdown_series_pandas,
+    extreme_series,
+    extreme_series_pandas,
     moving_average,
     moving_average_pandas,
     rolling_volatility,
     rolling_volatility_pandas,
     summarize_drawdown,
+    summarize_extremes,
 )
 from .models import AnalyticSnapshot
 from .series import load_price_series
@@ -128,11 +133,16 @@ def get_latest_snapshot(instrument, metric_type, *, lookback_days=None):
 #: plain frame over the closes, so ``MAX(close) OVER (ROWS BETWEEN UNBOUNDED
 #: PRECEDING AND CURRENT ROW)`` is one legal window, and only the ratio on top of
 #: it is arithmetic.
+#:
+#: Price extremes are the same case with two directions: a running maximum and a
+#: running minimum are each a single frame over the closes, so both can be had in
+#: the one query.
 DAILY_RETURN_BACKENDS = ("sql", "python", "pandas")
 CUMULATIVE_RETURN_BACKENDS = ("python", "pandas")
 MOVING_AVERAGE_BACKENDS = ("sql", "python", "pandas")
 VOLATILITY_BACKENDS = ("sql", "python", "pandas")
 DRAWDOWN_BACKENDS = ("sql", "python", "pandas")
+EXTREME_BACKENDS = ("sql", "python", "pandas")
 
 
 @dataclass(frozen=True)
@@ -220,6 +230,32 @@ class MaximumDrawdown(MetricResult):
 
     summary: DrawdownSummary = field(default_factory=DrawdownSummary)
     points: list[DrawdownPoint] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PriceExtremes(MetricResult):
+    """One price-extremes answer: the running high and low, and the range's.
+
+    ``summary`` holds both the close extremes and the traded ones; ``points`` hold
+    the running close extremes, whose last row is the summary's close pair.
+    """
+
+    summary: ExtremesSummary = field(default_factory=ExtremesSummary)
+    points: list[ExtremePoint] = field(default_factory=list)
+
+    @property
+    def undefined(self) -> int:
+        """Always ``0``: an extreme point cannot be missing a value.
+
+        Every row has a close, so the running high and the running low always
+        exist; the *traded* extremes are ``None`` only when the whole range is
+        empty, and then there are no points to count. This overrides
+        :attr:`MetricResult.undefined`, which counts ``point.value`` -- a field this
+        point type deliberately does not have. A point here is two prices, and
+        calling one of them "value" would invite a reader to treat the other as an
+        afterthought.
+        """
+        return 0
 
 
 def _reject_backend(backend: str, allowed: Sequence[str]) -> None:
@@ -499,5 +535,72 @@ def maximum_drawdown_for_instrument(
         end_date=end_date,
         padding=series.padding,
         summary=summarize_drawdown(points),
+        points=points[series.padding :],
+    )
+
+
+def price_extremes_for_instrument(
+    instrument,
+    *,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    backend: str = "sql",
+) -> PriceExtremes:
+    """The highest and lowest prices of a range, for one instrument.
+
+    Both readings of "the highest price" are reported, because a report asks both
+    and the engine should not choose silently:
+
+    * the extremes of the **closes** (``highest_close``/``lowest_close``), the
+      reference price every other metric is built on -- and, per date, the running
+      extremes, which is the series whose last row is that pair;
+    * the extremes of the **traded range** (``highest_high``/``lowest_low``), from
+      the ``high``/``low`` columns, which is what the market actually touched.
+
+    The anchors are inside the range, as with the drawdown: ``pad=0``, no warm-up
+    row, and the first point both the highest and the lowest close so far. This is
+    also the first metric to read columns other than ``close``, which is what the
+    loader's ``fields`` parameter has been for since metric 1.
+
+    The ``sql`` backend gets the running maximum and minimum from two single
+    windows over the closes -- legal in one query, unlike a window over another
+    window's output -- and everything on top of them is the shared code path.
+    """
+    _reject_backend(backend, EXTREME_BACKENDS)
+
+    series = load_price_series(
+        instrument,
+        start_date=start_date,
+        end_date=end_date,
+        fields=("high", "low"),
+        with_running_extremes=backend == "sql",
+    )
+
+    if backend == "sql":
+        points = extreme_series(
+            series.dates,
+            series.closes,
+            highest=series.column("running_max"),
+            lowest=series.column("running_min"),
+        )
+    elif backend == "pandas":
+        points = extreme_series_pandas(series.dates, series.closes)
+    else:
+        points = extreme_series(series.dates, series.closes)
+
+    summary = summarize_extremes(
+        series.dates,
+        points,
+        highs=series.column("high"),
+        lows=series.column("low"),
+    )
+
+    return PriceExtremes(
+        symbol=series.symbol,
+        backend=backend,
+        start_date=start_date,
+        end_date=end_date,
+        padding=series.padding,
+        summary=summary,
         points=points[series.padding :],
     )

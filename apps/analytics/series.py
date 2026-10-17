@@ -35,6 +35,7 @@ from django.db.models import (
     DecimalField,
     F,
     Max,
+    Min,
     Q,
     RowRange,
     Subquery,
@@ -206,6 +207,7 @@ def load_price_series(
     with_previous_close: bool = False,
     moving_average_window: int | None = None,
     with_running_max: bool = False,
+    with_running_extremes: bool = False,
 ) -> PriceSeries:
     """Reads one instrument's prices as an ordered, gap-tolerant series.
 
@@ -238,6 +240,10 @@ def load_price_series(
         drawdown is measured from. Its frame is unbounded to the start of the rows
         returned, so with ``pad=0`` the peak is the range's own -- which is the
         anchoring :func:`apps.analytics.metrics.drawdown_series` documents.
+    with_running_extremes
+        Add both ``running_max`` and ``running_min`` over the same frame: the
+        highest and lowest close so far, for the price-extremes metric. Two single
+        windows, so still one query.
 
     The window columns are parameters of *this* function rather than SQL handed in
     by a caller, because a window and the padding that makes it correct are one
@@ -301,6 +307,22 @@ def load_price_series(
             # ``pad=0`` is the start of the requested range. It is a real window
             # -- a running maximum is a scan -- so unlike the deviation it can be
             # had from the database in one level.
+            frame=RowRange(start=None, end=0),
+        )
+    if with_running_extremes:
+        # The same frame for the other direction. Both are single windows over the
+        # closes, so both are legal in one query; a metric needing the *deviation*
+        # of a running value could not do this (see the note in ``services``).
+        window_columns["running_max"] = Window(
+            expression=Max("close", output_field=PRICE_FIELD),
+            partition_by=[F("instrument_id")],
+            order_by=F("trading_date").asc(),
+            frame=RowRange(start=None, end=0),
+        )
+        window_columns["running_min"] = Window(
+            expression=Min("close", output_field=PRICE_FIELD),
+            partition_by=[F("instrument_id")],
+            order_by=F("trading_date").asc(),
             frame=RowRange(start=None, end=0),
         )
 
