@@ -28,11 +28,42 @@ class RuleSummaryInline(admin.TabularInline):
 
 @admin.register(IngestionJob)
 class IngestionJobAdmin(admin.ModelAdmin):
-    list_display = ("id", "source_type", "status", "created_by", "requested_at")
+    list_display = (
+        "id",
+        "source_type",
+        "status",
+        "attempts",
+        "rows_processed",
+        "created_by",
+        "requested_at",
+        "heartbeat_at",
+    )
     list_filter = ("status", "source_type")
-    search_fields = ("id", "created_by__email")
+    search_fields = (
+        "id",
+        "created_by__email",
+        "idempotency_key",
+        "celery_task_id",
+    )
     date_hierarchy = "requested_at"
-    readonly_fields = ("id", "requested_at")
+    # Everything the worker owns is read-only: the admin is for looking at a job,
+    # and hand-editing `policy` or `checkpoint` would change what the next
+    # attempt actually does.
+    readonly_fields = (
+        "id",
+        "requested_at",
+        "started_at",
+        "completed_at",
+        "status",
+        "idempotency_key",
+        "celery_task_id",
+        "attempts",
+        "rows_processed",
+        "heartbeat_at",
+        "last_error",
+        "checkpoint",
+        "policy",
+    )
     inlines = [IngestionFileInline, ValidationErrorInline, RuleSummaryInline]
 
 

@@ -77,7 +77,7 @@ ASSET_TYPES = ["equity", "etf", "crypto", "forex", "index", "future"]
 SOURCE_TYPES = ["csv", "json", "api", "manual"]
 
 # Mirrors apps.ingestion.models.JobStatus.
-JOB_STATUSES = ["pending", "running", "succeeded", "failed", "partial"]
+JOB_STATUSES = ["pending", "processing", "completed", "failed", "completed_with_errors"]
 
 # Mirrors apps.analytics.models.MetricType.
 METRIC_TYPES = ["return", "moving_average", "volatility", "drawdown"]
@@ -629,7 +629,7 @@ def render_expected_results(
     lines.append(f"| `AnalyticSnapshot` | `reference/analytic_snapshots.*` | {args.instruments * 4} |")
     lines.append(f"| `AuditEvent` | `reference/audit_events.*` | {len(batches)} |")
     lines.append("")
-    lines.append("Each clean `IngestionJob` should finish `succeeded` with "
+    lines.append("Each clean `IngestionJob` should finish `completed` with "
                  "`rows_received == rows_accepted` and `rows_rejected == 0`, "
                  "and each `IngestionFile` checksum must match the bytes on disk.\n")
 
@@ -640,7 +640,7 @@ def render_expected_results(
         outcome = "accepted" if rule is None else "rejected"
         lines.append(f"| {index} | `{rule or 'valid row'}` | {outcome} |")
     lines.append("")
-    lines.append(f"The resulting job should be **`partial`**: "
+    lines.append(f"The resulting job should be **`completed_with_errors`**: "
                  f"`rows_received = {len(dirty_pairs)}`, "
                  f"`rows_accepted = {len(accepted)}`, "
                  f"`rows_rejected = {len(rejected)}`, with one "
@@ -722,7 +722,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "job_id": job_id,
                 "created_by_email": "analyst@example.test",
                 "source_type": extension,
-                "status": "succeeded",
+                "status": "completed",
                 "requested_at": iso_timestamp(datetime.combine(dates[0], time(9, 30)) + timedelta(seconds=index)),
                 "started_at": iso_timestamp(datetime.combine(dates[0], time(9, 30)) + timedelta(seconds=index + 1)),
                 "completed_at": iso_timestamp(datetime.combine(dates[-1], time(16, 0)) + timedelta(seconds=index)),
@@ -760,7 +760,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     audit_events = [
         {
             "user_email": job["created_by_email"],
-            "action": "ingestion_job.succeeded",
+            "action": "ingestion_job.completed",
             "object_type": "IngestionJob",
             "object_id": job["job_id"],
             "request_id": f"req-{index:05d}",

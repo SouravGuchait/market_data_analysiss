@@ -45,10 +45,14 @@ python manage.py test
 python -m pytest            # both run the same suite via pytest.ini
 ```
 
-207 tests run against in-memory SQLite with a fast MD5 password hasher, so no
+429 tests run against in-memory SQLite with a fast MD5 password hasher, so no
 MySQL server is needed and the whole suite finishes in a few seconds.
 Development and production stay on MySQL — only `config/settings.py` sees the
 swap, gated on whether tests are running.
+
+The asynchronous tests need no broker: the API handoff is mocked and the worker
+task is exercised with `.apply()`. See
+[docs/celery_async.md](docs/celery_async.md#10-testing).
 
 ## Authentication
 
@@ -110,18 +114,23 @@ except `register`, `login`, and `token/refresh`. Each app owns its URL namespace
 | 4 | `GET` | `/api/v1/market-data/instruments/<id>/prices/` | authenticated | price history, optional date range |
 | 5 | `POST` | `/api/v1/ingestion/` | authenticated | create an ingestion job |
 | 6 | `POST` | `/api/v1/ingestion/upload/` | authenticated | upload a file and run the load synchronously |
-| 7 | `GET` | `/api/v1/ingestion/` | authenticated | list **your own** jobs |
-| 8 | `GET` | `/api/v1/ingestion/<uuid>/` | authenticated, **owner** | job status |
-| 9 | `GET` | `/api/v1/ingestion/<uuid>/report/` | authenticated, **owner** | data-quality report for a job |
-| 10 | `GET` | `/api/v1/ingestion/<uuid>/rule-summaries/` | authenticated, **owner** | rule-level PASS/FAIL for a job |
-| 11 | `GET` | `/api/v1/ingestion/<uuid>/validation-errors/` | authenticated, **owner** | rejected rows for a job |
-| 12 | `GET` | `/api/v1/analytics/instruments/<id>/metrics/` | authenticated | metric snapshots for an instrument |
-| 13 | `GET` | `/api/v1/auth/usage/` | authenticated | activity statistics |
+| 7 | `POST` | `/api/v1/ingestion/submit/` | authenticated | upload a file and **queue** the load (`202`) |
+| 8 | `GET` | `/api/v1/ingestion/` | authenticated | list **your own** jobs |
+| 9 | `GET` | `/api/v1/ingestion/<uuid>/` | authenticated, **owner** | job status and progress |
+| 10 | `POST` | `/api/v1/ingestion/<uuid>/cancel/` | authenticated, **owner** | request cancellation |
+| 11 | `GET` | `/api/v1/ingestion/<uuid>/report/` | authenticated, **owner** | data-quality report for a job |
+| 12 | `GET` | `/api/v1/ingestion/<uuid>/rule-summaries/` | authenticated, **owner** | rule-level PASS/FAIL for a job |
+| 13 | `GET` | `/api/v1/ingestion/<uuid>/validation-errors/` | authenticated, **owner** | rejected rows for a job |
+| 14 | `GET` | `/api/v1/analytics/instruments/<id>/metrics/` | authenticated | metric snapshots for an instrument |
+| 15 | `GET` | `/api/v1/auth/usage/` | authenticated | activity statistics |
 
 Instruments, prices, and analytics are **read-only** through the API — those
-rows are written by the ingestion pipeline, never by a client. The two writes are
-creating a job and uploading a file: `POST /ingestion/upload/` records the job
-*and* loads the rows behind it in one request.
+rows are written by the ingestion pipeline, never by a client. There are two
+ways to write: `POST /ingestion/upload/` records the job *and* loads the rows
+behind it in one request; `POST /ingestion/submit/` records and stores the file,
+then hands it to a worker and returns immediately with the job id to poll.
+The asynchronous path — the queue, the worker, and the recovery commands — is
+documented in [docs/celery_async.md](docs/celery_async.md).
 
 ### Query parameters
 
@@ -167,7 +176,7 @@ range (`start_date` after `end_date`) is a `400`.
 
 | Parameter | Match | Accepted values | Example |
 |---|---|---|---|
-| `status` | exact | `pending`, `running`, `succeeded`, `failed`, `partial` | `?status=running` |
+| `status` | exact | `pending`, `processing`, `completed`, `completed_with_errors`, `failed`, `cancelled` | `?status=processing` |
 | `source_type` | exact | `csv`, `json`, `xlsx`, `api`, `manual` | `?source_type=csv` |
 | `ordering` | sort | `requested_at`, `status`, `rows_received`; prefix `-` to reverse | `?ordering=-requested_at` |
 | `page`, `page_size` | pagination | `page_size` ≤ 100 | `?page_size=10` |
@@ -219,6 +228,8 @@ returns `200` — the parameters are simply ignored.
 | `POST /api/v1/auth/token/refresh/` | body: `refresh` |
 | `POST /api/v1/ingestion/` | body: `source_type` |
 | `POST /api/v1/ingestion/upload/` | multipart body: `file` (required), `source_type`, `sheet_name`, `on_invalid`, `on_existing` |
+| `POST /api/v1/ingestion/submit/` | same body as `upload/`, plus an optional `Idempotency-Key` **header** |
+| `POST /api/v1/ingestion/<uuid>/cancel/` | path: `uuid` — no body |
 | `GET /api/v1/ingestion/<uuid>/report/` | path: `uuid` — the report has no parameters |
 | `GET /api/v1/instruments/<id>/` | path: `id` — instrument primary key |
 | `GET /api/v1/instruments/exchanges/` | none — and deliberately **unpaginated** |
@@ -349,7 +360,7 @@ value is a `400` with `{"source_type": ["\"x\" is not a valid choice."]}`.
   "job": {
     "id": "2043cca3-ec4f-4817-8fa0-40ad78ac08e7",
     "source_type": "csv",
-    "status": "succeeded",
+    "status": "completed",
     "rows_received": 360,
     "rows_accepted": 360,
     "rows_rejected": 0,
@@ -357,7 +368,7 @@ value is a `400` with `{"source_type": ["\"x\" is not a valid choice."]}`.
   },
   "report": {
     "job_id": "2043cca3-ec4f-4817-8fa0-40ad78ac08e7",
-    "status": "succeeded",
+    "status": "completed",
     "rows_received": 360,
     "rows_accepted": 360,
     "rows_rejected": 0,
@@ -378,7 +389,7 @@ oversize upload is a `400` naming the `file` field, and no job is created.
 ```json
 {
   "job_id": "2043cca3-ec4f-4817-8fa0-40ad78ac08e7",
-  "status": "partial",
+  "status": "completed_with_errors",
   "rows_received": 15,
   "rows_accepted": 2,
   "rows_rejected": 13,
@@ -404,7 +415,7 @@ oversize upload is a `400` naming the `file` field, and no job is created.
 ]
 ```
 
-**List your own jobs** — `GET /api/v1/ingestion/?status=running&source_type=csv`
+**List your own jobs** — `GET /api/v1/ingestion/?status=processing&source_type=csv`
 
 ```json
 {
@@ -413,7 +424,7 @@ oversize upload is a `400` naming the `file` field, and no job is created.
     {
       "id": "2043cca3-ec4f-4817-8fa0-40ad78ac08e7",
       "source_type": "csv",
-      "status": "running",
+      "status": "processing",
       "rows_received": 100,
       "rows_accepted": 90,
       "rows_rejected": 10,
@@ -465,7 +476,7 @@ oversize upload is a `400` naming the `file` field, and no job is created.
 {
   "jobs": {
     "total": 4,
-    "by_status": { "pending": 3, "succeeded": 1 },
+    "by_status": { "pending": 3, "completed": 1 },
     "rows_received": 160,
     "rows_accepted": 140,
     "rows_rejected": 20
@@ -483,8 +494,9 @@ oversize upload is a `400` naming the `file` field, and no job is created.
 
 | Code | When |
 |---|---|
-| `200` | list or retrieve succeeded |
+| `200` | list or retrieve succeeded, or a replay of an idempotent submit |
 | `201` | job created |
+| `202` | job accepted for asynchronous processing (`submit/`) |
 | `400` | invalid filter, malformed date, or inverted date range |
 | `401` | missing or invalid token |
 | `403` | authenticated, but the object belongs to someone else |
@@ -536,6 +548,49 @@ Row rejection, duplicate handling, and the transaction boundary are decided by a
 explicit `IngestionPolicy` (`on_invalid`, `on_existing`), which the upload endpoint
 exposes as form fields. See [docs/ingestion_etl.md](docs/ingestion_etl.md) for the
 module contracts, the rules, and the sample-dataset results.
+
+## Asynchronous ingestion (Celery)
+
+The same pipeline also runs on a worker, for batches too large to hold a request
+open. [Celery](https://docs.celeryq.dev/) with **Redis as the broker** carries the
+message; the database row is the source of truth for what happened.
+
+```powershell
+# Queue a file instead of loading it inline. Returns 202 with the job.
+# (-Form needs PowerShell 7+; on Windows PowerShell 5.1 use curl.exe -F.)
+Invoke-RestMethod -Uri http://127.0.0.1:8000/api/v1/ingestion/submit/ `
+  -Method Post `
+  -Headers @{ Authorization = "Bearer $($tokens.access)"; "Idempotency-Key" = "2026-10-12-daily-prices" } `
+  -Form @{ file = Get-Item sample_data\synthetic\batches\prices_batch_004.csv }
+
+# Watch it run.
+python manage.py ingestion_status --queue
+
+# Start a worker (Windows needs the solo pool).
+.\scripts\run_worker.ps1 -Action worker
+```
+
+`POST /api/v1/ingestion/submit/` answers `202` for a new job and `200` when the
+`Idempotency-Key` (or, by default, the file's SHA-256) matches one already
+submitted by the same user — so a client that times out and retries does not
+queue the file twice. `POST /api/v1/ingestion/<uuid>/cancel/` asks a running job
+to stop; the worker checks between chunks and finishes the job as `cancelled`.
+
+A job moves through `pending` → `processing` → one of `completed`,
+`completed_with_errors`, `failed`, or `cancelled`. `attempts`, `rows_processed`,
+and `heartbeat_at` are exposed on the job serializer, so a stalled job is visible
+as a row that says `processing` with a stale heartbeat rather than a request that
+never returns.
+
+Two use cases are deliberately *not* on this path. An `api` source cannot be
+queued — its fetcher is not serialisable, and accepting a client-supplied URL
+would be an SSRF hole — so API ingestion stays synchronous. And nothing here
+assumes a task runs exactly once: delivery is at-least-once, so the job claim and
+the row upsert are both idempotent.
+
+See [docs/celery_async.md](docs/celery_async.md) for the state machine, the retry
+classification, the nine failure scenarios and how each is tested, the
+transaction boundaries, and the measured performance on large files.
 
 ## Database schema
 

@@ -61,7 +61,7 @@ class UploadEndpointTests(AuthenticatedAPITestCase):
         response = self.upload()
 
         self.assertEqual(response.status_code, 201)
-        self.assertEqual(response.data["job"]["status"], "succeeded")
+        self.assertEqual(response.data["job"]["status"], "completed")
         self.assertEqual(response.data["report"]["rows_accepted"], 1)
         self.assertEqual(PriceRecord.objects.count(), 1)
 
@@ -83,7 +83,7 @@ class UploadEndpointTests(AuthenticatedAPITestCase):
         rules = {row["rule"] for row in response.data["report"]["rules"]}
         self.assertEqual(len(rules), 12)
 
-    def test_a_dirty_batch_is_partial_and_reports_the_failures(self):
+    def test_a_dirty_batch_is_completed_with_errors_and_reports_the_failures(self):
         response = self.upload(
             body=csv_bytes(
                 [
@@ -104,7 +104,7 @@ class UploadEndpointTests(AuthenticatedAPITestCase):
         )
 
         self.assertEqual(response.status_code, 201)
-        self.assertEqual(response.data["job"]["status"], "partial")
+        self.assertEqual(response.data["job"]["status"], "completed_with_errors")
         self.assertTrue(response.data["report"]["sample_failures"])
 
     def test_an_unsupported_extension_is_400_and_writes_no_job(self):

@@ -91,6 +91,11 @@ def existing_price_keys(
     One query for the whole candidate set, not one per row. The result is used to
     classify each write as an insert or an update and to honour the
     ``on_existing`` policy.
+
+    The caller passes *distinct* instrument ids and dates. A chunk of a thousand
+    rows from twelve instruments would otherwise send MySQL a thousand-element
+    ``IN`` list with twelve distinct values in it, and the database has to build
+    the same lookup set either way.
     """
     if not instrument_ids or not dates:
         return set()
@@ -157,9 +162,11 @@ def upsert_prices(
         resolved.append((instrument_id, record))
         pairs.append((instrument_id, record["trading_date"]))
 
+    # Distinct values only: the membership test below is per row, but the query
+    # that populates it only needs to ask about each value once.
     existing = existing_price_keys(
-        [instrument_id for instrument_id, _ in pairs],
-        [record["trading_date"] for _, record in resolved],
+        {instrument_id for instrument_id, _ in pairs},
+        {trading_date for _, trading_date in pairs},
     )
 
     to_write: list[PriceRecord] = []

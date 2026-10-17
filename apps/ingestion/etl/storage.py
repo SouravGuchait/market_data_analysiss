@@ -114,6 +114,27 @@ def checksum_of(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def checksum_of_upload(uploaded_file) -> str:
+    """Return the SHA-256 of an ``UploadedFile``, left rewound for the write.
+
+    Contract
+    --------
+    in : a Django ``UploadedFile`` (in memory or on a temp file).
+    out: the hex digest, with the stream seeked back to 0.
+
+    Business purpose: the digest is the submission's idempotency key. Computing
+    it *before* the job row exists is what lets "the same file uploaded twice"
+    be recognised without first creating something to deduplicate against — and
+    it is safe to hash an upload and then store it, because the stream is put
+    back exactly where the storage layer expects it.
+    """
+    digest = hashlib.sha256()
+    for chunk in uploaded_file.chunks():
+        digest.update(chunk)
+    uploaded_file.seek(0)
+    return digest.hexdigest()
+
+
 def validate_local_file(path: str | Path) -> Path:
     """Validate an already-stored file: it must exist, be sized sanely, be allowed.
 

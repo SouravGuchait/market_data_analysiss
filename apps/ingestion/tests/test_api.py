@@ -3,7 +3,7 @@
 from django.test import TestCase
 
 from apps.common.tests.mixins import AuthenticatedAPITestCase
-from apps.ingestion.models import IngestionJob, IngestionValidationError
+from apps.ingestion.models import IngestionJob, IngestionValidationError, JobStatus
 from apps.ingestion import services
 
 JOBS_URL = "/api/v1/ingestion/"
@@ -101,7 +101,7 @@ class IngestionJobCreateTests(AuthenticatedAPITestCase):
         response = self.post_as(
             self.user,
             JOBS_URL,
-            {"source_type": "csv", "status": "succeeded", "rows_received": 9999},
+            {"source_type": "csv", "status": "completed", "rows_received": 9999},
         )
 
         self.assertEqual(response.status_code, 201)
@@ -145,14 +145,14 @@ class IngestionJobListTests(AuthenticatedAPITestCase):
         self.assertEqual(self.client.get(JOBS_URL).status_code, 401)
 
     def test_filtering_by_status(self):
-        self.my_job.status = "running"
+        self.my_job.status = JobStatus.PROCESSING
         self.my_job.save()
 
-        response = self.get_as(self.user, f"{JOBS_URL}?status=running")
+        response = self.get_as(self.user, f"{JOBS_URL}?status=processing")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["count"], 1)
-        self.assertEqual(response.data["results"][0]["status"], "running")
+        self.assertEqual(response.data["results"][0]["status"], "processing")
 
     def test_filtering_by_a_status_with_no_matches_returns_empty(self):
         response = self.get_as(self.user, f"{JOBS_URL}?status=failed")

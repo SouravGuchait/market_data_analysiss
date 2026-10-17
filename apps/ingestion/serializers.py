@@ -21,6 +21,7 @@ class IngestionJobSerializer(serializers.ModelSerializer):
     """
 
     created_by_email = serializers.EmailField(source="created_by.email", read_only=True)
+    progress_percent = serializers.IntegerField(read_only=True)
 
     class Meta:
         model = IngestionJob
@@ -32,8 +33,13 @@ class IngestionJobSerializer(serializers.ModelSerializer):
             "started_at",
             "completed_at",
             "rows_received",
+            "rows_processed",
             "rows_accepted",
             "rows_rejected",
+            "progress_percent",
+            "attempts",
+            "heartbeat_at",
+            "celery_task_id",
             "error_summary",
             "created_by_email",
         ]

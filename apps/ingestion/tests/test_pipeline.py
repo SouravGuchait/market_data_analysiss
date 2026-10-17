@@ -88,7 +88,7 @@ def test_a_clean_csv_loads_and_succeeds(tmp_path):
     result = ingest_file(user=user, path=path)
 
     job = result.job
-    assert job.status == JobStatus.SUCCEEDED
+    assert job.status == JobStatus.COMPLETED
     assert (job.rows_received, job.rows_accepted, job.rows_rejected) == (2, 2, 0)
     assert PriceRecord.objects.count() == 2
     assert job.rule_summaries.count() == len(RuleName)
@@ -112,7 +112,7 @@ def test_the_same_rows_load_from_any_format(tmp_path, suffix):
 
     result = ingest_file(user=user, path=path)
 
-    assert result.job.status == JobStatus.SUCCEEDED
+    assert result.job.status == JobStatus.COMPLETED
     assert PriceRecord.objects.count() == 1
 
 
@@ -130,7 +130,7 @@ def test_the_dirty_batch_is_partial_with_one_finding_per_bad_row(tmp_path):
     result = ingest_file(user=user, path=path, policy=policy)
 
     job = result.job
-    assert job.status == JobStatus.PARTIAL
+    assert job.status == JobStatus.COMPLETED_WITH_ERRORS
     assert (job.rows_received, job.rows_accepted, job.rows_rejected) == (15, 2, 13)
     assert PriceRecord.objects.count() == 2
 
@@ -251,7 +251,7 @@ def test_re_ingesting_the_same_file_updates_rather_than_duplicating(tmp_path):
 
     assert PriceRecord.objects.count() == 1
     assert result.updated == 1
-    assert result.job.status == JobStatus.SUCCEEDED
+    assert result.job.status == JobStatus.COMPLETED
 
 
 @pytest.mark.django_db
@@ -290,7 +290,7 @@ def test_a_missing_trading_day_is_reported(tmp_path):
 
     result = ingest_file(user=user, path=path)
 
-    assert result.job.status == JobStatus.PARTIAL
+    assert result.job.status == JobStatus.COMPLETED_WITH_ERRORS
     assert result.missing_trading_days == 1
     error = job_missing_date_error(result.job)
     assert "2024-03-12" in error.detail
@@ -313,7 +313,7 @@ def test_the_sample_dataset_loads_end_to_end():
     assert len(batches) == 6
     for batch in batches:
         job = ingest_file(user=user, path=batch).job
-        assert job.status == JobStatus.SUCCEEDED, job.error_summary
+        assert job.status == JobStatus.COMPLETED, job.error_summary
 
     assert PriceRecord.objects.count() == 360
 
