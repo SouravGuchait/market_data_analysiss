@@ -1,17 +1,39 @@
-"""Analytics endpoints."""
+"""Analytics endpoints.
 
+Two reads over the same engine, and neither writes. ``AnalyticSnapshotListAPIView``
+serves *stored* metric rows; :class:`MetricSeriesAPIView` and
+:class:`RankingAPIView` serve the engine's own computation, called directly. The
+computed pair is deliberately uncached: their answers depend on price rows, whose
+writes do not bump the analytics cache namespace, so caching them would risk
+serving a series computed before the newest session. See ``docs/market_analytics.md``.
+"""
+
+import json
 from datetime import date
 
 from django.shortcuts import get_object_or_404
 from rest_framework import generics
 from rest_framework.exceptions import ValidationError
+from rest_framework.response import Response
 
 from apps.common import cache
 from apps.common.views import CachedReadMixin
 from apps.instruments.models import Instrument
 
 from . import services
-from .serializers import AnalyticSnapshotSerializer
+from .metrics import MOVING_AVERAGE_NAMES, RANKING_MEASURES, SelectedPeriod
+from .serializers import (
+    AnalyticSnapshotSerializer,
+    CumulativeReturnsSerializer,
+    DailyReturnsSerializer,
+    MaximumDrawdownSerializer,
+    MovingAveragesSerializer,
+    PercentageChangeSerializer,
+    PriceExtremesSerializer,
+    RankingSerializer,
+    RollingVolatilitySerializer,
+    VolumeSummariesSerializer,
+)
 
 
 class AnalyticSnapshotListAPIView(CachedReadMixin, generics.ListAPIView):
@@ -169,3 +191,343 @@ class AnalyticSnapshotListAPIView(CachedReadMixin, generics.ListAPIView):
         if lookback < 0:
             raise ValidationError({"lookback_days": ["Must not be negative."]})
         return lookback
+
+
+# --------------------------------------------------------------------------- #
+# The computed metrics
+#
+# The engine is a library, so these endpoints parse a request, call exactly one
+# service, and serialize the result. No arithmetic, no second implementation, and
+# no query construction: if a number is wrong it is wrong in one place, and the
+# test for it lives with that place.
+# --------------------------------------------------------------------------- #
+
+#: The metric a request gets when it does not name one.
+DEFAULT_METRIC = "returns"
+
+#: The closed metric vocabulary, mapped to the service that computes each one. A
+#: name is absent from this table or it cannot be asked for; there is no fallback
+#: for an unknown name, because a typo silently answering a different question is
+#: the worst kind of default.
+METRIC_SERVICES = {
+    "returns": services.daily_returns_for_instrument,
+    "cumulative_returns": services.cumulative_returns_for_instrument,
+    "moving_averages": services.moving_averages_for_instrument,
+    "volatility": services.rolling_volatility_for_instrument,
+    "drawdown": services.maximum_drawdown_for_instrument,
+    "extremes": services.price_extremes_for_instrument,
+    "volume": services.volume_summaries_for_instrument,
+    "percentage_change": services.percentage_change_for_instrument,
+}
+
+METRIC_SERIALIZERS = {
+    "returns": DailyReturnsSerializer,
+    "cumulative_returns": CumulativeReturnsSerializer,
+    "moving_averages": MovingAveragesSerializer,
+    "volatility": RollingVolatilitySerializer,
+    "drawdown": MaximumDrawdownSerializer,
+    "extremes": PriceExtremesSerializer,
+    "volume": VolumeSummariesSerializer,
+    "percentage_change": PercentageChangeSerializer,
+}
+
+#: Parameters every metric takes. ``format`` is here because DRF reads it for
+#: content negotiation, not because a metric does anything with it.
+SHARED_PARAMS = ("metric", "start_date", "end_date", "backend", "format")
+
+#: The parameters a metric takes *besides* the shared ones. A metric absent from
+#: this table takes none, so asking it for anything else is an error rather than a
+#: silently ignored no-op.
+EXTRA_PARAMS = {
+    "moving_averages": ("names",),
+    "volatility": ("window",),
+    "percentage_change": ("periods",),
+}
+
+#: The volatility window when the request does not give one: a month of sessions,
+#: the convention the metric's own documentation uses.
+DEFAULT_VOLATILITY_WINDOW = 30
+
+#: A ranking's parameters, and its default measure.
+RANKING_PARAMS = (
+    "measure",
+    "instrument_ids",
+    "start_date",
+    "end_date",
+    "lookback",
+    "descending",
+    "limit",
+    "backend",
+    "format",
+)
+DEFAULT_MEASURE = "return"
+
+
+class QueryParameterMixin:
+    """Parses the query parameters the computed endpoints accept.
+
+    Parsing lives here rather than in a service: a service's contract is Python
+    types and arithmetic, and a malformed request is an HTTP concern. Every failure
+    is raised as a DRF ``ValidationError`` under the parameter's own name, so it
+    comes back as a 400 in the same ``{"error": {"fields": ...}}`` shape the rest of
+    the API already uses.
+    """
+
+    def raw(self, name):
+        """The parameter's value, with an empty string treated as absent.
+
+        An omitted parameter and ``?window=`` are the same thing to a caller who
+        built a URL from form fields, and both mean "use the default".
+        """
+        value = self.request.query_params.get(name)
+        if value is None or value.strip() == "":
+            return None
+        return value
+
+    def present(self, name):
+        return self.raw(name) is not None
+
+    def parse_date(self, name):
+        value = self.raw(name)
+        if value is None:
+            return None
+        try:
+            return date.fromisoformat(value)
+        except ValueError as exc:
+            raise ValidationError(
+                {name: [f"'{value}' is not a valid ISO date (YYYY-MM-DD)."]}
+            ) from exc
+
+    def parse_int(self, name, *, default, minimum=None):
+        value = self.raw(name)
+        if value is None:
+            return default
+        try:
+            parsed = int(value)
+        except ValueError as exc:
+            raise ValidationError({name: [f"'{value}' is not an integer."]}) from exc
+        if minimum is not None and parsed < minimum:
+            raise ValidationError({name: [f"Must be at least {minimum}."]})
+        return parsed
+
+    def parse_bool(self, name, *, default):
+        value = self.raw(name)
+        if value is None:
+            return default
+        lowered = value.lower()
+        if lowered in ("true", "1", "yes"):
+            return True
+        if lowered in ("false", "0", "no"):
+            return False
+        raise ValidationError(
+            {name: [f"'{value}' is not a boolean; use true or false."]}
+        )
+
+    def parse_choice(self, name, *, default, choices):
+        value = self.raw(name)
+        if value is None:
+            return default
+        if value not in choices:
+            raise ValidationError(
+                {name: [f"'{value}' is not valid; choose one of {list(choices)}."]}
+            )
+        return value
+
+    def reject_unknown(self, allowed):
+        """Rejects a parameter the chosen shape does not take.
+
+        Silently ignoring an inapplicable parameter would let a caller believe they
+        had asked for something. ``?window=30`` on the moving averages answers about
+        three fixed windows regardless, so it is a 400 naming what is accepted --
+        the same reason an unknown metric is a 400 rather than a default.
+        """
+        unknown = sorted(
+            name for name in self.request.query_params if name not in allowed
+        )
+        if unknown:
+            accepted = ", ".join(sorted(allowed))
+            raise ValidationError(
+                {
+                    "query_params": [
+                        f"{', '.join(unknown)} not accepted here; accepted: {accepted}."
+                    ]
+                }
+            )
+
+
+class MetricSeriesAPIView(QueryParameterMixin, generics.GenericAPIView):
+    """Computes one metric for one instrument, over an optional date range.
+
+    ``metric`` names which one (default ``returns``) and the remaining parameters
+    are that metric's own inputs. There is no pagination on purpose: a windowed
+    metric cannot be paged without recomputing its warm-up for every page, and the
+    envelope -- ``padding``, ``window``, ``undefined`` -- describes the series as a
+    whole. The payload is therefore one object whose ``points`` are the series.
+
+    Defaults are the engine's, not the endpoint's: an omitted ``start_date`` or
+    ``end_date`` is no bound, an omitted ``backend`` is the backend that exists for
+    that metric, an omitted ``window`` is :data:`DEFAULT_VOLATILITY_WINDOW`, an
+    omitted ``names`` is all three conventional averages, and an omitted ``periods``
+    is a single period spanning the requested range.
+    """
+
+    pagination_class = None
+    serializer_class = DailyReturnsSerializer
+
+    def get_instrument(self):
+        return get_object_or_404(
+            Instrument.objects.select_related("exchange"),
+            pk=self.kwargs["instrument_pk"],
+        )
+
+    def get(self, request, *args, **kwargs):
+        metric = self.raw("metric") or DEFAULT_METRIC
+        if metric not in METRIC_SERVICES:
+            choices = ", ".join(sorted(METRIC_SERVICES))
+            raise ValidationError(
+                {"metric": [f"'{metric}' is not a metric; choose one of {choices}."]}
+            )
+        self.reject_unknown(SHARED_PARAMS + EXTRA_PARAMS.get(metric, ()))
+
+        try:
+            result = METRIC_SERVICES[metric](
+                self.get_instrument(), **self.service_kwargs(metric)
+            )
+        except ValueError as exc:
+            # Every ValueError the engine raises is about the request -- an unknown
+            # backend, an inverted range, a window too small, a period passed
+            # alongside the dates it excludes. That is the client's mistake, so 400.
+            raise ValidationError({"metric": [str(exc)]}) from exc
+
+        return Response(METRIC_SERIALIZERS[metric](result).data)
+
+    def service_kwargs(self, metric):
+        kwargs = {
+            "start_date": self.parse_date("start_date"),
+            "end_date": self.parse_date("end_date"),
+        }
+        # Left out entirely when not asked for, so the service's own default -- the
+        # backend that exists for that metric -- is what applies.
+        if self.present("backend"):
+            kwargs["backend"] = self.raw("backend")
+
+        if metric == "moving_averages" and self.present("names"):
+            kwargs["names"] = self.parse_names()
+        if metric == "volatility":
+            kwargs["window"] = self.parse_int(
+                "window", default=DEFAULT_VOLATILITY_WINDOW, minimum=2
+            )
+        if metric == "percentage_change" and self.present("periods"):
+            kwargs["periods"] = self.parse_periods()
+        return kwargs
+
+    def parse_names(self):
+        """The moving-average series to compute, from the engine's vocabulary.
+
+        The names are the engine's own (``moving_average_7`` and so on) rather than
+        a bare window: a second spelling for the same series would be a second
+        vocabulary to keep in step.
+        """
+        names = [part.strip() for part in self.raw("names").split(",") if part.strip()]
+        unknown = [name for name in names if name not in MOVING_AVERAGE_NAMES]
+        if unknown:
+            choices = ", ".join(MOVING_AVERAGE_NAMES)
+            raise ValidationError(
+                {"names": [f"{', '.join(unknown)} not known; choose from {choices}."]}
+            )
+        return names
+
+    def parse_periods(self):
+        """The multi-period form of the change, as one JSON array in the URL.
+
+        A GET has no body and a list has no natural flat spelling, so the periods
+        are a single JSON value: ``[{"label": "q1", "start_date": "...",
+        "end_date": "..."}, ...]``. ``label`` is optional and comes back on the
+        answer; the two dates are not.
+        """
+        try:
+            loaded = json.loads(self.raw("periods"))
+        except json.JSONDecodeError as exc:
+            raise ValidationError(
+                {"periods": ["Must be a JSON array of periods."]}
+            ) from exc
+        if not isinstance(loaded, list):
+            raise ValidationError({"periods": ["Must be a JSON array of periods."]})
+
+        periods = []
+        for index, item in enumerate(loaded):
+            if not isinstance(item, dict):
+                raise ValidationError({"periods": [f"Entry {index} is not an object."]})
+            try:
+                periods.append(
+                    SelectedPeriod(
+                        label=item.get("label"),
+                        start_date=date.fromisoformat(item["start_date"]),
+                        end_date=date.fromisoformat(item["end_date"]),
+                    )
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValidationError(
+                    {"periods": [f"Entry {index} needs ISO start_date and end_date."]}
+                ) from exc
+        return tuple(periods)
+
+
+class RankingAPIView(QueryParameterMixin, generics.GenericAPIView):
+    """Ranks instruments by one measure over one window.
+
+    Cross-sectional, so no instrument appears in the path: the answer is *about*
+    symbols rather than belonging to one. ``measure`` is the closed vocabulary
+    ``return`` / ``volume`` (default ``return``). ``limit`` truncates after ranking,
+    so the rows that come back keep their real places rather than being renumbered
+    as a page.
+
+    Defaults: an omitted ``lookback`` is the whole bounded range, an omitted
+    ``descending`` is best-first, and an omitted ``limit`` returns every instrument
+    in the universe.
+    """
+
+    pagination_class = None
+    serializer_class = RankingSerializer
+
+    def get(self, request, *args, **kwargs):
+        self.reject_unknown(RANKING_PARAMS)
+        try:
+            ranking = services.ranking_for_instruments(**self.service_kwargs())
+        except ValueError as exc:
+            raise ValidationError({"ranking": [str(exc)]}) from exc
+
+        return Response(RankingSerializer(ranking).data)
+
+    def service_kwargs(self):
+        kwargs = {
+            "measure": self.parse_choice(
+                "measure", default=DEFAULT_MEASURE, choices=tuple(RANKING_MEASURES)
+            ),
+            "start_date": self.parse_date("start_date"),
+            "end_date": self.parse_date("end_date"),
+            "lookback": self.parse_int("lookback", default=None, minimum=1),
+            "descending": self.parse_bool("descending", default=True),
+            "limit": self.parse_int("limit", default=None, minimum=0),
+        }
+        if self.present("instrument_ids"):
+            kwargs["instrument_ids"] = self.parse_instrument_ids()
+        if self.present("backend"):
+            kwargs["backend"] = self.raw("backend")
+        return kwargs
+
+    def parse_instrument_ids(self):
+        raw = [
+            part.strip()
+            for part in self.raw("instrument_ids").split(",")
+            if part.strip()
+        ]
+        ids = []
+        for part in raw:
+            try:
+                ids.append(int(part))
+            except ValueError as exc:
+                raise ValidationError(
+                    {"instrument_ids": [f"'{part}' is not an instrument id."]}
+                ) from exc
+        return ids
