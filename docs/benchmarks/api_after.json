@@ -1,0 +1,645 @@
+{
+  "label": "after",
+  "measured_at": "2026-10-17T20:36:09",
+  "environment": {
+    "database": "mysql",
+    "database_version": "market_data",
+    "cache_backend": "django.core.cache.backends.locmem.LocMemCache",
+    "cache_enabled": true,
+    "cache_available": true,
+    "python": "3.12.0",
+    "django": "5.2.18",
+    "seed": 20261017,
+    "instruments": 100,
+    "prices": 50000,
+    "snapshots": 200000,
+    "repeat": 15
+  },
+  "price_query_ab": {
+    "rounds": 300,
+    "with_join_ms": 1.475,
+    "without_join_ms": 0.833,
+    "with_join_sql_chars": 1271,
+    "without_join_sql_chars": 592,
+    "with_join_plan": {
+      "format": "tree",
+      "plan": "-> Limit: 25 row(s)  (cost=175 rows=25)\n    -> Index lookup on marketdata_pricerecord using uniq_price_instrument_trading_date (instrument_id = 13)  (cost=175 rows=500)\n"
+    },
+    "without_join_plan": {
+      "format": "tree",
+      "plan": "-> Limit: 25 row(s)  (cost=175 rows=25)\n    -> Index lookup on marketdata_pricerecord using uniq_price_instrument_trading_date (instrument_id = 13)  (cost=175 rows=500)\n"
+    }
+  },
+  "cases": {
+    "instruments.list.p1": {
+      "url": "/api/v1/instruments/?page=1",
+      "status": 200,
+      "cold_queries": 2,
+      "warm_queries": 2,
+      "cache": "-",
+      "median_ms": 3.67,
+      "p95_ms": 5.67,
+      "min_ms": 2.28,
+      "bytes": 3665,
+      "rows": 112,
+      "sql": "SELECT `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at`, `instruments_exchange`.`id`, `instruments_exchange`.`code`, `instruments_exchange`.`name`, `instruments_exchange`.`timezone` FROM `instruments_instrument` INNER JOIN `instruments_exchange` ON (`instruments_instrument`.`exchange_id` = `instruments_exchange`.`id`) ORDER BY `instruments_instrument`.`symbol` ASC LIMIT 25",
+      "explain": {
+        "format": "tree",
+        "plan": "-> Limit: 25 row(s)  (cost=50.7 rows=25)\n    -> Nested loop inner join  (cost=50.7 rows=112)\n        -> Sort: instruments_instrument.symbol  (cost=11.5 rows=112)\n            -> Table scan on instruments_instrument  (cost=11.5 rows=112)\n        -> Single-row index lookup on instruments_exchange using PRIMARY (id = instruments_instrument.exchange_id)  (cost=0.251 rows=1)\n"
+      },
+      "statements": [
+        {
+          "sql": "SELECT COUNT(*) AS `__count` FROM `instruments_instrument`",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Count rows in instruments_instrument\n"
+          }
+        },
+        {
+          "sql": "SELECT `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at`, `instruments_exchange`.`id`, `instruments_exchange`.`code`, `instruments_exchange`.`name`, `instruments_exchange`.`timezone` FROM `instruments_instrument` INNER JOIN `instruments_exchange` ON (`instruments_instrument`.`exchange_id` = `instruments_exchange`.`id`) ORDER BY `instruments_instrument`.`symbol` ASC LIMIT 25",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Limit: 25 row(s)  (cost=50.7 rows=25)\n    -> Nested loop inner join  (cost=50.7 rows=112)\n        -> Sort: instruments_instrument.symbol  (cost=11.5 rows=112)\n            -> Table scan on instruments_instrument  (cost=11.5 rows=112)\n        -> Single-row index lookup on instruments_exchange using PRIMARY (id = instruments_instrument.exchange_id)  (cost=0.251 rows=1)\n"
+          }
+        }
+      ]
+    },
+    "instruments.list.p3": {
+      "url": "/api/v1/instruments/?page=3",
+      "status": 200,
+      "cold_queries": 2,
+      "warm_queries": 2,
+      "cache": "-",
+      "median_ms": 3.87,
+      "p95_ms": 4.88,
+      "min_ms": 2.96,
+      "bytes": 3767,
+      "rows": 112,
+      "sql": "SELECT `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at`, `instruments_exchange`.`id`, `instruments_exchange`.`code`, `instruments_exchange`.`name`, `instruments_exchange`.`timezone` FROM `instruments_instrument` INNER JOIN `instruments_exchange` ON (`instruments_instrument`.`exchange_id` = `instruments_exchange`.`id`) ORDER BY `instruments_instrument`.`symbol` ASC LIMIT 25 OFFSET 50",
+      "explain": {
+        "format": "tree",
+        "plan": "-> Limit/Offset: 25/50 row(s)  (cost=50.7 rows=25)\n    -> Nested loop inner join  (cost=50.7 rows=112)\n        -> Sort: instruments_instrument.symbol  (cost=11.5 rows=112)\n            -> Table scan on instruments_instrument  (cost=11.5 rows=112)\n        -> Single-row index lookup on instruments_exchange using PRIMARY (id = instruments_instrument.exchange_id)  (cost=0.251 rows=1)\n"
+      },
+      "statements": [
+        {
+          "sql": "SELECT COUNT(*) AS `__count` FROM `instruments_instrument`",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Count rows in instruments_instrument\n"
+          }
+        },
+        {
+          "sql": "SELECT `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at`, `instruments_exchange`.`id`, `instruments_exchange`.`code`, `instruments_exchange`.`name`, `instruments_exchange`.`timezone` FROM `instruments_instrument` INNER JOIN `instruments_exchange` ON (`instruments_instrument`.`exchange_id` = `instruments_exchange`.`id`) ORDER BY `instruments_instrument`.`symbol` ASC LIMIT 25 OFFSET 50",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Limit/Offset: 25/50 row(s)  (cost=50.7 rows=25)\n    -> Nested loop inner join  (cost=50.7 rows=112)\n        -> Sort: instruments_instrument.symbol  (cost=11.5 rows=112)\n            -> Table scan on instruments_instrument  (cost=11.5 rows=112)\n        -> Single-row index lookup on instruments_exchange using PRIMARY (id = instruments_instrument.exchange_id)  (cost=0.251 rows=1)\n"
+          }
+        }
+      ]
+    },
+    "instruments.list.filter": {
+      "url": "/api/v1/instruments/?asset_type=equity",
+      "status": 200,
+      "cold_queries": 2,
+      "warm_queries": 2,
+      "cache": "-",
+      "median_ms": 3.59,
+      "p95_ms": 5.24,
+      "min_ms": 2.6,
+      "bytes": 3720,
+      "rows": 33,
+      "sql": "SELECT `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at`, `instruments_exchange`.`id`, `instruments_exchange`.`code`, `instruments_exchange`.`name`, `instruments_exchange`.`timezone` FROM `instruments_instrument` INNER JOIN `instruments_exchange` ON (`instruments_instrument`.`exchange_id` = `instruments_exchange`.`id`) WHERE `instruments_instrument`.`asset_type` = 'equity' ORDER BY `instruments_instrument`.`symbol` ASC LIMIT 25",
+      "explain": {
+        "format": "tree",
+        "plan": "-> Limit: 25 row(s)  (cost=15.6 rows=25)\n    -> Nested loop inner join  (cost=15.6 rows=33)\n        -> Sort: instruments_instrument.symbol  (cost=4.05 rows=33)\n            -> Index lookup on instruments_instrument using idx_instrument_asset_type (asset_type = 'equity')  (cost=4.05 rows=33)\n        -> Single-row index lookup on instruments_exchange using PRIMARY (id = instruments_instrument.exchange_id)  (cost=0.253 rows=1)\n"
+      },
+      "statements": [
+        {
+          "sql": "SELECT COUNT(*) AS `__count` FROM `instruments_instrument` WHERE `instruments_instrument`.`asset_type` = 'equity'",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Aggregate: count(0)  (cost=11.2 rows=1)\n    -> Covering index lookup on instruments_instrument using idx_instrument_asset_type (asset_type = 'equity')  (cost=3.62 rows=33)\n"
+          }
+        },
+        {
+          "sql": "SELECT `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at`, `instruments_exchange`.`id`, `instruments_exchange`.`code`, `instruments_exchange`.`name`, `instruments_exchange`.`timezone` FROM `instruments_instrument` INNER JOIN `instruments_exchange` ON (`instruments_instrument`.`exchange_id` = `instruments_exchange`.`id`) WHERE `instruments_instrument`.`asset_type` = 'equity' ORDER BY `instruments_instrument`.`symbol` ASC LIMIT 25",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Limit: 25 row(s)  (cost=15.6 rows=25)\n    -> Nested loop inner join  (cost=15.6 rows=33)\n        -> Sort: instruments_instrument.symbol  (cost=4.05 rows=33)\n            -> Index lookup on instruments_instrument using idx_instrument_asset_type (asset_type = 'equity')  (cost=4.05 rows=33)\n        -> Single-row index lookup on instruments_exchange using PRIMARY (id = instruments_instrument.exchange_id)  (cost=0.253 rows=1)\n"
+          }
+        }
+      ]
+    },
+    "instruments.list.search": {
+      "url": "/api/v1/instruments/?search=Benchmark",
+      "status": 200,
+      "cold_queries": 2,
+      "warm_queries": 2,
+      "cache": "-",
+      "median_ms": 4.57,
+      "p95_ms": 6.16,
+      "min_ms": 3.42,
+      "bytes": 3742,
+      "rows": 100,
+      "sql": "SELECT `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at`, `instruments_exchange`.`id`, `instruments_exchange`.`code`, `instruments_exchange`.`name`, `instruments_exchange`.`timezone` FROM `instruments_instrument` INNER JOIN `instruments_exchange` ON (`instruments_instrument`.`exchange_id` = `instruments_exchange`.`id`) WHERE ((`instruments_instrument`.`symbol` LIKE '%Benchmark%' OR `instruments_instrument`.`name` LIKE '%Benchmark%') AND (`instruments_instrument`.`symbol` LIKE '%Benchmark%' OR `instruments_instrument`.`name` LIKE '%Benchmark%')) ORDER BY `instruments_instrument`.`symbol` ASC LIMIT 25",
+      "explain": {
+        "format": "tree",
+        "plan": "-> Limit: 25 row(s)  (cost=3.81 rows=1.1)\n    -> Nested loop inner join  (cost=3.81 rows=1.1)\n        -> Filter: (((instruments_instrument.symbol like '%Benchmark%') or (instruments_instrument.`name` like '%Benchmark%')) and ((instruments_instrument.symbol like '%Benchmark%') or (instruments_instrument.`name` like '%Benchmark%')))  (cost=2.47 rows=1.1)\n            -> Index scan on instruments_instrument using symbol  (cost=2.47 rows=25)\n        -> Single-row index lookup on instruments_exchange using PRIMARY (id = instruments_instrument.exchange_id)  (cost=0.27 rows=1)\n"
+      },
+      "statements": [
+        {
+          "sql": "SELECT COUNT(*) AS `__count` FROM `instruments_instrument` WHERE ((`instruments_instrument`.`symbol` LIKE '%Benchmark%' OR `instruments_instrument`.`name` LIKE '%Benchmark%') AND (`instruments_instrument`.`symbol` LIKE '%Benchmark%' OR `instruments_instrument`.`name` LIKE '%Benchmark%'))",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Aggregate: count(0)  (cost=12.6 rows=1)\n    -> Filter: (((instruments_instrument.symbol like '%Benchmark%') or (instruments_instrument.`name` like '%Benchmark%')) and ((instruments_instrument.symbol like '%Benchmark%') or (instruments_instrument.`name` like '%Benchmark%')))  (cost=11.5 rows=4.93)\n        -> Table scan on instruments_instrument  (cost=11.5 rows=112)\n"
+          }
+        },
+        {
+          "sql": "SELECT `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at`, `instruments_exchange`.`id`, `instruments_exchange`.`code`, `instruments_exchange`.`name`, `instruments_exchange`.`timezone` FROM `instruments_instrument` INNER JOIN `instruments_exchange` ON (`instruments_instrument`.`exchange_id` = `instruments_exchange`.`id`) WHERE ((`instruments_instrument`.`symbol` LIKE '%Benchmark%' OR `instruments_instrument`.`name` LIKE '%Benchmark%') AND (`instruments_instrument`.`symbol` LIKE '%Benchmark%' OR `instruments_instrument`.`name` LIKE '%Benchmark%')) ORDER BY `instruments_instrument`.`symbol` ASC LIMIT 25",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Limit: 25 row(s)  (cost=3.81 rows=1.1)\n    -> Nested loop inner join  (cost=3.81 rows=1.1)\n        -> Filter: (((instruments_instrument.symbol like '%Benchmark%') or (instruments_instrument.`name` like '%Benchmark%')) and ((instruments_instrument.symbol like '%Benchmark%') or (instruments_instrument.`name` like '%Benchmark%')))  (cost=2.47 rows=1.1)\n            -> Index scan on instruments_instrument using symbol  (cost=2.47 rows=25)\n        -> Single-row index lookup on instruments_exchange using PRIMARY (id = instruments_instrument.exchange_id)  (cost=0.27 rows=1)\n"
+          }
+        }
+      ]
+    },
+    "instruments.list.order": {
+      "url": "/api/v1/instruments/?ordering=-created_at",
+      "status": 200,
+      "cold_queries": 2,
+      "warm_queries": 2,
+      "cache": "-",
+      "median_ms": 3.79,
+      "p95_ms": 5.25,
+      "min_ms": 2.7,
+      "bytes": 3745,
+      "rows": 112,
+      "sql": "SELECT `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at`, `instruments_exchange`.`id`, `instruments_exchange`.`code`, `instruments_exchange`.`name`, `instruments_exchange`.`timezone` FROM `instruments_instrument` INNER JOIN `instruments_exchange` ON (`instruments_instrument`.`exchange_id` = `instruments_exchange`.`id`) ORDER BY `instruments_instrument`.`created_at` DESC LIMIT 25",
+      "explain": {
+        "format": "tree",
+        "plan": "-> Limit: 25 row(s)  (cost=50.7 rows=25)\n    -> Nested loop inner join  (cost=50.7 rows=112)\n        -> Sort: instruments_instrument.created_at DESC  (cost=11.5 rows=112)\n            -> Table scan on instruments_instrument  (cost=11.5 rows=112)\n        -> Single-row index lookup on instruments_exchange using PRIMARY (id = instruments_instrument.exchange_id)  (cost=0.251 rows=1)\n"
+      },
+      "statements": [
+        {
+          "sql": "SELECT COUNT(*) AS `__count` FROM `instruments_instrument`",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Count rows in instruments_instrument\n"
+          }
+        },
+        {
+          "sql": "SELECT `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at`, `instruments_exchange`.`id`, `instruments_exchange`.`code`, `instruments_exchange`.`name`, `instruments_exchange`.`timezone` FROM `instruments_instrument` INNER JOIN `instruments_exchange` ON (`instruments_instrument`.`exchange_id` = `instruments_exchange`.`id`) ORDER BY `instruments_instrument`.`created_at` DESC LIMIT 25",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Limit: 25 row(s)  (cost=50.7 rows=25)\n    -> Nested loop inner join  (cost=50.7 rows=112)\n        -> Sort: instruments_instrument.created_at DESC  (cost=11.5 rows=112)\n            -> Table scan on instruments_instrument  (cost=11.5 rows=112)\n        -> Single-row index lookup on instruments_exchange using PRIMARY (id = instruments_instrument.exchange_id)  (cost=0.251 rows=1)\n"
+          }
+        }
+      ]
+    },
+    "instruments.detail": {
+      "url": "/api/v1/instruments/13/",
+      "status": 200,
+      "cold_queries": 1,
+      "warm_queries": 1,
+      "cache": "-",
+      "median_ms": 1.77,
+      "p95_ms": 2.83,
+      "min_ms": 1.34,
+      "bytes": 288,
+      "rows": null,
+      "sql": "SELECT `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at`, `instruments_exchange`.`id`, `instruments_exchange`.`code`, `instruments_exchange`.`name`, `instruments_exchange`.`timezone` FROM `instruments_instrument` INNER JOIN `instruments_exchange` ON (`instruments_instrument`.`exchange_id` = `instruments_exchange`.`id`) WHERE `instruments_instrument`.`id` = 13 LIMIT 21",
+      "explain": {
+        "format": "tree",
+        "plan": "-> Limit: 21 row(s)  (cost=0..0 rows=1)\n    -> Rows fetched before execution  (cost=0..0 rows=1)\n"
+      },
+      "statements": [
+        {
+          "sql": "SELECT `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at`, `instruments_exchange`.`id`, `instruments_exchange`.`code`, `instruments_exchange`.`name`, `instruments_exchange`.`timezone` FROM `instruments_instrument` INNER JOIN `instruments_exchange` ON (`instruments_instrument`.`exchange_id` = `instruments_exchange`.`id`) WHERE `instruments_instrument`.`id` = 13 LIMIT 21",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Limit: 21 row(s)  (cost=0..0 rows=1)\n    -> Rows fetched before execution  (cost=0..0 rows=1)\n"
+          }
+        }
+      ]
+    },
+    "exchanges.list": {
+      "url": "/api/v1/instruments/exchanges/",
+      "status": 200,
+      "cold_queries": 1,
+      "warm_queries": 1,
+      "cache": "-",
+      "median_ms": 1.19,
+      "p95_ms": 2.01,
+      "min_ms": 0.82,
+      "bytes": 556,
+      "rows": null,
+      "sql": "SELECT `instruments_exchange`.`id`, `instruments_exchange`.`code`, `instruments_exchange`.`name`, `instruments_exchange`.`timezone` FROM `instruments_exchange` ORDER BY `instruments_exchange`.`code` ASC",
+      "explain": {
+        "format": "tree",
+        "plan": "-> Sort: instruments_exchange.`code`  (cost=0.95 rows=7)\n    -> Table scan on instruments_exchange  (cost=0.95 rows=7)\n"
+      },
+      "statements": [
+        {
+          "sql": "SELECT `instruments_exchange`.`id`, `instruments_exchange`.`code`, `instruments_exchange`.`name`, `instruments_exchange`.`timezone` FROM `instruments_exchange` ORDER BY `instruments_exchange`.`code` ASC",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Sort: instruments_exchange.`code`  (cost=0.95 rows=7)\n    -> Table scan on instruments_exchange  (cost=0.95 rows=7)\n"
+          }
+        }
+      ]
+    },
+    "prices.p1": {
+      "url": "/api/v1/market-data/instruments/13/prices/?page=1",
+      "status": 200,
+      "cold_queries": 3,
+      "warm_queries": 3,
+      "cache": "-",
+      "median_ms": 4.45,
+      "p95_ms": 5.4,
+      "min_ms": 3.48,
+      "bytes": 4686,
+      "rows": 500,
+      "sql": "SELECT `marketdata_pricerecord`.`id`, `marketdata_pricerecord`.`ingestion_job_id`, `marketdata_pricerecord`.`instrument_id`, `marketdata_pricerecord`.`trading_date`, `marketdata_pricerecord`.`open`, `marketdata_pricerecord`.`high`, `marketdata_pricerecord`.`low`, `marketdata_pricerecord`.`close`, `marketdata_pricerecord`.`adjusted_close`, `marketdata_pricerecord`.`volume`, `marketdata_pricerecord`.`source`, `marketdata_pricerecord`.`created_at` FROM `marketdata_pricerecord` WHERE `marketdata_pricerecord`.`instrument_id` = 13 ORDER BY `marketdata_pricerecord`.`trading_date` ASC LIMIT 25",
+      "explain": {
+        "format": "tree",
+        "plan": "-> Limit: 25 row(s)  (cost=175 rows=25)\n    -> Index lookup on marketdata_pricerecord using uniq_price_instrument_trading_date (instrument_id = 13)  (cost=175 rows=500)\n"
+      },
+      "statements": [
+        {
+          "sql": "SELECT `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at`, `instruments_exchange`.`id`, `instruments_exchange`.`code`, `instruments_exchange`.`name`, `instruments_exchange`.`timezone` FROM `instruments_instrument` INNER JOIN `instruments_exchange` ON (`instruments_instrument`.`exchange_id` = `instruments_exchange`.`id`) WHERE `instruments_instrument`.`id` = 13 LIMIT 21",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Limit: 21 row(s)  (cost=0..0 rows=1)\n    -> Rows fetched before execution  (cost=0..0 rows=1)\n"
+          }
+        },
+        {
+          "sql": "SELECT COUNT(*) AS `__count` FROM `marketdata_pricerecord` WHERE `marketdata_pricerecord`.`instrument_id` = 13",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Aggregate: count(0)  (cost=166 rows=1)\n    -> Covering index lookup on marketdata_pricerecord using uniq_price_instrument_trading_date (instrument_id = 13)  (cost=50.5 rows=500)\n"
+          }
+        },
+        {
+          "sql": "SELECT `marketdata_pricerecord`.`id`, `marketdata_pricerecord`.`ingestion_job_id`, `marketdata_pricerecord`.`instrument_id`, `marketdata_pricerecord`.`trading_date`, `marketdata_pricerecord`.`open`, `marketdata_pricerecord`.`high`, `marketdata_pricerecord`.`low`, `marketdata_pricerecord`.`close`, `marketdata_pricerecord`.`adjusted_close`, `marketdata_pricerecord`.`volume`, `marketdata_pricerecord`.`source`, `marketdata_pricerecord`.`created_at` FROM `marketdata_pricerecord` WHERE `marketdata_pricerecord`.`instrument_id` = 13 ORDER BY `marketdata_pricerecord`.`trading_date` ASC LIMIT 25",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Limit: 25 row(s)  (cost=175 rows=25)\n    -> Index lookup on marketdata_pricerecord using uniq_price_instrument_trading_date (instrument_id = 13)  (cost=175 rows=500)\n"
+          }
+        }
+      ]
+    },
+    "prices.p20": {
+      "url": "/api/v1/market-data/instruments/13/prices/?page=20",
+      "status": 200,
+      "cold_queries": 3,
+      "warm_queries": 3,
+      "cache": "-",
+      "median_ms": 5.63,
+      "p95_ms": 7.65,
+      "min_ms": 4.13,
+      "bytes": 4687,
+      "rows": 500,
+      "sql": "SELECT `marketdata_pricerecord`.`id`, `marketdata_pricerecord`.`ingestion_job_id`, `marketdata_pricerecord`.`instrument_id`, `marketdata_pricerecord`.`trading_date`, `marketdata_pricerecord`.`open`, `marketdata_pricerecord`.`high`, `marketdata_pricerecord`.`low`, `marketdata_pricerecord`.`close`, `marketdata_pricerecord`.`adjusted_close`, `marketdata_pricerecord`.`volume`, `marketdata_pricerecord`.`source`, `marketdata_pricerecord`.`created_at` FROM `marketdata_pricerecord` WHERE `marketdata_pricerecord`.`instrument_id` = 13 ORDER BY `marketdata_pricerecord`.`trading_date` ASC LIMIT 25 OFFSET 475",
+      "explain": {
+        "format": "tree",
+        "plan": "-> Limit/Offset: 25/475 row(s)  (cost=175 rows=25)\n    -> Index lookup on marketdata_pricerecord using uniq_price_instrument_trading_date (instrument_id = 13)  (cost=175 rows=500)\n"
+      },
+      "statements": [
+        {
+          "sql": "SELECT `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at`, `instruments_exchange`.`id`, `instruments_exchange`.`code`, `instruments_exchange`.`name`, `instruments_exchange`.`timezone` FROM `instruments_instrument` INNER JOIN `instruments_exchange` ON (`instruments_instrument`.`exchange_id` = `instruments_exchange`.`id`) WHERE `instruments_instrument`.`id` = 13 LIMIT 21",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Limit: 21 row(s)  (cost=0..0 rows=1)\n    -> Rows fetched before execution  (cost=0..0 rows=1)\n"
+          }
+        },
+        {
+          "sql": "SELECT COUNT(*) AS `__count` FROM `marketdata_pricerecord` WHERE `marketdata_pricerecord`.`instrument_id` = 13",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Aggregate: count(0)  (cost=166 rows=1)\n    -> Covering index lookup on marketdata_pricerecord using uniq_price_instrument_trading_date (instrument_id = 13)  (cost=50.5 rows=500)\n"
+          }
+        },
+        {
+          "sql": "SELECT `marketdata_pricerecord`.`id`, `marketdata_pricerecord`.`ingestion_job_id`, `marketdata_pricerecord`.`instrument_id`, `marketdata_pricerecord`.`trading_date`, `marketdata_pricerecord`.`open`, `marketdata_pricerecord`.`high`, `marketdata_pricerecord`.`low`, `marketdata_pricerecord`.`close`, `marketdata_pricerecord`.`adjusted_close`, `marketdata_pricerecord`.`volume`, `marketdata_pricerecord`.`source`, `marketdata_pricerecord`.`created_at` FROM `marketdata_pricerecord` WHERE `marketdata_pricerecord`.`instrument_id` = 13 ORDER BY `marketdata_pricerecord`.`trading_date` ASC LIMIT 25 OFFSET 475",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Limit/Offset: 25/475 row(s)  (cost=175 rows=25)\n    -> Index lookup on marketdata_pricerecord using uniq_price_instrument_trading_date (instrument_id = 13)  (cost=175 rows=500)\n"
+          }
+        }
+      ]
+    },
+    "prices.range": {
+      "url": "/api/v1/market-data/instruments/13/prices/?start_date=2023-11-15&end_date=2024-03-14",
+      "status": 200,
+      "cold_queries": 3,
+      "warm_queries": 3,
+      "cache": "-",
+      "median_ms": 4.63,
+      "p95_ms": 7.1,
+      "min_ms": 2.9,
+      "bytes": 4729,
+      "rows": 87,
+      "sql": "SELECT `marketdata_pricerecord`.`id`, `marketdata_pricerecord`.`ingestion_job_id`, `marketdata_pricerecord`.`instrument_id`, `marketdata_pricerecord`.`trading_date`, `marketdata_pricerecord`.`open`, `marketdata_pricerecord`.`high`, `marketdata_pricerecord`.`low`, `marketdata_pricerecord`.`close`, `marketdata_pricerecord`.`adjusted_close`, `marketdata_pricerecord`.`volume`, `marketdata_pricerecord`.`source`, `marketdata_pricerecord`.`created_at` FROM `marketdata_pricerecord` WHERE (`marketdata_pricerecord`.`instrument_id` = 13 AND `marketdata_pricerecord`.`trading_date` >= '2023-11-15' AND `marketdata_pricerecord`.`trading_date` <= '2024-03-14') ORDER BY `marketdata_pricerecord`.`trading_date` ASC LIMIT 25",
+      "explain": {
+        "format": "tree",
+        "plan": "-> Limit: 25 row(s)  (cost=39.4 rows=25)\n    -> Index range scan on marketdata_pricerecord using uniq_price_instrument_trading_date over (instrument_id = 13 AND '2023-11-15' <= trading_date <= '2024-03-14'), with index condition: ((marketdata_pricerecord.instrument_id = 13) and (marketdata_pricerecord.trading_date >= DATE'2023-11-15') and (marketdata_pricerecord.trading_date <= DATE'2024-03-14'))  (cost=39.4 rows=87)\n"
+      },
+      "statements": [
+        {
+          "sql": "SELECT `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at`, `instruments_exchange`.`id`, `instruments_exchange`.`code`, `instruments_exchange`.`name`, `instruments_exchange`.`timezone` FROM `instruments_instrument` INNER JOIN `instruments_exchange` ON (`instruments_instrument`.`exchange_id` = `instruments_exchange`.`id`) WHERE `instruments_instrument`.`id` = 13 LIMIT 21",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Limit: 21 row(s)  (cost=0..0 rows=1)\n    -> Rows fetched before execution  (cost=0..0 rows=1)\n"
+          }
+        },
+        {
+          "sql": "SELECT COUNT(*) AS `__count` FROM `marketdata_pricerecord` WHERE (`marketdata_pricerecord`.`instrument_id` = 13 AND `marketdata_pricerecord`.`trading_date` >= '2023-11-15' AND `marketdata_pricerecord`.`trading_date` <= '2024-03-14')",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Aggregate: count(0)  (cost=37.8 rows=1)\n    -> Filter: ((marketdata_pricerecord.instrument_id = 13) and (marketdata_pricerecord.trading_date >= DATE'2023-11-15') and (marketdata_pricerecord.trading_date <= DATE'2024-03-14'))  (cost=17.7 rows=87)\n        -> Covering index range scan on marketdata_pricerecord using uniq_price_instrument_trading_date over (instrument_id = 13 AND '2023-11-15' <= trading_date <= '2024-03-14')  (cost=17.7 rows=87)\n"
+          }
+        },
+        {
+          "sql": "SELECT `marketdata_pricerecord`.`id`, `marketdata_pricerecord`.`ingestion_job_id`, `marketdata_pricerecord`.`instrument_id`, `marketdata_pricerecord`.`trading_date`, `marketdata_pricerecord`.`open`, `marketdata_pricerecord`.`high`, `marketdata_pricerecord`.`low`, `marketdata_pricerecord`.`close`, `marketdata_pricerecord`.`adjusted_close`, `marketdata_pricerecord`.`volume`, `marketdata_pricerecord`.`source`, `marketdata_pricerecord`.`created_at` FROM `marketdata_pricerecord` WHERE (`marketdata_pricerecord`.`instrument_id` = 13 AND `marketdata_pricerecord`.`trading_date` >= '2023-11-15' AND `marketdata_pricerecord`.`trading_date` <= '2024-03-14') ORDER BY `marketdata_pricerecord`.`trading_date` ASC LIMIT 25",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Limit: 25 row(s)  (cost=39.4 rows=25)\n    -> Index range scan on marketdata_pricerecord using uniq_price_instrument_trading_date over (instrument_id = 13 AND '2023-11-15' <= trading_date <= '2024-03-14'), with index condition: ((marketdata_pricerecord.instrument_id = 13) and (marketdata_pricerecord.trading_date >= DATE'2023-11-15') and (marketdata_pricerecord.trading_date <= DATE'2024-03-14'))  (cost=39.4 rows=87)\n"
+          }
+        }
+      ]
+    },
+    "prices.order_close": {
+      "url": "/api/v1/market-data/instruments/13/prices/?ordering=-close",
+      "status": 200,
+      "cold_queries": 3,
+      "warm_queries": 3,
+      "cache": "-",
+      "median_ms": 5.32,
+      "p95_ms": 6.83,
+      "min_ms": 4.81,
+      "bytes": 4701,
+      "rows": 500,
+      "sql": "SELECT `marketdata_pricerecord`.`id`, `marketdata_pricerecord`.`ingestion_job_id`, `marketdata_pricerecord`.`instrument_id`, `marketdata_pricerecord`.`trading_date`, `marketdata_pricerecord`.`open`, `marketdata_pricerecord`.`high`, `marketdata_pricerecord`.`low`, `marketdata_pricerecord`.`close`, `marketdata_pricerecord`.`adjusted_close`, `marketdata_pricerecord`.`volume`, `marketdata_pricerecord`.`source`, `marketdata_pricerecord`.`created_at` FROM `marketdata_pricerecord` WHERE `marketdata_pricerecord`.`instrument_id` = 13 ORDER BY `marketdata_pricerecord`.`close` DESC LIMIT 25",
+      "explain": {
+        "format": "tree",
+        "plan": "-> Limit: 25 row(s)  (cost=175 rows=25)\n    -> Sort: marketdata_pricerecord.`close` DESC, limit input to 25 row(s) per chunk  (cost=175 rows=500)\n        -> Index lookup on marketdata_pricerecord using uniq_price_instrument_trading_date (instrument_id = 13)  (cost=175 rows=500)\n"
+      },
+      "statements": [
+        {
+          "sql": "SELECT `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at`, `instruments_exchange`.`id`, `instruments_exchange`.`code`, `instruments_exchange`.`name`, `instruments_exchange`.`timezone` FROM `instruments_instrument` INNER JOIN `instruments_exchange` ON (`instruments_instrument`.`exchange_id` = `instruments_exchange`.`id`) WHERE `instruments_instrument`.`id` = 13 LIMIT 21",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Limit: 21 row(s)  (cost=0..0 rows=1)\n    -> Rows fetched before execution  (cost=0..0 rows=1)\n"
+          }
+        },
+        {
+          "sql": "SELECT COUNT(*) AS `__count` FROM `marketdata_pricerecord` WHERE `marketdata_pricerecord`.`instrument_id` = 13",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Aggregate: count(0)  (cost=166 rows=1)\n    -> Covering index lookup on marketdata_pricerecord using uniq_price_instrument_trading_date (instrument_id = 13)  (cost=50.5 rows=500)\n"
+          }
+        },
+        {
+          "sql": "SELECT `marketdata_pricerecord`.`id`, `marketdata_pricerecord`.`ingestion_job_id`, `marketdata_pricerecord`.`instrument_id`, `marketdata_pricerecord`.`trading_date`, `marketdata_pricerecord`.`open`, `marketdata_pricerecord`.`high`, `marketdata_pricerecord`.`low`, `marketdata_pricerecord`.`close`, `marketdata_pricerecord`.`adjusted_close`, `marketdata_pricerecord`.`volume`, `marketdata_pricerecord`.`source`, `marketdata_pricerecord`.`created_at` FROM `marketdata_pricerecord` WHERE `marketdata_pricerecord`.`instrument_id` = 13 ORDER BY `marketdata_pricerecord`.`close` DESC LIMIT 25",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Limit: 25 row(s)  (cost=175 rows=25)\n    -> Sort: marketdata_pricerecord.`close` DESC, limit input to 25 row(s) per chunk  (cost=175 rows=500)\n        -> Index lookup on marketdata_pricerecord using uniq_price_instrument_trading_date (instrument_id = 13)  (cost=175 rows=500)\n"
+          }
+        }
+      ]
+    },
+    "analytics.p1": {
+      "url": "/api/v1/analytics/instruments/13/metrics/?page=1",
+      "status": 200,
+      "cold_queries": 3,
+      "warm_queries": 0,
+      "cache": "HIT",
+      "median_ms": 0.4,
+      "p95_ms": 1.34,
+      "min_ms": 0.33,
+      "bytes": 5361,
+      "rows": 2000,
+      "sql": "SELECT `analytics_analyticsnapshot`.`id`, `analytics_analyticsnapshot`.`instrument_id`, `analytics_analyticsnapshot`.`as_of_date`, `analytics_analyticsnapshot`.`metric_type`, `analytics_analyticsnapshot`.`lookback_days`, `analytics_analyticsnapshot`.`value`, `analytics_analyticsnapshot`.`metadata`, `analytics_analyticsnapshot`.`calculated_at`, `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at` FROM `analytics_analyticsnapshot` INNER JOIN `instruments_instrument` ON (`analytics_analyticsnapshot`.`instrument_id` = `instruments_instrument`.`id`) WHERE `analytics_analyticsnapshot`.`instrument_id` = 13 ORDER BY `analytics_analyticsnapshot`.`as_of_date` DESC LIMIT 25",
+      "explain": {
+        "format": "tree",
+        "plan": "-> Limit: 25 row(s)  (cost=700 rows=25)\n    -> Index lookup on analytics_analyticsnapshot using uniq_snapshot_grain (instrument_id = 13) (reverse)  (cost=700 rows=2000)\n"
+      },
+      "statements": [
+        {
+          "sql": "SELECT `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at`, `instruments_exchange`.`id`, `instruments_exchange`.`code`, `instruments_exchange`.`name`, `instruments_exchange`.`timezone` FROM `instruments_instrument` INNER JOIN `instruments_exchange` ON (`instruments_instrument`.`exchange_id` = `instruments_exchange`.`id`) WHERE `instruments_instrument`.`id` = 13 LIMIT 21",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Limit: 21 row(s)  (cost=0..0 rows=1)\n    -> Rows fetched before execution  (cost=0..0 rows=1)\n"
+          }
+        },
+        {
+          "sql": "SELECT COUNT(*) AS `__count` FROM `analytics_analyticsnapshot` WHERE `analytics_analyticsnapshot`.`instrument_id` = 13",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Aggregate: count(0)  (cost=670 rows=1)\n    -> Covering index lookup on analytics_analyticsnapshot using idx_snapshot_instr_metric_date (instrument_id = 13)  (cost=209 rows=2000)\n"
+          }
+        },
+        {
+          "sql": "SELECT `analytics_analyticsnapshot`.`id`, `analytics_analyticsnapshot`.`instrument_id`, `analytics_analyticsnapshot`.`as_of_date`, `analytics_analyticsnapshot`.`metric_type`, `analytics_analyticsnapshot`.`lookback_days`, `analytics_analyticsnapshot`.`value`, `analytics_analyticsnapshot`.`metadata`, `analytics_analyticsnapshot`.`calculated_at`, `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at` FROM `analytics_analyticsnapshot` INNER JOIN `instruments_instrument` ON (`analytics_analyticsnapshot`.`instrument_id` = `instruments_instrument`.`id`) WHERE `analytics_analyticsnapshot`.`instrument_id` = 13 ORDER BY `analytics_analyticsnapshot`.`as_of_date` DESC LIMIT 25",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Limit: 25 row(s)  (cost=700 rows=25)\n    -> Index lookup on analytics_analyticsnapshot using uniq_snapshot_grain (instrument_id = 13) (reverse)  (cost=700 rows=2000)\n"
+          }
+        }
+      ]
+    },
+    "analytics.metric": {
+      "url": "/api/v1/analytics/instruments/13/metrics/?metric_type=return",
+      "status": 200,
+      "cold_queries": 3,
+      "warm_queries": 0,
+      "cache": "HIT",
+      "median_ms": 0.4,
+      "p95_ms": 0.55,
+      "min_ms": 0.32,
+      "bytes": 5285,
+      "rows": 500,
+      "sql": "SELECT `analytics_analyticsnapshot`.`id`, `analytics_analyticsnapshot`.`instrument_id`, `analytics_analyticsnapshot`.`as_of_date`, `analytics_analyticsnapshot`.`metric_type`, `analytics_analyticsnapshot`.`lookback_days`, `analytics_analyticsnapshot`.`value`, `analytics_analyticsnapshot`.`metadata`, `analytics_analyticsnapshot`.`calculated_at`, `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at` FROM `analytics_analyticsnapshot` INNER JOIN `instruments_instrument` ON (`analytics_analyticsnapshot`.`instrument_id` = `instruments_instrument`.`id`) WHERE (`analytics_analyticsnapshot`.`instrument_id` = 13 AND `analytics_analyticsnapshot`.`metric_type` = 'return') ORDER BY `analytics_analyticsnapshot`.`as_of_date` DESC LIMIT 25",
+      "explain": {
+        "format": "tree",
+        "plan": "-> Limit: 25 row(s)  (cost=175 rows=25)\n    -> Index lookup on analytics_analyticsnapshot using idx_snapshot_instr_metric_date (instrument_id = 13, metric_type = 'return')  (cost=175 rows=500)\n"
+      },
+      "statements": [
+        {
+          "sql": "SELECT `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at`, `instruments_exchange`.`id`, `instruments_exchange`.`code`, `instruments_exchange`.`name`, `instruments_exchange`.`timezone` FROM `instruments_instrument` INNER JOIN `instruments_exchange` ON (`instruments_instrument`.`exchange_id` = `instruments_exchange`.`id`) WHERE `instruments_instrument`.`id` = 13 LIMIT 21",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Limit: 21 row(s)  (cost=0..0 rows=1)\n    -> Rows fetched before execution  (cost=0..0 rows=1)\n"
+          }
+        },
+        {
+          "sql": "SELECT COUNT(*) AS `__count` FROM `analytics_analyticsnapshot` WHERE (`analytics_analyticsnapshot`.`instrument_id` = 13 AND `analytics_analyticsnapshot`.`metric_type` = 'return')",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Aggregate: count(0)  (cost=168 rows=1)\n    -> Covering index lookup on analytics_analyticsnapshot using idx_snapshot_instr_metric_date (instrument_id = 13, metric_type = 'return')  (cost=52.5 rows=500)\n"
+          }
+        },
+        {
+          "sql": "SELECT `analytics_analyticsnapshot`.`id`, `analytics_analyticsnapshot`.`instrument_id`, `analytics_analyticsnapshot`.`as_of_date`, `analytics_analyticsnapshot`.`metric_type`, `analytics_analyticsnapshot`.`lookback_days`, `analytics_analyticsnapshot`.`value`, `analytics_analyticsnapshot`.`metadata`, `analytics_analyticsnapshot`.`calculated_at`, `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at` FROM `analytics_analyticsnapshot` INNER JOIN `instruments_instrument` ON (`analytics_analyticsnapshot`.`instrument_id` = `instruments_instrument`.`id`) WHERE (`analytics_analyticsnapshot`.`instrument_id` = 13 AND `analytics_analyticsnapshot`.`metric_type` = 'return') ORDER BY `analytics_analyticsnapshot`.`as_of_date` DESC LIMIT 25",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Limit: 25 row(s)  (cost=175 rows=25)\n    -> Index lookup on analytics_analyticsnapshot using idx_snapshot_instr_metric_date (instrument_id = 13, metric_type = 'return')  (cost=175 rows=500)\n"
+          }
+        }
+      ]
+    },
+    "analytics.range": {
+      "url": "/api/v1/analytics/instruments/13/metrics/?metric_type=return&start_date=2023-11-15&end_date=2024-03-14",
+      "status": 200,
+      "cold_queries": 3,
+      "warm_queries": 0,
+      "cache": "HIT",
+      "median_ms": 0.37,
+      "p95_ms": 0.49,
+      "min_ms": 0.34,
+      "bytes": 5327,
+      "rows": 174,
+      "sql": "SELECT `analytics_analyticsnapshot`.`id`, `analytics_analyticsnapshot`.`instrument_id`, `analytics_analyticsnapshot`.`as_of_date`, `analytics_analyticsnapshot`.`metric_type`, `analytics_analyticsnapshot`.`lookback_days`, `analytics_analyticsnapshot`.`value`, `analytics_analyticsnapshot`.`metadata`, `analytics_analyticsnapshot`.`calculated_at`, `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at` FROM `analytics_analyticsnapshot` INNER JOIN `instruments_instrument` ON (`analytics_analyticsnapshot`.`instrument_id` = `instruments_instrument`.`id`) WHERE (`analytics_analyticsnapshot`.`instrument_id` = 13 AND `analytics_analyticsnapshot`.`metric_type` = 'return' AND `analytics_analyticsnapshot`.`as_of_date` >= '2023-11-15' AND `analytics_analyticsnapshot`.`as_of_date` <= '2024-03-14') ORDER BY `analytics_analyticsnapshot`.`as_of_date` DESC LIMIT 25",
+      "explain": {
+        "format": "tree",
+        "plan": "-> Limit: 25 row(s)  (cost=78.6 rows=25)\n    -> Index range scan on analytics_analyticsnapshot using idx_snapshot_instr_metric_date over (instrument_id = 13 AND metric_type = 'return' AND '2024-03-14' <= as_of_date <= '2023-11-15'), with index condition: ((analytics_analyticsnapshot.instrument_id = 13) and (analytics_analyticsnapshot.metric_type = 'return') and (analytics_analyticsnapshot.as_of_date >= DATE'2023-11-15') and (analytics_analyticsnapshot.as_of_date <= DATE'2024-03-14'))  (cost=78.6 rows=174)\n"
+      },
+      "statements": [
+        {
+          "sql": "SELECT `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at`, `instruments_exchange`.`id`, `instruments_exchange`.`code`, `instruments_exchange`.`name`, `instruments_exchange`.`timezone` FROM `instruments_instrument` INNER JOIN `instruments_exchange` ON (`instruments_instrument`.`exchange_id` = `instruments_exchange`.`id`) WHERE `instruments_instrument`.`id` = 13 LIMIT 21",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Limit: 21 row(s)  (cost=0..0 rows=1)\n    -> Rows fetched before execution  (cost=0..0 rows=1)\n"
+          }
+        },
+        {
+          "sql": "SELECT COUNT(*) AS `__count` FROM `analytics_analyticsnapshot` WHERE (`analytics_analyticsnapshot`.`instrument_id` = 13 AND `analytics_analyticsnapshot`.`metric_type` = 'return' AND `analytics_analyticsnapshot`.`as_of_date` >= '2023-11-15' AND `analytics_analyticsnapshot`.`as_of_date` <= '2024-03-14')",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Aggregate: count(0)  (cost=75.9 rows=1)\n    -> Filter: ((analytics_analyticsnapshot.instrument_id = 13) and (analytics_analyticsnapshot.metric_type = 'return') and (analytics_analyticsnapshot.as_of_date >= DATE'2023-11-15') and (analytics_analyticsnapshot.as_of_date <= DATE'2024-03-14'))  (cost=35.8 rows=174)\n        -> Covering index range scan on analytics_analyticsnapshot using idx_snapshot_instr_metric_date over (instrument_id = 13 AND metric_type = 'return' AND '2024-03-14' <= as_of_date <= '2023-11-15')  (cost=35.8 rows=174)\n"
+          }
+        },
+        {
+          "sql": "SELECT `analytics_analyticsnapshot`.`id`, `analytics_analyticsnapshot`.`instrument_id`, `analytics_analyticsnapshot`.`as_of_date`, `analytics_analyticsnapshot`.`metric_type`, `analytics_analyticsnapshot`.`lookback_days`, `analytics_analyticsnapshot`.`value`, `analytics_analyticsnapshot`.`metadata`, `analytics_analyticsnapshot`.`calculated_at`, `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at` FROM `analytics_analyticsnapshot` INNER JOIN `instruments_instrument` ON (`analytics_analyticsnapshot`.`instrument_id` = `instruments_instrument`.`id`) WHERE (`analytics_analyticsnapshot`.`instrument_id` = 13 AND `analytics_analyticsnapshot`.`metric_type` = 'return' AND `analytics_analyticsnapshot`.`as_of_date` >= '2023-11-15' AND `analytics_analyticsnapshot`.`as_of_date` <= '2024-03-14') ORDER BY `analytics_analyticsnapshot`.`as_of_date` DESC LIMIT 25",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Limit: 25 row(s)  (cost=78.6 rows=25)\n    -> Index range scan on analytics_analyticsnapshot using idx_snapshot_instr_metric_date over (instrument_id = 13 AND metric_type = 'return' AND '2024-03-14' <= as_of_date <= '2023-11-15'), with index condition: ((analytics_analyticsnapshot.instrument_id = 13) and (analytics_analyticsnapshot.metric_type = 'return') and (analytics_analyticsnapshot.as_of_date >= DATE'2023-11-15') and (analytics_analyticsnapshot.as_of_date <= DATE'2024-03-14'))  (cost=78.6 rows=174)\n"
+          }
+        }
+      ]
+    },
+    "analytics.order_value": {
+      "url": "/api/v1/analytics/instruments/13/metrics/?ordering=-value",
+      "status": 200,
+      "cold_queries": 3,
+      "warm_queries": 0,
+      "cache": "HIT",
+      "median_ms": 0.35,
+      "p95_ms": 0.93,
+      "min_ms": 0.32,
+      "bytes": 5483,
+      "rows": 2000,
+      "sql": "SELECT `analytics_analyticsnapshot`.`id`, `analytics_analyticsnapshot`.`instrument_id`, `analytics_analyticsnapshot`.`as_of_date`, `analytics_analyticsnapshot`.`metric_type`, `analytics_analyticsnapshot`.`lookback_days`, `analytics_analyticsnapshot`.`value`, `analytics_analyticsnapshot`.`metadata`, `analytics_analyticsnapshot`.`calculated_at`, `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at` FROM `analytics_analyticsnapshot` INNER JOIN `instruments_instrument` ON (`analytics_analyticsnapshot`.`instrument_id` = `instruments_instrument`.`id`) WHERE `analytics_analyticsnapshot`.`instrument_id` = 13 ORDER BY `analytics_analyticsnapshot`.`value` DESC LIMIT 25",
+      "explain": {
+        "format": "tree",
+        "plan": "-> Limit: 25 row(s)  (cost=700 rows=25)\n    -> Sort: analytics_analyticsnapshot.`value` DESC, limit input to 25 row(s) per chunk  (cost=700 rows=2000)\n        -> Index lookup on analytics_analyticsnapshot using uniq_snapshot_grain (instrument_id = 13)  (cost=700 rows=2000)\n"
+      },
+      "statements": [
+        {
+          "sql": "SELECT `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at`, `instruments_exchange`.`id`, `instruments_exchange`.`code`, `instruments_exchange`.`name`, `instruments_exchange`.`timezone` FROM `instruments_instrument` INNER JOIN `instruments_exchange` ON (`instruments_instrument`.`exchange_id` = `instruments_exchange`.`id`) WHERE `instruments_instrument`.`id` = 13 LIMIT 21",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Limit: 21 row(s)  (cost=0..0 rows=1)\n    -> Rows fetched before execution  (cost=0..0 rows=1)\n"
+          }
+        },
+        {
+          "sql": "SELECT COUNT(*) AS `__count` FROM `analytics_analyticsnapshot` WHERE `analytics_analyticsnapshot`.`instrument_id` = 13",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Aggregate: count(0)  (cost=670 rows=1)\n    -> Covering index lookup on analytics_analyticsnapshot using idx_snapshot_instr_metric_date (instrument_id = 13)  (cost=209 rows=2000)\n"
+          }
+        },
+        {
+          "sql": "SELECT `analytics_analyticsnapshot`.`id`, `analytics_analyticsnapshot`.`instrument_id`, `analytics_analyticsnapshot`.`as_of_date`, `analytics_analyticsnapshot`.`metric_type`, `analytics_analyticsnapshot`.`lookback_days`, `analytics_analyticsnapshot`.`value`, `analytics_analyticsnapshot`.`metadata`, `analytics_analyticsnapshot`.`calculated_at`, `instruments_instrument`.`id`, `instruments_instrument`.`symbol`, `instruments_instrument`.`name`, `instruments_instrument`.`asset_type`, `instruments_instrument`.`exchange_id`, `instruments_instrument`.`currency`, `instruments_instrument`.`is_active`, `instruments_instrument`.`created_at`, `instruments_instrument`.`updated_at` FROM `analytics_analyticsnapshot` INNER JOIN `instruments_instrument` ON (`analytics_analyticsnapshot`.`instrument_id` = `instruments_instrument`.`id`) WHERE `analytics_analyticsnapshot`.`instrument_id` = 13 ORDER BY `analytics_analyticsnapshot`.`value` DESC LIMIT 25",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Limit: 25 row(s)  (cost=700 rows=25)\n    -> Sort: analytics_analyticsnapshot.`value` DESC, limit input to 25 row(s) per chunk  (cost=700 rows=2000)\n        -> Index lookup on analytics_analyticsnapshot using uniq_snapshot_grain (instrument_id = 13)  (cost=700 rows=2000)\n"
+          }
+        }
+      ]
+    },
+    "auth.usage": {
+      "url": "/api/v1/auth/usage/",
+      "status": 200,
+      "cold_queries": 3,
+      "warm_queries": 0,
+      "cache": "HIT",
+      "median_ms": 0.29,
+      "p95_ms": 0.61,
+      "min_ms": 0.23,
+      "bytes": 226,
+      "rows": null,
+      "sql": "SELECT COUNT(`marketdata_pricerecord`.`id`) AS `price_records_imported`, COUNT(DISTINCT `marketdata_pricerecord`.`instrument_id`) AS `instruments_covered`, MIN(`marketdata_pricerecord`.`trading_date`) AS `earliest_price_date`, MAX(`marketdata_pricerecord`.`trading_date`) AS `latest_price_date` FROM `marketdata_pricerecord` INNER JOIN `ingestion_ingestionjob` ON (`marketdata_pricerecord`.`ingestion_job_id` = `ingestion_ingestionjob`.`id`) WHERE `ingestion_ingestionjob`.`created_by_id` = 14",
+      "explain": {
+        "format": "tree",
+        "plan": "-> Aggregate: count(marketdata_pricerecord.id), count(distinct marketdata_pricerecord.instrument_id), min(marketdata_pricerecord.trading_date), max(marketdata_pricerecord.trading_date)  (cost=21641 rows=1)\n    -> Nested loop inner join  (cost=8563 rows=56760)\n        -> Covering index lookup on ingestion_ingestionjob using idx_job_owner_requested (created_by_id = 14)  (cost=1.08 rows=8)\n        -> Index lookup on marketdata_pricerecord using marketdata_pricereco_ingestion_job_id_c293824d_fk_ingestion (ingestion_job_id = ingestion_ingestionjob.id)  (cost=449 rows=7095)\n"
+      },
+      "statements": [
+        {
+          "sql": "SELECT COUNT(`ingestion_ingestionjob`.`id`) AS `total_jobs`, SUM(`ingestion_ingestionjob`.`rows_received`) AS `total_rows_received`, SUM(`ingestion_ingestionjob`.`rows_accepted`) AS `total_rows_accepted`, SUM(`ingestion_ingestionjob`.`rows_rejected`) AS `total_rows_rejected` FROM `ingestion_ingestionjob` WHERE `ingestion_ingestionjob`.`created_by_id` = 14",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Aggregate: count(ingestion_ingestionjob.id), sum(ingestion_ingestionjob.rows_received), sum(ingestion_ingestionjob.rows_accepted), sum(ingestion_ingestionjob.rows_rejected)  (cost=3.19 rows=1)\n    -> Index lookup on ingestion_ingestionjob using uniq_job_owner_idempotency_key (created_by_id = 14)  (cost=1.35 rows=8)\n"
+          }
+        },
+        {
+          "sql": "SELECT `ingestion_ingestionjob`.`status` AS `status`, COUNT(`ingestion_ingestionjob`.`id`) AS `count` FROM `ingestion_ingestionjob` WHERE `ingestion_ingestionjob`.`created_by_id` = 14 GROUP BY 1",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Table scan on <temporary>\n    -> Aggregate using temporary table\n        -> Index lookup on ingestion_ingestionjob using uniq_job_owner_idempotency_key (created_by_id = 14)  (cost=1.35 rows=8)\n"
+          }
+        },
+        {
+          "sql": "SELECT COUNT(`marketdata_pricerecord`.`id`) AS `price_records_imported`, COUNT(DISTINCT `marketdata_pricerecord`.`instrument_id`) AS `instruments_covered`, MIN(`marketdata_pricerecord`.`trading_date`) AS `earliest_price_date`, MAX(`marketdata_pricerecord`.`trading_date`) AS `latest_price_date` FROM `marketdata_pricerecord` INNER JOIN `ingestion_ingestionjob` ON (`marketdata_pricerecord`.`ingestion_job_id` = `ingestion_ingestionjob`.`id`) WHERE `ingestion_ingestionjob`.`created_by_id` = 14",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Aggregate: count(marketdata_pricerecord.id), count(distinct marketdata_pricerecord.instrument_id), min(marketdata_pricerecord.trading_date), max(marketdata_pricerecord.trading_date)  (cost=21641 rows=1)\n    -> Nested loop inner join  (cost=8563 rows=56760)\n        -> Covering index lookup on ingestion_ingestionjob using idx_job_owner_requested (created_by_id = 14)  (cost=1.08 rows=8)\n        -> Index lookup on marketdata_pricerecord using marketdata_pricereco_ingestion_job_id_c293824d_fk_ingestion (ingestion_job_id = ingestion_ingestionjob.id)  (cost=449 rows=7095)\n"
+          }
+        }
+      ]
+    },
+    "jobs.list": {
+      "url": "/api/v1/ingestion/?page=1",
+      "status": 200,
+      "cold_queries": 2,
+      "warm_queries": 2,
+      "cache": "-",
+      "median_ms": 3.87,
+      "p95_ms": 4.96,
+      "min_ms": 3.15,
+      "bytes": 3147,
+      "rows": 8,
+      "sql": "SELECT `ingestion_ingestionjob`.`id`, `ingestion_ingestionjob`.`created_by_id`, `ingestion_ingestionjob`.`source_type`, `ingestion_ingestionjob`.`status`, `ingestion_ingestionjob`.`requested_at`, `ingestion_ingestionjob`.`started_at`, `ingestion_ingestionjob`.`completed_at`, `ingestion_ingestionjob`.`rows_received`, `ingestion_ingestionjob`.`rows_accepted`, `ingestion_ingestionjob`.`rows_rejected`, `ingestion_ingestionjob`.`error_summary`, `ingestion_ingestionjob`.`idempotency_key`, `ingestion_ingestionjob`.`celery_task_id`, `ingestion_ingestionjob`.`attempts`, `ingestion_ingestionjob`.`rows_processed`, `ingestion_ingestionjob`.`heartbeat_at`, `ingestion_ingestionjob`.`last_error`, `ingestion_ingestionjob`.`checkpoint`, `ingestion_ingestionjob`.`policy`, `accounts_user`.`id`, `accounts_user`.`password`, `accounts_user`.`last_login`, `accounts_user`.`is_superuser`, `accounts_user`.`first_name`, `accounts_user`.`last_name`, `accounts_user`.`is_staff`, `accounts_user`.`is_active`, `accounts_user`.`date_joined`, `accounts_user`.`email`, `accounts_user`.`role` FROM `ingestion_ingestionjob` INNER JOIN `accounts_user` ON (`ingestion_ingestionjob`.`created_by_id` = `accounts_user`.`id`) WHERE `ingestion_ingestionjob`.`created_by_id` = 14 ORDER BY `ingestion_ingestionjob`.`requested_at` DESC LIMIT 8",
+      "explain": {
+        "format": "tree",
+        "plan": "-> Limit: 8 row(s)  (cost=1.35 rows=8)\n    -> Index lookup on ingestion_ingestionjob using idx_job_owner_requested (created_by_id = 14)  (cost=1.35 rows=8)\n"
+      },
+      "statements": [
+        {
+          "sql": "SELECT COUNT(*) AS `__count` FROM `ingestion_ingestionjob` WHERE `ingestion_ingestionjob`.`created_by_id` = 14",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Aggregate: count(0)  (cost=2.92 rows=1)\n    -> Covering index lookup on ingestion_ingestionjob using idx_job_owner_requested (created_by_id = 14)  (cost=1.08 rows=8)\n"
+          }
+        },
+        {
+          "sql": "SELECT `ingestion_ingestionjob`.`id`, `ingestion_ingestionjob`.`created_by_id`, `ingestion_ingestionjob`.`source_type`, `ingestion_ingestionjob`.`status`, `ingestion_ingestionjob`.`requested_at`, `ingestion_ingestionjob`.`started_at`, `ingestion_ingestionjob`.`completed_at`, `ingestion_ingestionjob`.`rows_received`, `ingestion_ingestionjob`.`rows_accepted`, `ingestion_ingestionjob`.`rows_rejected`, `ingestion_ingestionjob`.`error_summary`, `ingestion_ingestionjob`.`idempotency_key`, `ingestion_ingestionjob`.`celery_task_id`, `ingestion_ingestionjob`.`attempts`, `ingestion_ingestionjob`.`rows_processed`, `ingestion_ingestionjob`.`heartbeat_at`, `ingestion_ingestionjob`.`last_error`, `ingestion_ingestionjob`.`checkpoint`, `ingestion_ingestionjob`.`policy`, `accounts_user`.`id`, `accounts_user`.`password`, `accounts_user`.`last_login`, `accounts_user`.`is_superuser`, `accounts_user`.`first_name`, `accounts_user`.`last_name`, `accounts_user`.`is_staff`, `accounts_user`.`is_active`, `accounts_user`.`date_joined`, `accounts_user`.`email`, `accounts_user`.`role` FROM `ingestion_ingestionjob` INNER JOIN `accounts_user` ON (`ingestion_ingestionjob`.`created_by_id` = `accounts_user`.`id`) WHERE `ingestion_ingestionjob`.`created_by_id` = 14 ORDER BY `ingestion_ingestionjob`.`requested_at` DESC LIMIT 8",
+          "explain": {
+            "format": "tree",
+            "plan": "-> Limit: 8 row(s)  (cost=1.35 rows=8)\n    -> Index lookup on ingestion_ingestionjob using idx_job_owner_requested (created_by_id = 14)  (cost=1.35 rows=8)\n"
+          }
+        }
+      ]
+    }
+  }
+}

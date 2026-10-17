@@ -22,6 +22,7 @@ from typing import Any
 
 from django.db import connection
 
+from apps.common.cache import invalidate_after_commit
 from apps.instruments.models import Instrument
 from apps.marketdata.models import PriceRecord, TradingCalendar
 
@@ -211,6 +212,12 @@ def upsert_prices(
                 )
             ),
         )
+        # ``bulk_create`` sends no signals, so the cache is invalidated here
+        # instead of by the receivers in apps/marketdata/signals.py. It is
+        # ``on_commit`` because a chunk that rolls back wrote nothing: the cached
+        # summary is still true, and evicting it would force a recompute that
+        # returns the same answer.
+        invalidate_after_commit("usage")
     return result
 
 
