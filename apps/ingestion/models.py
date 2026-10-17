@@ -137,6 +137,17 @@ class IngestionJob(models.Model):
             # Stale-job sweeps scan "PROCESSING with a cold heartbeat"; this is
             # the index that keeps that scan off a full table read.
             models.Index(fields=["status", "heartbeat_at"], name="idx_job_status_heartbeat"),
+            # The job list is "this owner's jobs, newest first". The owner filter
+            # alone was already served by the idempotency-key index, but the sort
+            # was not: EXPLAIN over the benchmark data showed a "Sort row IDs:
+            # requested_at DESC" node sitting on top of that lookup. Naming the
+            # ordering here makes it part of the access path instead, so one page
+            # is a bounded index read rather than a lookup plus a sort of
+            # everything the owner has ever submitted.
+            models.Index(
+                fields=["created_by", "-requested_at"],
+                name="idx_job_owner_requested",
+            ),
         ]
 
     @property

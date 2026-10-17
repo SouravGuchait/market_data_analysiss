@@ -9,6 +9,8 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 
+from apps.common.views import CachedReadMixin
+
 from . import services
 from .serializers import (
     LogoutSerializer,
@@ -65,15 +67,29 @@ class MeView(APIView):
         return Response(UserSerializer(request.user).data)
 
 
-class UserUsageView(APIView):
+class UserUsageView(CachedReadMixin, APIView):
     """The authenticated user's own activity summary.
 
     An ``APIView`` rather than a generic view because the response is not a model
     representation: it is an aggregate built by a service function, so there is
     no queryset, serializer, or pagination to configure.
+
+    It is the most expensive single read in the API -- the summary scans every
+    price row this user owns -- and it is read far more often than it changes, so
+    it is served through the cache, keyed by owner.
     """
 
     permission_classes = [IsAuthenticated]
+    cache_namespace = services.USAGE_CACHE_NAMESPACE
 
-    def get(self, request):
-        return Response(services.get_user_usage_statistics(request.user))
+    def get(self, request, *args, **kwargs):
+        return self.cached_response(request, *args, **kwargs)
+
+    def get_cache_key(self):
+        return services.usage_cache_key(self.request.user)
+
+    def get_cache_ttl(self):
+        return services.usage_cache_ttl()
+
+    def produce_payload(self, request, *args, **kwargs):
+        return services.get_user_usage_statistics(request.user)

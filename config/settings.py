@@ -153,6 +153,81 @@ SIMPLE_JWT = {
     "UPDATE_LAST_LOGIN": True,
 }
 
+# --------------------------------------------------------------------------- #
+# Read-through cache for the analytics endpoints
+# --------------------------------------------------------------------------- #
+# The cache never holds the only copy of anything: every entry is a memoised view
+# of rows that are still in the database. That is what makes a Redis outage a
+# performance event rather than an outage -- the request recomputes from MySQL.
+# apps/common/cache.py enforces the same rule at call level by treating any
+# backend error as a miss.
+#
+# Redis is opt-in so a laptop without one still gets a working cache, and so the
+# default request path never pays a connect timeout. Production sets
+# REDIS_CACHE_URL. A separate logical database (…/1) is used because the Celery
+# broker already owns db 0: flushing one must not silence the other.
+REDIS_CACHE_URL = env("REDIS_CACHE_URL", default="")
+
+if REDIS_CACHE_URL:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.redis.RedisCache",
+            "LOCATION": REDIS_CACHE_URL,
+            "KEY_PREFIX": env("CACHE_KEY_PREFIX", default="market_data"),
+            # One second, not the five-to-ten a socket will otherwise wait. A
+            # cache slower than the query it is meant to save is a liability, so
+            # a stalled connection gives up and lets the database answer.
+            "OPTIONS": {
+                "socket_connect_timeout": env.int("REDIS_CACHE_TIMEOUT", default=1),
+                "socket_timeout": env.int("REDIS_CACHE_TIMEOUT", default=1),
+            },
+        }
+    }
+else:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+            "LOCATION": "market-data-dev",
+            "KEY_PREFIX": env("CACHE_KEY_PREFIX", default="market_data"),
+        }
+    }
+
+# Cached reads are switchable without a code change, so a deployment can turn
+# them off if a stale answer is ever worse than a slow one.
+API_CACHE_ENABLED = env.bool("API_CACHE_ENABLED", default=True)
+
+# Snapshots are append-only and written by the pipeline, so this TTL is a
+# backstop behind explicit invalidation rather than the primary mechanism.
+API_CACHE_ANALYTICS_TTL = env.int("API_CACHE_ANALYTICS_TTL", default=300)
+# The usage summary aggregates the whole price table for one owner: expensive
+# enough to be worth caching, cheap enough that a 60s TTL goes unnoticed.
+API_CACHE_USAGE_TTL = env.int("API_CACHE_USAGE_TTL", default=60)
+# Stampede control. A request that misses takes the lock and computes; the others
+# wait this long for the winner before computing for themselves, so a cold key
+# costs one heavy query instead of one per concurrent request. The lock is an
+# optimisation, never a correctness dependency: no request is ever blocked
+# indefinitely by another.
+API_CACHE_LOCK_SECONDS = env.int("API_CACHE_LOCK_SECONDS", default=5)
+API_CACHE_STAMPEDE_WAIT_SECONDS = env.float("API_CACHE_STAMPEDE_WAIT_SECONDS", default=0.5)
+
+if TESTING:
+    # In-process, and cold for every test. Cached reads stay off unless a test
+    # opts in with ``override_settings(API_CACHE_ENABLED=True)``.
+    #
+    # This is not just convenience. Django does *not* clear caches between tests,
+    # and ``TestCase`` rolls the database back while primary keys restart, so a
+    # warm entry keyed on "user 1" could otherwise serve one test's rows to the
+    # next. Worse, several existing tests assert exact query counts
+    # (``assertNumQueries(4)``) that a cache hit would silently invalidate. Making
+    # the cache explicit in the tests that exercise it keeps both honest.
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+            "LOCATION": "market-data-tests",
+        }
+    }
+    API_CACHE_ENABLED = False
+
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -182,6 +257,9 @@ LOGGING = {
         "django.request": {"handlers": ["console"], "level": "WARNING", "propagate": False},
         "market_data": {"handlers": ["console"], "level": "INFO", "propagate": False},
         "market_data.tasks": {"handlers": ["console"], "level": "INFO", "propagate": False},
+        # Cache degradation is reported here, throttled, so a Redis outage
+        # produces one warning a minute instead of one per request.
+        "market_data.cache": {"handlers": ["console"], "level": "INFO", "propagate": False},
     },
 }
 
