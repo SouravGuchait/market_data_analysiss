@@ -1,0 +1,8 @@
+[
+  {"code": "NASDAQ", "name": "Nasdaq Stock Market", "timezone": "America/New_York"},
+  {"code": "NYSE", "name": "New York Stock Exchange", "timezone": "America/New_York"},
+  {"code": "LSE", "name": "London Stock Exchange", "timezone": "Europe/London"},
+  {"code": "NSE", "name": "National Stock Exchange of India", "timezone": "Asia/Kolkata"},
+  {"code": "CRYPTO", "name": "Synthetic Crypto Network", "timezone": "UTC"},
+  {"code": "FX", "name": "Synthetic Interbank FX", "timezone": "UTC"}
+]

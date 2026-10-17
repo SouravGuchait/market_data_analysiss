@@ -1,0 +1,13 @@
+symbol,name,asset_type,exchange_code,currency,is_active
+APE001,Apex Analytics 1,equity,NASDAQ,USD,False
+COB003,Cobalt Health 3,equity,LSE,GBP,True
+EVE005,Evergreen Systems 5,crypto,CRYPTO,USD,True
+TSLA,Tesla Inc.,equity,NASDAQ,USD,True
+AAPL,Apple Inc.,equity,NASDAQ,USD,True
+MSFT,Microsoft Corporation,equity,NASDAQ,USD,True
+GOOG,Alphabet Inc.,equity,NASDAQ,USD,True
+AMZN,Amazon.com Inc.,equity,NASDAQ,USD,True
+NVDA,NVIDIA Corporation,equity,NASDAQ,USD,True
+DEL004,Delta Markets 4,index,NSE,INR,True
+BEA002,Beacon Energy 2,etf,NYSE,USD,True
+SPY,SPDR S&P 500 ETF Trust,etf,NYSE,USD,True

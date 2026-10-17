@@ -1,15 +1,43 @@
 """Business logic for ingestion jobs.
 
-Job creation is the one write path in the API layer, so the rules that make a job
-valid live here rather than in the view: which fields a client may set, what the
-initial state is, and who is allowed to see a job.
+Two related jobs live here, kept in one module on purpose:
+
+* the **read/create surface** the API talks to — which fields a client may set,
+  what a job's initial state is, and who may see a job; and
+* the **ETL entry points** — the synchronous engine in ``apps.ingestion.etl`` is
+  driven from here, so the API, the management command, and the tests all call
+  the same functions rather than reaching into ``etl`` directly.
+
+A view — or, later, a Celery task — therefore never wires the pipeline itself:
+it calls a service, and the service owns the wiring.
 """
 
-from django.core.exceptions import ValidationError
+from pathlib import Path
 
-from .models import IngestionJob, JobStatus, SourceType
+from django.core.exceptions import ValidationError
+from django.core.files.storage import default_storage
+
+from .etl import storage
+from .etl.pipeline import IngestionPolicy, IngestionResult, run_ingestion
+from .etl.reporting import job_report
+from .models import IngestionJob, SourceType
 
 VALID_SOURCE_TYPES = {choice.value for choice in SourceType}
+
+# The one place a filename is mapped to a source type. ``storage`` allows the
+# same extensions, so a mismatch between what can be stored and what can be read
+# has a single cause rather than two independent lists.
+_EXTENSION_TO_SOURCE_TYPE = {
+    ".csv": SourceType.CSV,
+    ".json": SourceType.JSON,
+    ".jsonl": SourceType.JSON,
+    ".xlsx": SourceType.XLSX,
+}
+
+
+# --------------------------------------------------------------------------- #
+# Read / create surface (used by the API)
+# --------------------------------------------------------------------------- #
 
 
 def get_job_queryset():
@@ -68,6 +96,15 @@ def get_validation_errors_for_job(job, *, error_code=None):
     return queryset.order_by("row_number")
 
 
+def get_rule_summaries_for_job(job):
+    """Returns the rule-level PASS/FAIL verdicts recorded for a job.
+
+    One row per rule the pipeline evaluated, in the model's default order (by
+    rule name). Returned as a queryset so a view can serialize or paginate it.
+    """
+    return job.rule_summaries.all()
+
+
 def get_job_statistics(user):
     """Aggregates a user's ingestion activity.
 
@@ -83,3 +120,159 @@ def get_job_statistics(user):
         total_rows_accepted=Sum("rows_accepted"),
         total_rows_rejected=Sum("rows_rejected"),
     )
+
+
+# --------------------------------------------------------------------------- #
+# ETL entry points (the synchronous engine)
+# --------------------------------------------------------------------------- #
+
+
+def infer_source_type(filename) -> str:
+    """Map a filename to its :class:`~apps.ingestion.models.SourceType`.
+
+    Contract
+    --------
+    in : any filename or path.
+    out: the matching ``SourceType`` member.
+
+    Business purpose: a caller that has a file but no declared source type — the
+    management command, an upload without an explicit type — gets the right
+    adapter chosen the same way everywhere.
+
+    Raises ``ValueError`` for an extension the engine cannot parse, so the caller
+    learns "not one of ours" up front rather than from a parse failure mid-load.
+    """
+    suffix = Path(str(filename)).suffix.lower()
+    try:
+        return _EXTENSION_TO_SOURCE_TYPE[suffix]
+    except KeyError:
+        allowed = ", ".join(sorted(_EXTENSION_TO_SOURCE_TYPE))
+        raise ValueError(
+            f"cannot infer a source type from {filename!r}; expected one of: {allowed}"
+        ) from None
+
+
+def run_job(
+    job,
+    *,
+    source_type,
+    path=None,
+    fetcher=None,
+    sheet_name=None,
+    records_key=None,
+    policy: IngestionPolicy | None = None,
+) -> IngestionResult:
+    """Run the synchronous ETL for an already-created job.
+
+    Contract
+    --------
+    in : a ``pending`` job, its ``source_type``, and its source — a ``path`` for a
+         file format, or a ``fetcher`` callable for the API source — plus an
+         optional :class:`~apps.ingestion.etl.pipeline.IngestionPolicy`.
+    out: an :class:`~apps.ingestion.etl.pipeline.IngestionResult`; the job row is
+         updated in place and ends ``succeeded``, ``partial``, or ``failed``.
+
+    Business purpose: the single call that turns a job request into loaded rows,
+    so every trigger — API, command, test — shares the same validation,
+    reporting, and transaction behaviour.
+    """
+    return run_ingestion(
+        job,
+        source_type=source_type,
+        path=path,
+        fetcher=fetcher,
+        sheet_name=sheet_name,
+        records_key=records_key,
+        policy=policy,
+    )
+
+
+def ingest_file(
+    *,
+    user,
+    path,
+    source_type: str | None = None,
+    policy: IngestionPolicy | None = None,
+    sheet_name: str | None = None,
+) -> IngestionResult:
+    """Create a job for a file on disk, register it, and run the ETL.
+
+    Contract
+    --------
+    in : the owning user, a path, and optional overrides.
+
+    out: the :class:`~apps.ingestion.etl.pipeline.IngestionResult`.
+
+    Business purpose: the path the management command and the tests use. The file
+    is validated (extension, size, existence) *before* the job is created, so a
+    file that cannot be read leaves no half-made job behind.
+
+    Raises ``ValueError`` for an unknown extension and
+    :class:`~apps.ingestion.etl.errors.UnsafeFileError` for a missing or oversize
+    file.
+    """
+    resolved_type = source_type or infer_source_type(path)
+    resolved_path = storage.validate_local_file(path)
+    job = create_job(created_by=user, source_type=resolved_type)
+    storage.register_local_file(job=job, path=resolved_path)
+    return run_job(
+        job,
+        source_type=resolved_type,
+        path=resolved_path,
+        sheet_name=sheet_name,
+        policy=policy,
+    )
+
+
+def ingest_upload(
+    *,
+    user,
+    uploaded_file,
+    source_type: str | None = None,
+    policy: IngestionPolicy | None = None,
+    sheet_name: str | None = None,
+) -> IngestionResult:
+    """Create a job for an uploaded file, store it, and run the ETL.
+
+    Contract
+    --------
+    in : the owning user and a Django ``UploadedFile``.
+
+    out: the :class:`~apps.ingestion.etl.pipeline.IngestionResult`.
+
+    Business purpose: the HTTP upload path. The file passes its safety checks
+    before the job exists, is stored under ``MEDIA_ROOT`` with a checksum, and is
+    then read back from storage — so the pipeline parses exactly the artifact the
+    job is recorded against, not a buffer that might differ from what was saved.
+    """
+    name = storage.safe_filename(uploaded_file.name)
+    storage.validate_extension(name)
+    storage.assert_within_size(uploaded_file.size)
+
+    resolved_type = source_type or infer_source_type(name)
+    job = create_job(created_by=user, source_type=resolved_type)
+    stored = storage.store_upload(job=job, uploaded_file=uploaded_file)
+    return run_job(
+        job,
+        source_type=resolved_type,
+        path=default_storage.path(stored.storage_path),
+        sheet_name=sheet_name,
+        policy=policy,
+    )
+
+
+def report_for(job) -> dict:
+    """Return the data-quality report for a finished job as a plain dict.
+
+    Contract
+    --------
+    in : an :class:`~apps.ingestion.models.IngestionJob`.
+
+    out: the report produced by
+         :func:`apps.ingestion.etl.reporting.job_report` — the row counts, one
+         PASS/FAIL entry per rule, and a sample of the failures.
+
+    Business purpose: the one shape a dashboard, a view, or a log line reads, so
+    the rule table and the failure sample cannot drift apart.
+    """
+    return job_report(job)

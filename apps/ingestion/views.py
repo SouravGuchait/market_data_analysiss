@@ -1,16 +1,29 @@
-"""Ingestion job endpoints."""
+"""Ingestion job endpoints.
+
+The read/create surface mirrors the PR's original design; the upload, report, and
+rule-summary endpoints are the ETL upgrade: they are what actually run a load and
+expose its data-quality verdict. Every view stays a thin adapter — the work is in
+``services``.
+"""
 
 from django.shortcuts import get_object_or_404
 from rest_framework import generics, status
+from rest_framework.exceptions import ValidationError
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from apps.common.permissions import IsJobOwner
 
 from . import services
+from .etl.errors import UnsafeFileError
+from .etl.pipeline import IngestionPolicy
 from .serializers import (
     IngestionJobCreateSerializer,
     IngestionJobSerializer,
+    IngestionRuleSummarySerializer,
+    IngestionUploadSerializer,
     IngestionValidationErrorSerializer,
 )
 
@@ -57,6 +70,54 @@ class IngestionJobListCreateAPIView(generics.ListCreateAPIView):
         return Response(IngestionJobSerializer(job).data, status=status.HTTP_201_CREATED)
 
 
+class IngestionJobUploadAPIView(APIView):
+    """Uploads a source file and runs the synchronous ETL in one request.
+
+    Separate from ``POST /`` on purpose: creating a job is a request to load, and
+    this is the action that fulfils it. A client that only wants to record a job
+    is not forced to send a file, and a client that has the file gets the load
+    done in the same round trip.
+
+    Returns ``201`` with both the resulting job and its data-quality report, so a
+    caller needs one request to learn the outcome.
+    """
+
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request):
+        serializer = IngestionUploadSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        policy = IngestionPolicy(
+            on_invalid=data["on_invalid"],
+            on_existing=data["on_existing"],
+        )
+
+        try:
+            result = services.ingest_upload(
+                user=request.user,
+                uploaded_file=data["file"],
+                source_type=data.get("source_type"),
+                sheet_name=data.get("sheet_name"),
+                policy=policy,
+            )
+        except (UnsafeFileError, ValueError) as exc:
+            # The serializer checks the file first, so reaching here means the
+            # source type could not be resolved. Either way it is the client's
+            # input, not a server fault.
+            raise ValidationError({"file": [str(exc)]}) from exc
+
+        return Response(
+            {
+                "job": IngestionJobSerializer(result.job).data,
+                "report": result.report,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
 class IngestionJobRetrieveAPIView(generics.RetrieveAPIView):
     """Retrieves the status of one job.
 
@@ -78,6 +139,22 @@ class IngestionJobRetrieveAPIView(generics.RetrieveAPIView):
         return job
 
 
+class IngestionJobReportAPIView(APIView):
+    """Returns the data-quality report for one job.
+
+    The report is a computed document assembled from the job, its rule summaries,
+    and a sample of its failures — not a model — so it is returned as a plain
+    JSON object rather than through a ``ModelSerializer``.
+    """
+
+    permission_classes = [IsAuthenticated, IsJobOwner]
+
+    def get(self, request, pk):
+        job = get_object_or_404(services.get_job_queryset(), pk=pk)
+        self.check_object_permissions(request, job)
+        return Response(services.report_for(job))
+
+
 class IngestionJobValidationErrorListAPIView(generics.ListAPIView):
     """Lists the validation errors recorded against one job."""
 
@@ -92,3 +169,23 @@ class IngestionJobValidationErrorListAPIView(generics.ListAPIView):
         return services.get_validation_errors_for_job(
             job, error_code=self.request.query_params.get("error_code")
         )
+
+
+class IngestionJobRuleSummaryListAPIView(generics.ListAPIView):
+    """Lists the rule-level PASS/FAIL verdicts for one job.
+
+    Unpaginated: the pipeline evaluates a fixed set of rules, so a job has at most
+    one row per rule. A page wrapper around a dozen rows would add noise, the same
+    reasoning as the exchanges endpoint.
+    """
+
+    serializer_class = IngestionRuleSummarySerializer
+    ordering_fields = ["rule_name", "passed", "failed"]
+    ordering = ["rule_name"]
+    pagination_class = None
+    permission_classes = [IsAuthenticated, IsJobOwner]
+
+    def get_queryset(self):
+        job = get_object_or_404(services.get_job_queryset(), pk=self.kwargs["job_pk"])
+        self.check_object_permissions(self.request, job)
+        return services.get_rule_summaries_for_job(job)

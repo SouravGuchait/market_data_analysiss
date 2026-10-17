@@ -1,0 +1,7 @@
+file_id,job_id,original_filename,storage_path,checksum,content_type
+8bde6147-2c54-5586-bd69-0d45efd196b6,b10d2e45-e6a0-5961-a899-3db1a9c2cf27,prices_batch_001.csv,media/ingestion/prices_batch_001.csv,5cd7698bfe824e82c4be5030cb4c86e48949e4889a9f2eb29f932df5190500c7,text/csv
+ecd56b25-f005-5000-841d-4e99b468c015,ea0d32a3-0bbf-5d8a-b239-f28cd1a23761,prices_batch_002.json,media/ingestion/prices_batch_002.json,63c34aed3927bd8138ad804570126048e4b14bc6649eede620102268001e745a,application/json
+4ac06b72-b4bd-56a1-96bf-f2edfdb9872d,f214f39f-09bf-57c8-89df-013b7942fd77,prices_batch_003.xlsx,media/ingestion/prices_batch_003.xlsx,4e3049fc99ef13f4255540cea3b19387fe41adaf7f09af00c294f0709efd952c,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+9f67c537-2f24-58cb-86ba-7c7b847450a7,b2e8afe7-a2ad-59ab-b0ea-e4cd766aa7b5,prices_batch_004.csv,media/ingestion/prices_batch_004.csv,c841d4dcfff3b92d29fa63fb8a870678178383a44abf297694e6affb7ec99eb7,text/csv
+58409058-1e4e-57a5-bbff-bf94b1d970b9,3cb49512-7fc9-590d-b33b-c6719c5e479f,prices_batch_005.json,media/ingestion/prices_batch_005.json,5e038471de4057df729fc275d6bf2354558eac3bffd975c8609ea1689817e67c,application/json
+85711ccd-09de-54a5-9158-a1441ccf8f07,2e02513f-8911-58a6-b4c5-1ae0d7d0db77,prices_batch_006.xlsx,media/ingestion/prices_batch_006.xlsx,8ba404a3bb41c2a8343118cf69ae41703175529dfdfca3e68aef64bb770a3a86,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet

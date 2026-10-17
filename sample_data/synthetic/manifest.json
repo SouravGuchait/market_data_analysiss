@@ -1,0 +1,66 @@
+{
+  "generator": "scripts/generate_dummy_market_data.py",
+  "seed": 20261016,
+  "end_date": "2024-03-14",
+  "trading_days": 30,
+  "instruments": 12,
+  "price_batches": 6,
+  "price_records": 360,
+  "price_decimals": 4,
+  "formats": [
+    "csv",
+    "json",
+    "xlsx"
+  ],
+  "tables": {
+    "exchanges": {
+      "csv": 272,
+      "json": 503,
+      "xlsx": 5063
+    },
+    "instruments": {
+      "csv": 599,
+      "json": 1675,
+      "xlsx": 5411
+    },
+    "trading_calendar": {
+      "csv": 410,
+      "json": 1445,
+      "xlsx": 5211
+    },
+    "ingestion_jobs": {
+      "csv": 1011,
+      "json": 2079,
+      "xlsx": 5474
+    },
+    "ingestion_files": {
+      "csv": 1449,
+      "json": 2033,
+      "xlsx": 5723
+    },
+    "analytic_snapshots": {
+      "csv": 4309,
+      "json": 8348,
+      "xlsx": 6619
+    },
+    "audit_events": {
+      "csv": 1221,
+      "json": 1887,
+      "xlsx": 5424
+    }
+  },
+  "rule_codes": [
+    "missing_symbol",
+    "missing_required_field",
+    "non_positive_price",
+    "high_below_low",
+    "open_outside_range",
+    "close_outside_range",
+    "negative_volume",
+    "invalid_date",
+    "future_date",
+    "duplicate_record",
+    "unknown_instrument"
+  ],
+  "note": "All values are synthetic and unsuitable for any real decision."
+}

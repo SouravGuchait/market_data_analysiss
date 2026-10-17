@@ -1,0 +1,14 @@
+[
+  {"symbol": "APE001", "name": "Apex Analytics 1", "asset_type": "equity", "exchange_code": "NASDAQ", "currency": "USD", "is_active": false},
+  {"symbol": "COB003", "name": "Cobalt Health 3", "asset_type": "equity", "exchange_code": "LSE", "currency": "GBP", "is_active": true},
+  {"symbol": "EVE005", "name": "Evergreen Systems 5", "asset_type": "crypto", "exchange_code": "CRYPTO", "currency": "USD", "is_active": true},
+  {"symbol": "TSLA", "name": "Tesla Inc.", "asset_type": "equity", "exchange_code": "NASDAQ", "currency": "USD", "is_active": true},
+  {"symbol": "AAPL", "name": "Apple Inc.", "asset_type": "equity", "exchange_code": "NASDAQ", "currency": "USD", "is_active": true},
+  {"symbol": "MSFT", "name": "Microsoft Corporation", "asset_type": "equity", "exchange_code": "NASDAQ", "currency": "USD", "is_active": true},
+  {"symbol": "GOOG", "name": "Alphabet Inc.", "asset_type": "equity", "exchange_code": "NASDAQ", "currency": "USD", "is_active": true},
+  {"symbol": "AMZN", "name": "Amazon.com Inc.", "asset_type": "equity", "exchange_code": "NASDAQ", "currency": "USD", "is_active": true},
+  {"symbol": "NVDA", "name": "NVIDIA Corporation", "asset_type": "equity", "exchange_code": "NASDAQ", "currency": "USD", "is_active": true},
+  {"symbol": "DEL004", "name": "Delta Markets 4", "asset_type": "index", "exchange_code": "NSE", "currency": "INR", "is_active": true},
+  {"symbol": "BEA002", "name": "Beacon Energy 2", "asset_type": "etf", "exchange_code": "NYSE", "currency": "USD", "is_active": true},
+  {"symbol": "SPY", "name": "SPDR S&P 500 ETF Trust", "asset_type": "etf", "exchange_code": "NYSE", "currency": "USD", "is_active": true}
+]

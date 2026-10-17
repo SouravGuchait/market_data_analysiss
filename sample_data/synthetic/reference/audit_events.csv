@@ -1,0 +1,7 @@
+user_email,action,object_type,object_id,request_id,ip_address,metadata,created_at
+analyst@example.test,ingestion_job.succeeded,IngestionJob,b10d2e45-e6a0-5961-a899-3db1a9c2cf27,req-00001,127.0.0.1,"{""rows_accepted"": 60, ""source_type"": ""csv""}",2024-03-14T16:00:01Z
+analyst@example.test,ingestion_job.succeeded,IngestionJob,ea0d32a3-0bbf-5d8a-b239-f28cd1a23761,req-00002,127.0.0.1,"{""rows_accepted"": 60, ""source_type"": ""json""}",2024-03-14T16:00:02Z
+analyst@example.test,ingestion_job.succeeded,IngestionJob,f214f39f-09bf-57c8-89df-013b7942fd77,req-00003,127.0.0.1,"{""rows_accepted"": 60, ""source_type"": ""xlsx""}",2024-03-14T16:00:03Z
+analyst@example.test,ingestion_job.succeeded,IngestionJob,b2e8afe7-a2ad-59ab-b0ea-e4cd766aa7b5,req-00004,127.0.0.1,"{""rows_accepted"": 60, ""source_type"": ""csv""}",2024-03-14T16:00:04Z
+analyst@example.test,ingestion_job.succeeded,IngestionJob,3cb49512-7fc9-590d-b33b-c6719c5e479f,req-00005,127.0.0.1,"{""rows_accepted"": 60, ""source_type"": ""json""}",2024-03-14T16:00:05Z
+analyst@example.test,ingestion_job.succeeded,IngestionJob,2e02513f-8911-58a6-b4c5-1ae0d7d0db77,req-00006,127.0.0.1,"{""rows_accepted"": 60, ""source_type"": ""xlsx""}",2024-03-14T16:00:06Z
