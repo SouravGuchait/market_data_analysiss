@@ -1,0 +1,17 @@
+[
+  {"symbol": "AAPL", "trading_date": "2024-03-12", "open": "100.00", "high": "102.00", "low": "99.00", "close": "101.00", "adjusted_close": "101.00", "volume": "1000", "source": "synthetic_dirty"},
+  {"symbol": "", "trading_date": "2024-03-12", "open": "100.00", "high": "102.00", "low": "99.00", "close": "101.00", "adjusted_close": "101.00", "volume": "1000", "source": "synthetic_dirty"},
+  {"symbol": "MSFT", "trading_date": "2024-03-12", "open": "", "high": "102.00", "low": "99.00", "close": "101.00", "adjusted_close": "101.00", "volume": "1000", "source": "synthetic_dirty"},
+  {"symbol": "MSFT", "trading_date": "2024-03-13", "open": "100.00", "high": "102.00", "low": "", "close": "101.00", "adjusted_close": "101.00", "volume": "1000", "source": "synthetic_dirty"},
+  {"symbol": "SPY", "trading_date": "2024-03-12", "open": "0.00", "high": "102.00", "low": "99.00", "close": "101.00", "adjusted_close": "101.00", "volume": "1000", "source": "synthetic_dirty"},
+  {"symbol": "SPY", "trading_date": "2024-03-13", "open": "100.00", "high": "102.00", "low": "99.00", "close": "-5.00", "adjusted_close": "101.00", "volume": "1000", "source": "synthetic_dirty"},
+  {"symbol": "GOOG", "trading_date": "2024-03-12", "open": "100.00", "high": "98.00", "low": "99.00", "close": "101.00", "adjusted_close": "101.00", "volume": "1000", "source": "synthetic_dirty"},
+  {"symbol": "AMZN", "trading_date": "2024-03-12", "open": "105.00", "high": "102.00", "low": "99.00", "close": "101.00", "adjusted_close": "101.00", "volume": "1000", "source": "synthetic_dirty"},
+  {"symbol": "AMZN", "trading_date": "2024-03-13", "open": "100.00", "high": "102.00", "low": "99.00", "close": "105.00", "adjusted_close": "101.00", "volume": "1000", "source": "synthetic_dirty"},
+  {"symbol": "TSLA", "trading_date": "2024-03-12", "open": "100.00", "high": "102.00", "low": "99.00", "close": "101.00", "adjusted_close": "101.00", "volume": "-100", "source": "synthetic_dirty"},
+  {"symbol": "NVDA", "trading_date": "2024-13-45", "open": "100.00", "high": "102.00", "low": "99.00", "close": "101.00", "adjusted_close": "101.00", "volume": "1000", "source": "synthetic_dirty"},
+  {"symbol": "NVDA", "trading_date": "2099-01-01", "open": "100.00", "high": "102.00", "low": "99.00", "close": "101.00", "adjusted_close": "101.00", "volume": "1000", "source": "synthetic_dirty"},
+  {"symbol": "AAPL", "trading_date": "2024-03-12", "open": "100.00", "high": "102.00", "low": "99.00", "close": "101.00", "adjusted_close": "101.00", "volume": "1000", "source": "synthetic_dirty"},
+  {"symbol": "ZZZZ", "trading_date": "2024-03-12", "open": "100.00", "high": "102.00", "low": "99.00", "close": "101.00", "adjusted_close": "101.00", "volume": "1000", "source": "synthetic_dirty"},
+  {"symbol": "MSFT", "trading_date": "2024-03-14", "open": "100.00", "high": "102.00", "low": "99.00", "close": "101.00", "adjusted_close": "101.00", "volume": "1000", "source": "synthetic_dirty"}
+]

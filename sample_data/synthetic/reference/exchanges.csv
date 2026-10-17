@@ -1,0 +1,7 @@
+code,name,timezone
+NASDAQ,Nasdaq Stock Market,America/New_York
+NYSE,New York Stock Exchange,America/New_York
+LSE,London Stock Exchange,Europe/London
+NSE,National Stock Exchange of India,Asia/Kolkata
+CRYPTO,Synthetic Crypto Network,UTC
+FX,Synthetic Interbank FX,UTC

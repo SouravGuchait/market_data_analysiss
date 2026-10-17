@@ -109,15 +109,19 @@ except `register`, `login`, and `token/refresh`. Each app owns its URL namespace
 | 3 | `GET` | `/api/v1/instruments/exchanges/` | authenticated | list exchanges (unpaginated) |
 | 4 | `GET` | `/api/v1/market-data/instruments/<id>/prices/` | authenticated | price history, optional date range |
 | 5 | `POST` | `/api/v1/ingestion/` | authenticated | create an ingestion job |
-| 6 | `GET` | `/api/v1/ingestion/` | authenticated | list **your own** jobs |
-| 7 | `GET` | `/api/v1/ingestion/<uuid>/` | authenticated, **owner** | job status |
-| 8 | `GET` | `/api/v1/ingestion/<uuid>/validation-errors/` | authenticated, **owner** | rejected rows for a job |
-| 9 | `GET` | `/api/v1/analytics/instruments/<id>/metrics/` | authenticated | metric snapshots for an instrument |
-| 10 | `GET` | `/api/v1/auth/usage/` | authenticated | activity statistics |
+| 6 | `POST` | `/api/v1/ingestion/upload/` | authenticated | upload a file and run the load synchronously |
+| 7 | `GET` | `/api/v1/ingestion/` | authenticated | list **your own** jobs |
+| 8 | `GET` | `/api/v1/ingestion/<uuid>/` | authenticated, **owner** | job status |
+| 9 | `GET` | `/api/v1/ingestion/<uuid>/report/` | authenticated, **owner** | data-quality report for a job |
+| 10 | `GET` | `/api/v1/ingestion/<uuid>/rule-summaries/` | authenticated, **owner** | rule-level PASS/FAIL for a job |
+| 11 | `GET` | `/api/v1/ingestion/<uuid>/validation-errors/` | authenticated, **owner** | rejected rows for a job |
+| 12 | `GET` | `/api/v1/analytics/instruments/<id>/metrics/` | authenticated | metric snapshots for an instrument |
+| 13 | `GET` | `/api/v1/auth/usage/` | authenticated | activity statistics |
 
 Instruments, prices, and analytics are **read-only** through the API — those
-rows are written by the ingestion pipeline, never by a client. The only write
-is creating an ingestion job.
+rows are written by the ingestion pipeline, never by a client. The two writes are
+creating a job and uploading a file: `POST /ingestion/upload/` records the job
+*and* loads the rows behind it in one request.
 
 ### Query parameters
 
@@ -164,7 +168,7 @@ range (`start_date` after `end_date`) is a `400`.
 | Parameter | Match | Accepted values | Example |
 |---|---|---|---|
 | `status` | exact | `pending`, `running`, `succeeded`, `failed`, `partial` | `?status=running` |
-| `source_type` | exact | `csv`, `json`, `api`, `manual` | `?source_type=csv` |
+| `source_type` | exact | `csv`, `json`, `xlsx`, `api`, `manual` | `?source_type=csv` |
 | `ordering` | sort | `requested_at`, `status`, `rows_received`; prefix `-` to reverse | `?ordering=-requested_at` |
 | `page`, `page_size` | pagination | `page_size` ≤ 100 | `?page_size=10` |
 
@@ -179,6 +183,14 @@ Default order is `requested_at` descending — newest first.
 | `page`, `page_size` | pagination | `page_size` ≤ 100 | `?page_size=100` |
 
 Default order is `row_number` ascending, so rejections read in file order.
+
+**`GET /api/v1/ingestion/<uuid>/rule-summaries/`**
+
+| Parameter | Match | Accepted values | Example |
+|---|---|---|---|
+| `ordering` | sort | `rule_name`, `passed`, `failed`; prefix `-` to reverse | `?ordering=-failed` |
+
+Unpaginated — a job has one row per rule. Default order is `rule_name` ascending.
 
 **`GET /api/v1/analytics/instruments/<id>/metrics/`**
 
@@ -206,15 +218,17 @@ returns `200` — the parameters are simply ignored.
 | `POST /api/v1/auth/logout/` | body: `refresh` |
 | `POST /api/v1/auth/token/refresh/` | body: `refresh` |
 | `POST /api/v1/ingestion/` | body: `source_type` |
+| `POST /api/v1/ingestion/upload/` | multipart body: `file` (required), `source_type`, `sheet_name`, `on_invalid`, `on_existing` |
+| `GET /api/v1/ingestion/<uuid>/report/` | path: `uuid` — the report has no parameters |
 | `GET /api/v1/instruments/<id>/` | path: `id` — instrument primary key |
 | `GET /api/v1/instruments/exchanges/` | none — and deliberately **unpaginated** |
 
 **Pagination on every list.** `PageNumberPagination`, `page_size=25` by default,
 `max_page_size=100`, overridable with `?page_size=`. Responses are always
 `{"count", "next", "previous", "results"}` — `next` and `previous` are URLs or
-`null`. The one exception is `/instruments/exchanges/`, which sets
-`pagination_class = None` because the table holds a few hundred rows and a page
-wrapper would add noise.
+`null`. The exceptions are `/instruments/exchanges/` and
+`/ingestion/<uuid>/rule-summaries/`, which set `pagination_class = None` because
+a small, fixed set of rows reads better without a page wrapper.
 
 ### Verified filter behaviour
 
@@ -322,10 +336,73 @@ Every row below was checked against a running server with four instruments
 }
 ```
 
-`source_type` is one of `csv`, `json`, `api`, `manual`. Only that one field is
+`source_type` is one of `csv`, `json`, `xlsx`, `api`, `manual`. Only that one field is
 writable — `status`, timestamps, and row counts are absent from the input
 serializer entirely, so sending them is ignored rather than trusted. An unknown
 value is a `400` with `{"source_type": ["\"x\" is not a valid choice."]}`.
+
+**Upload and run a load** — `POST /api/v1/ingestion/upload/` with
+`multipart/form-data` and a `file` part
+
+```json
+{
+  "job": {
+    "id": "2043cca3-ec4f-4817-8fa0-40ad78ac08e7",
+    "source_type": "csv",
+    "status": "succeeded",
+    "rows_received": 360,
+    "rows_accepted": 360,
+    "rows_rejected": 0,
+    "created_by_email": "analyst@example.com"
+  },
+  "report": {
+    "job_id": "2043cca3-ec4f-4817-8fa0-40ad78ac08e7",
+    "status": "succeeded",
+    "rows_received": 360,
+    "rows_accepted": 360,
+    "rows_rejected": 0,
+    "rules": [
+      { "rule": "non_positive_price", "passed": 360, "failed": 0, "status": "pass" }
+    ],
+    "sample_failures": []
+  }
+}
+```
+
+The file is checked before the job exists: an unsupported extension or an
+oversize upload is a `400` naming the `file` field, and no job is created.
+`source_type` may be omitted — it is inferred from the extension.
+
+**Data-quality report** — `GET /api/v1/ingestion/<uuid>/report/`
+
+```json
+{
+  "job_id": "2043cca3-ec4f-4817-8fa0-40ad78ac08e7",
+  "status": "partial",
+  "rows_received": 15,
+  "rows_accepted": 2,
+  "rows_rejected": 13,
+  "error_summary": "received=15; accepted=2; rejected=13; failures: non_positive_price=2, high_below_low=1",
+  "rules": [
+    { "rule": "non_positive_price", "passed": 13, "failed": 2, "status": "fail" },
+    { "rule": "high_below_low", "passed": 14, "failed": 1, "status": "fail" }
+  ],
+  "sample_failures": [
+    { "row_number": 5, "rule": "non_positive_price", "field": "open", "detail": "open=0.00 must be greater than zero" }
+  ]
+}
+```
+
+**Rule verdicts** — `GET /api/v1/ingestion/<uuid>/rule-summaries/?ordering=-failed`
+(unpaginated)
+
+```json
+[
+  { "rule_name": "non_positive_price", "passed": 13, "failed": 2, "status": "fail" },
+  { "rule_name": "high_below_low", "passed": 14, "failed": 1, "status": "fail" },
+  { "rule_name": "missing_symbol", "passed": 15, "failed": 0, "status": "pass" }
+]
+```
 
 **List your own jobs** — `GET /api/v1/ingestion/?status=running&source_type=csv`
 
@@ -444,9 +521,25 @@ Every list joins its foreign keys through `select_related` in the service layer,
 so query counts stay constant rather than growing with page size — asserted in
 tests via `assertNumQueries` (3 for instruments, 4 for prices, 2 for job detail).
 
+## Ingestion ETL
+
+Price batches are loaded synchronously by `apps.ingestion.etl` — one pipeline for
+CSV, JSON, XLSX, and API sources, with per-rule PASS/FAIL reporting and a job row
+for every run. Drive it three ways: upload a file to
+`POST /api/v1/ingestion/upload/`, call `apps.ingestion.services`, or use the shell:
+
+```powershell
+python manage.py ingest_prices --file path\to\prices.csv --email analyst@example.test
+```
+
+Row rejection, duplicate handling, and the transaction boundary are decided by an
+explicit `IngestionPolicy` (`on_invalid`, `on_existing`), which the upload endpoint
+exposes as form fields. See [docs/ingestion_etl.md](docs/ingestion_etl.md) for the
+module contracts, the rules, and the sample-dataset results.
+
 ## Database schema
 
-Seven models across six apps. The shape is a star schema: `Instrument` is the
+The shape is a star schema: `Instrument` is the
 dimension, `PriceRecord` is the fact table, and everything else hangs off a job
 or a user.
 
@@ -456,7 +549,8 @@ Exchange 1 ────< Instrument 1 ────< PriceRecord          (refere
                                    │ SET_NULL (history outlives the job)
 IngestionJob 1 ────┬──< PriceRecord
                    ├──< IngestionFile
-                   └──< IngestionValidationError
+                   ├──< IngestionValidationError
+                   └──< IngestionRuleSummary
 User 1 ────────────< IngestionJob       (PROTECT, never CASCADE)
 User 1 ────────────< AuditEvent         (SET_NULL, the record outlives the user)
 Instrument 1 ──────< AnalyticSnapshot   (CASCADE, a snapshot is worthless without it)
@@ -471,6 +565,7 @@ Instrument 1 ──────< AnalyticSnapshot   (CASCADE, a snapshot is wort
 | `IngestionJob` | `UUID` | non-negative row counts |
 | `IngestionFile` | `UUID` | unique `(job, checksum)` — the same bytes twice is a duplicate |
 | `IngestionValidationError` | `BigAutoField` | `error_code` indexed |
+| `IngestionRuleSummary` | `BigAutoField` | unique `(job, rule_name)` — one PASS/FAIL row per rule |
 | `AnalyticSnapshot` | `BigAutoField` | unique `(instrument, as_of_date, metric_type, lookback_days)` |
 | `AuditEvent` | `BigAutoField` | `request_id` indexed |
 
@@ -523,7 +618,7 @@ market_data_analysiss/
 │   ├── analytics/            # AnalyticSnapshot
 │   ├── audit/                # AuditEvent
 │   ├── common/               # Shared permissions and the error envelope
-│   ├── ingestion/            # IngestionJob, IngestionFile, IngestionValidationError
+│   ├── ingestion/            # IngestionJob, IngestionFile, IngestionValidationError, IngestionRuleSummary
 │   ├── instruments/          # Exchange, Instrument
 │   └── marketdata/           # PriceRecord, TradingCalendar
 ├── scripts/                  # Local utility scripts, including sample-data generation
@@ -544,8 +639,9 @@ market_data_analysiss/
   `{"error": {...}}` response envelope used by every endpoint.
 - `apps/instruments/`: `Exchange` and `Instrument`, the reference-data dimension table.
 - `apps/marketdata/`: `PriceRecord` (the fact table) and `TradingCalendar`.
-- `apps/ingestion/`: `IngestionJob` with its `IngestionFile` and
-  `IngestionValidationError` children.
+- `apps/ingestion/`: `IngestionJob` with its `IngestionFile`,
+  `IngestionValidationError` (one per rejected row), and `IngestionRuleSummary`
+  (one PASS/FAIL per rule) children.
 - `apps/analytics/`: `AnalyticSnapshot`, one metric per instrument, date, and lookback.
 - `apps/audit/`: `AuditEvent`, append-only records of privileged actions.
 - `templates/`, `static/`, and `media/`: project templates, static assets, and local uploaded media.

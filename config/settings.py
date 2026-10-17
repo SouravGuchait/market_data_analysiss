@@ -1,26 +1,10 @@
 """Django settings for the Market Data Intelligence API."""
 
-import logging
+import sys
 from datetime import timedelta
 from pathlib import Path
-import sys
 
 import environ
-
-
-class SuppressProbeNotFound(logging.Filter):
-    """Silences 404 warnings from health-check probes hitting absent paths.
-
-    An uptime monitor polls paths like ``/health`` on a timer. The 404 is the
-    correct response, but a WARNING every 30 seconds buries genuine request
-    errors in the console. Only "Not Found" is suppressed; 500s, 403s and
-    SuspiciousOperation warnings still surface.
-    """
-
-    def filter(self, record):
-        message = record.getMessage()
-        return "Not Found:" not in message and "Resource Not Found" not in message
-
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -179,11 +163,12 @@ LOGGING = {
         },
     },
     "filters": {
-        # External uptime monitors poll paths like /health on a timer. The 404 is
-        # the correct response, but a WARNING every 30 seconds buries real
-        # request errors. Only "Not Found" is dropped — 500s, 403s and
-        # SuspiciousOperation warnings still surface.
-        "suppress_probe_not_found": {"()": SuppressProbeNotFound},
+        # Referenced by the console handler below; defined here as a dotted
+        # factory so dictConfig can build it. Without this section Django fails
+        # to configure logging at all, which breaks every management command.
+        "suppress_probe_not_found": {
+            "()": "config.log_filters.SuppressProbeNotFound",
+        },
     },
     "handlers": {
         "console": {

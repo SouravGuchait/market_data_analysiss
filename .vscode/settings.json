@@ -1,7 +1,8 @@
 {
-    "python.testing.pytestArgs": [
-        "apps"
-    ],
-    "python.testing.unittestEnabled": false,
-    "python.testing.pytestEnabled": true
+  // Pin the Test Explorer to this project's virtualenv and to pytest, so the
+  // IDE panel matches what `./venv/Scripts/python.exe -m pytest` does.
+  "python.defaultInterpreterPath": "${workspaceFolder}/venv/Scripts/python.exe",
+  "python.testing.pytestEnabled": true,
+  "python.testing.unittestEnabled": false,
+  "python.testing.autoTestDiscoverOnSaveEnabled": true
 }

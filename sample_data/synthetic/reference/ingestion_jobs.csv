@@ -1,0 +1,7 @@
+job_id,created_by_email,source_type,status,requested_at,started_at,completed_at,rows_received,rows_accepted,rows_rejected,error_summary
+b10d2e45-e6a0-5961-a899-3db1a9c2cf27,analyst@example.test,csv,succeeded,2024-02-02T09:30:01Z,2024-02-02T09:30:02Z,2024-03-14T16:00:01Z,60,60,0,
+ea0d32a3-0bbf-5d8a-b239-f28cd1a23761,analyst@example.test,json,succeeded,2024-02-02T09:30:02Z,2024-02-02T09:30:03Z,2024-03-14T16:00:02Z,60,60,0,
+f214f39f-09bf-57c8-89df-013b7942fd77,analyst@example.test,xlsx,succeeded,2024-02-02T09:30:03Z,2024-02-02T09:30:04Z,2024-03-14T16:00:03Z,60,60,0,
+b2e8afe7-a2ad-59ab-b0ea-e4cd766aa7b5,analyst@example.test,csv,succeeded,2024-02-02T09:30:04Z,2024-02-02T09:30:05Z,2024-03-14T16:00:04Z,60,60,0,
+3cb49512-7fc9-590d-b33b-c6719c5e479f,analyst@example.test,json,succeeded,2024-02-02T09:30:05Z,2024-02-02T09:30:06Z,2024-03-14T16:00:05Z,60,60,0,
+2e02513f-8911-58a6-b4c5-1ae0d7d0db77,analyst@example.test,xlsx,succeeded,2024-02-02T09:30:06Z,2024-02-02T09:30:07Z,2024-03-14T16:00:06Z,60,60,0,
