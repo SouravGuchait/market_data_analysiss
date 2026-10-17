@@ -20,13 +20,13 @@ its edge-case policy, and its trade-offs written down before the next one starts
 |---|---|---|
 | 1 | Daily simple returns | implemented |
 | 2 | Cumulative returns | implemented |
-| 3 | Moving averages (7/30/90) | implemented |
+| 3 | Moving averages (7/30/90) | implemented — three named series, one read |
 | 4 | Rolling volatility | implemented |
 | 5 | Maximum drawdown | implemented |
 | 6 | Highest and lowest prices | implemented |
 | 7 | Trading-volume summaries | implemented |
-| 8 | Percentage change over a selected period | next |
-| 9 | Rankings by return and trading volume | planned |
+| 8 | Percentage change over a selected period | implemented |
+| 9 | Rankings by return and trading volume | next |
 
 ## Where the code is
 
@@ -122,6 +122,7 @@ and leaving the off-by-one to be discovered:
 | Maximum drawdown | — (running maximum from the range start) | 1 close | — |
 | Price extremes | — (running extremes from the range start) | 1 close | — |
 | Volume summaries | — (running total from the range start) | 1 volume | — |
+| Period change | — (two chosen observations) | 2 closes | — |
 
 Both columns are right. "20-day volatility" really is the standard deviation of
 twenty daily returns, and "20-day average" really is the mean of twenty closes;
@@ -131,10 +132,11 @@ they differ by one observation, and every response carries `sample_size` (or the
 All windows are **trailing and right-aligned** — a value dated `t` uses no price
 after `t` — and all of them count **observations**, not calendar days, so a
 holiday does not shorten a window and a gap does not become one of its members.
-`pad` is `window - 1` for a moving average, `window` for a volatility (which
-needs one more close than return), and `1` for a daily return. It is `0` for
-cumulative returns, maximum drawdown, price extremes and volume summaries — the
-four metrics whose anchor is inside the range: see their sections.
+`pad` is `window - 1` for a moving average (for the named series, the longest
+window asked for), `window` for a volatility (which needs one more close than
+return), and `1` for a daily return. It is `0` for cumulative returns, maximum
+drawdown, price extremes, volume summaries and period change — the five metrics
+whose anchor is inside the range, or narrower than it: see their sections.
 
 ### Backends
 
@@ -144,14 +146,15 @@ the same points, asserted row for row:
 | Metric | `sql` | `python` | `pandas` |
 |---|---|---|---|
 | Daily returns | `LAG(close)` | list shift | `Series.shift(1)` |
-| Moving average | `AVG(close) OVER (...)` | running sum | `Series.rolling` |
+| Moving averages (7/30/90) | three `AVG(close) OVER (...)` frames in one query | three running sums | three `Series.rolling` |
 | Rolling volatility | returns from `LAG`, deviation in Python | returns from a shift, deviation in Python | `Series.rolling().std()` |
 | Cumulative returns | — | direct ratio | direct ratio, vectorised |
 | Maximum drawdown | running maximum from `MAX(close) OVER (...)`, ratio in Python | running maximum scan | `Series.cummax()` |
 | Price extremes | running maximum and minimum from `MAX(close)`/`MIN(close) OVER (...)` | running scan in both directions | `Series.cummax()`/`cummin()` |
 | Volume summaries | running total from `SUM(volume) OVER (...)`, ratio in Python | running sum | `Series.cumsum()` (`int64`) |
+| Period change | — | linear scan for the two bounds | `Index.searchsorted` |
 
-Two of the seven have no `sql` member, and both for the same reason: **a metric
+Three of the eight have no `sql` member. Two of them share a reason: **a metric
 whose window must be computed from *windowed values* cannot be expressed in one
 SQL query**, because a window function may not appear inside another window
 function's arguments. Cumulative returns need a *product* (no dialect has a
@@ -161,6 +164,17 @@ which are themselves `LAG`s. MySQL states the second one outright:
 ```
 OperationalError: (3593, "You cannot use the window function 'lag' in this context.'")
 ```
+
+Period change has no `sql` member for a third and different reason: it has no window
+at all. Its "window" is the *choice of two rows* — the first observation at or after
+the period's start, the last at or before its end — and the engine's read boundary
+returns a series, not a pair. The SQL form would be two `ORDER BY ... LIMIT 1`
+subqueries, a different query shape rather than a frame over the rows the loader
+already has, so it is left out rather than smuggled in as a second read path for a
+subtraction. The verification script *runs* that query to show the two agree, and
+`EXPLAIN` shows it is two index lookups; reading the period's rows instead costs one
+indexed range scan and buys `observations` — how many sessions the period held —
+which the two-endpoint query could not report.
 
 Maximum drawdown, price extremes and volume summaries are the test of that rule
 rather than an exception to it: each of their windows is over a column the row
@@ -173,11 +187,10 @@ derived table to get a database-computed cross-check:
 OperationalError: (3593, "You cannot use the window function 'max' in this context.'")
 ```
 
-So the engine does not offer a SQL member it cannot honestly implement. The two
-without one are computed in Python over rows a single query already returned —
-which is why the choice costs nothing in queries, only in where the arithmetic
-runs. The engine's canonical path stays inside the database wherever a window is a
-real window.
+So the engine does not offer a SQL member it cannot honestly implement. The three
+without one are computed in Python over rows a single query already returned — which
+is why the choice costs nothing in queries, only in where the arithmetic runs. The
+engine's canonical path stays inside the database wherever a window is a real window.
 
 ### On demand or stored
 
@@ -199,6 +212,7 @@ the analytics API is read-only (`ListAPIView`).
 | **Zero mean volume** (nothing has traded yet in the range) | `relative_volume` is `None` while the running total is `0`; the running total and the session volume are still exact and still reported. | `volume / 0` is not a ratio. Same rule as a zero previous close: report no value rather than `0` (typical of nothing?) or `inf`. |
 | **Duplicate dates** | Rejected. `PriceSeries.assert_one_row_per_date()` raises rather than deduplicating. In the table it cannot happen: `uniq_price_instrument_trading_date` is unique, and re-ingestion upserts on it (the corrected price replaces the old row). | Deduplication would have to choose which of two contradictory closes for one day is real. Either choice fabricates a price; fixing the source is the only correct response. |
 | **Insufficient history** | `None`, never a partial window. Nine observations cannot produce a ten-day measure. | A "7-day average" of three days is a different statistic wearing the same name. A short series returns `None` for the early rows and a value as soon as the window is full. |
+| **A period with no observation in it** | `None` throughout — no base, no end, `observations` of `0` — and the result counts it as undefined. Not an error. | The selected bounds are calendar dates and may fall between two sessions, or before the first one, or after the last. There is no pair of prices to divide, so there is no change; the same rule as a date range with no rows. |
 | **No history at all** | An empty series, one query, no error. | A newly listed instrument is a normal state, not a failure. |
 | **Series shorter than the requested lookback** | The loader still looks back as far as there is anything to look at, so no requested row is ever dropped. | See `_warm_up_boundary`. The alternative — comparing a date against the NULL that a shorter history produces — silently returns an empty response. |
 
@@ -484,6 +498,32 @@ The engine reports the level. It does not cross a price over an average, score t
 crossing, or call it a signal; a crossing is a fact about two numbers, and what to
 do about it is a reader's judgement, not this engine's.
 
+### Three named series, not a window parameter
+
+7, 30 and 90 are a **closed vocabulary**, not a knob:
+
+```python
+MOVING_AVERAGE_SERIES = (
+    MovingAverageSeries(name="moving_average_7", window=7),
+    MovingAverageSeries(name="moving_average_30", window=30),
+    MovingAverageSeries(name="moving_average_90", window=90),
+)
+```
+
+A caller asks for a name — `names=("moving_average_30",)`, or all three by default —
+and the name determines the window, the loader's column, and, if any of them is ever
+snapshotted, the `lookback_days`. There is deliberately **no `window` argument** on
+the service. A free integer would let a caller compare a 7 against a 23 and call the
+two the same statistic; three names make the comparison meaningful, and an unknown
+name is a `ValueError` that lists the vocabulary rather than quietly handing back
+fewer series than were asked for. The output order is conventional as well: asking
+for 90 then 7 returns 7 then 90, so the same request in a different order is the same
+payload, and a name asked for twice is computed once.
+
+The arithmetic is one function for all of them. `moving_average(dates, closes,
+window)` keeps its `window` because it is the *primitive* — the pure calculation the
+unit tests hand-check — and the named series are a vocabulary layered over it.
+
 ### Formula and window semantics
 
 ```
@@ -508,7 +548,7 @@ so each is pinned by a test:
 
 ### Intermediate calculations
 
-Closes 10, 12, 11, 13, 15, window 3:
+The primitive, on closes 10, 12, 11, 13, 15 with window 3:
 
 | Trading day | Close | Window | Calculation | Mean |
 |---|---|---|---|---|
@@ -520,6 +560,19 @@ Closes 10, 12, 11, 13, 15, window 3:
 
 A mean that needs more than eight places, closes 1, 2, 2 with window 3:
 `5 / 3 = 1.66666…` → `1.66666667` (half up).
+
+The named 7-session series, on twelve sessions with closes 10 … 21:
+
+| Trading day | Close | 7-observation window | Calculation | Mean |
+|---|---|---|---|---|
+| 2024-03-16 | 15 | 10, 11, 12, 13, 14, 15 | not full (6 of 7) | `null` |
+| 2024-03-17 | 16 | 10, 11, 12, 13, 14, 15, 16 | `91 / 7` | `13.00000000` |
+| 2024-03-19 | 18 | 12, 13, 14, 15, 16, 17, 18 | `105 / 7` | `15.00000000` |
+| 2024-03-22 | 21 | 15, 16, 17, 18, 19, 20, 21 | `126 / 7` | `18.00000000` |
+
+The 30- and 90-session series on the same twelve sessions are `null` at every row,
+because twelve observations cannot fill either window — which is the completeness
+rule doing its job rather than a bug.
 
 The sample series, window 3, requested from 2024-03-13 — the table that shows the
 warm-up paying off:
@@ -537,48 +590,83 @@ last mean — which is the contrast a test asserts directly.
 
 One row of warm-up was enough for a return. A 90-observation average needs **89**,
 and the loader's boundary subquery takes the offset as a parameter, so nothing about
-the loader changes: `pad=window-1` and the same single query. On the benchmark
-instrument a `window=30` request resolves the boundary 29 rows back and reads 60
-rows — 29 warm-up plus 31 requested — in one round trip. A test asserts the padding
-is exactly `window - 1` and that the first requested date carries a value.
+the loader changes: `pad=window-1`. The named series make that parameter a *sequence*
+— the loader adds one `AVG(close) OVER (...)` column per window — while still taking
+**one** pad, covering the longest series asked for.
+
+That is a choice with a visible cost, so it is stated rather than hidden. On the
+benchmark instrument a request for all three reads `89 + 31 = 120` rows and computes
+three means from them. Three separate calls would read `6 + 31`, `29 + 31` and
+`89 + 31` rows over three queries. So asking for all three is *cheaper* in rows than
+the three calls it replaces, and it is one query instead of three. The price is paid
+only by a caller who wants the 7-session series alone: it still reads 89 warm-up rows,
+which is why `names` exists as a selection. A test asserts the padding is
+`max(window) - 1` and that a short history bounds it (the `Coalesce` fallback).
 
 ### What the database does with the window
 
-The `sql` backend pushes the whole mean into the query:
+The `sql` backend pushes all three means into the query, as three frame aggregates
+over the same rows:
 
 ```sql
 AVG(close) OVER (PARTITION BY instrument_id ORDER BY trading_date
-                 ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS moving_average
+                 ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)  AS moving_average_7
+AVG(close) OVER (PARTITION BY instrument_id ORDER BY trading_date
+                 ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS moving_average_30
+AVG(close) OVER (PARTITION BY instrument_id ORDER BY trading_date
+                 ROWS BETWEEN 89 PRECEDING AND CURRENT ROW) AS moving_average_90
 ```
 
 and `EXPLAIN FORMAT=TREE` on it, against MySQL, reads:
 
 ```
 -> Sort: marketdata_pricerecord.trading_date
-    -> Table scan on <temporary>  (cost=13.9..17.1 rows=60)
+    -> Table scan on <temporary>  (cost=27.7..31.6 rows=120)
         -> Temporary table
             -> Window aggregate with buffering:
-                 avg(marketdata_pricerecord.close) OVER (
-                   PARTITION BY instrument_id ORDER BY trading_date
-                   ROWS BETWEEN 29 PRECEDING AND CURRENT ROW)
-                -> Filter: (trading_date >= <cache>(coalesce((select #2),(select #3))))
-                    -> Index range scan ... over (instrument_id = 13 AND
-                         '2023-12-22' <= trading_date <= '2024-03-14')
-                    -> Select #2 (subquery in condition; run only once)
-                        -> Limit/Offset: 1/28 row(s)
-                    -> Select #3 (subquery in condition; run only once)
+                 avg(close) OVER (PARTITION BY instrument_id ORDER BY trading_date
+                                  ROWS BETWEEN 89 PRECEDING AND CURRENT ROW)
+                -> Table scan on <temporary>
+                    -> Temporary table
+                        -> Window aggregate with buffering:
+                             avg(close) OVER (... ROWS BETWEEN 29 PRECEDING AND CURRENT ROW)
+                            -> Table scan on <temporary>
+                                -> Temporary table
+                                    -> Window aggregate with buffering:
+                                         avg(close) OVER (... ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)
+                                        -> Sort: instrument_id, trading_date  (cost=54.3 rows=120)
+                                            -> Filter: (trading_date >= <cache>(coalesce((select #2),(select #3))))
+                                                -> Index range scan ... over (instrument_id = 13 AND
+                                                     '2023-09-29' <= trading_date <= '2024-03-14')
+                                                -> Select #2 (subquery in condition; run only once)
+                                                    -> Limit/Offset: 1/88 row(s)
+                                                -> Select #3 (subquery in condition; run only once)
+                                                    -> Limit: 1 row(s)
 ```
 
-Three things in that plan are the design, visible rather than asserted: the frame
-is `29 PRECEDING AND CURRENT ROW`; the boundary subquery is `Limit/Offset: 1/28`,
-i.e. the 29th prior date, computed once (`run only once`) and cached; and the index
-range scan *starts* at the resolved warm-up date (`2023-12-22`), so the padding is
-part of the range rather than a filter applied to a result.
+Four things in that plan are the design, visible rather than asserted:
 
-The honest cost is the first line: MySQL implements the window with a **buffer and a
-temporary table**, because a frame aggregate is not streamable in general. That is
-work the Python rolling sum does not do — it is a single pass over rows that are
-already in memory — which is the trade-off the timing table below records.
+* **all three frames are in the one statement** — the verification script asserts
+  that each window's `ROWS BETWEEN … PRECEDING` appears in the SQL actually sent, so
+  "one query for three series" is checked rather than claimed (measured: 120 rows for
+  `sql`, `padding=89`, `undefined=0`, and the last values
+  `41.38411429` / `40.76325000` / `39.82356889` for 7 / 30 / 90);
+* the frames are `6`, `29` and `89 PRECEDING AND CURRENT ROW` — the windows' own
+  off-by-one, once per named series;
+* the boundary subquery is `Limit/Offset: 1/88`, i.e. the 89th prior date, computed
+  once (`run only once`) and cached, and the index range scan *starts* at the resolved
+  warm-up date (`2023-09-29`), so the padding is part of the range rather than a
+  filter applied to a result;
+* there is exactly **one sort** for all three — the frames are nested over the same
+  ordered rows rather than the rows being sorted three times.
+
+The honest cost is the nesting: MySQL implements each frame with its own **buffered
+window aggregate and temporary table**, and three frames mean three of them, layered.
+That is work the Python rolling sums do not do — they are three passes over rows
+already in memory, with no temporary table — which is the trade-off the timing table
+below records. It is also why the `sql` backend is the default where it exists but is
+not the fastest here: what it offers is that the arithmetic runs where the rows are,
+not that it runs sooner.
 
 ### Trade-offs
 
@@ -604,6 +692,13 @@ denominated in currency and its rounding is money rounding
 (`quantize_price`, eight places) rather than ratio rounding. The two happen to be
 the same width today, which is exactly why they have different names in
 `metrics.py`.
+
+**A name is a contract, and that is the point.** Because the windows are a closed
+set, `moving_average_7` means one thing in a service call, a loader column, a
+snapshot's `lookback_days` and this document. A single free `window` parameter is
+more flexible and less useful: flexibility that lets two reports disagree about what
+"the moving average" is has a cost paid at every comparison, while a fixed set has a
+cost paid once, when a fourth window is wanted.
 
 ## Metric 4 — rolling volatility
 
@@ -1247,22 +1342,149 @@ that now contains the new sessions — no incremental state, no accumulation, an
 (`instrument, as_of_date, metric_type, lookback_days`) would make the rewrite
 idempotent if the job existed. It does not yet; see *Deliberately not done yet*.
 
+## Metric 8 — percentage price change over a selected period
+
+### Business meaning
+
+One number for a period: how much the price moved between two points in time, as a
+percentage of where it started. It is what a report means by "up 4.4% this month", and
+it is the *endpoint* of a shape metric 2 already lays out — cumulative returns are
+this same ratio computed at every session, against the range's first observation.
+
+It is a separate entry point for three reasons, none of which is "the number is
+different":
+
+* **the period need not be the range.** The base can be any date: "the change from the
+  1st to the 15th" is a question about two sessions, not about the whole series
+  requested;
+* **a report wants the number and the percentage**, not a series it has to read the
+  last row of;
+* **a report wants several periods at once** — this week, this month, this quarter —
+  and the engine answers all of them from **one read** of their union.
+
+### Formula
+
+```
+change(t0, t1)  = ( close(t1) - close(t0) ) / close(t0)
+percent_change  = change x 100
+```
+
+with `t0` the first observation at or after the period's start and `t1` the last at or
+before its end. Both are reported back (`base_date`, `base_close`, `end_date`,
+`end_close`), because a requested bound is a calendar date and the session actually
+used may be a different one.
+
+### Intermediate calculations
+
+The sample series, closes 100, 102, 101, 103, 104 on consecutive sessions:
+
+| Selected period | Base | End | `change` | `percent_change` | `observations` |
+|---|---|---|---|---|---|
+| 2024-03-11 … 2024-03-15 | 100 | 104 | `(104 - 100) / 100 = 0.04` | `4.00000000` | 5 |
+| 2024-03-12 … 2024-03-15 | 102 | 104 | `2 / 102 = 0.0196078431…` | `1.96078400` | 4 |
+| 2024-03-13 … 2024-03-15 | 101 | 104 | `3 / 101 = 0.0297029702…` | `2.97029700` | 3 |
+| 2024-03-14 … 2024-03-15 | 103 | 104 | `1 / 103 = 0.0097087378…` | `0.97087400` | 2 |
+| 2024-03-13 … 2024-03-13 | 101 | 101 | `0 / 101 = 0` | `0.00000000` | 1 |
+
+A one-session period is a change of exactly `0`, which is a true statement rather than
+a degenerate case, and it carries `observations` of `1` so it can be told apart from a
+period that held no session at all.
+
+### The percentage is derived from the ratio, not from the prices
+
+`percent_change` is a property: `change x 100`, quantized once. It is **not**
+recomputed from the two closes. That makes the payload internally consistent — a
+reader can check `percent_change == change x 100` exactly, and a test asserts it for
+every period shape — at a stated cost: the percentage carries the ratio's eight places
+scaled up rather than eight places of its own. For a 2% move that is `2.00000000`
+where re-deriving from the prices would give `2.00000001` — a hundredth of a basis
+point, below any market's tick, in exchange for two fields that cannot disagree. A
+reader who wants the extra place has `base_close` and `end_close` to hand.
+
+### Several periods, one read
+
+`percentage_change_for_instrument(instrument, periods=(...))` takes a sequence of
+labelled periods — `SelectedPeriod(label, start_date, end_date)`, where a `None` bound
+means "from the beginning" or "to the end" — and answers each one from **one** read of
+their union. On the benchmark instrument, four periods spanning 2022-04-15 …
+2024-03-14 came back in **1 query** (asserted):
+
+```
+last 5   2024-03-08 -> 2024-03-14  change=0.00755564  percent=0.75556400
+last 21  2024-02-15 -> 2024-03-14  change=0.01466751  percent=1.46675100
+window   2024-02-01 -> 2024-03-14  change=0.04438793  percent=4.43879300
+to date  2022-04-15 -> 2024-03-14  change=0.52575083  percent=52.57508300
+```
+
+Note the union rule: the `to date` period has no start, so the read opens to the first
+row of the series (500 rows here) rather than to the earliest *specified* bound. That
+is the same `None`-means-open convention as the single-period form, and it is what
+makes that period's `change` the full-history number. Passing `start_date`/`end_date`
+**and** `periods` is a `ValueError`: mixing a range with a list of ranges invites a
+caller to have one of them silently ignored.
+
+### Two channels to the same number, and the cross-metric check
+
+Metric 2 lays out the same fact: `cumulative_returns` over a range ends on
+`close(last) / close(first) - 1`, which is this metric's `change` when the period *is*
+the range. A test asserts `period_change.change == cumulative_returns.total` at
+several bases rather than assuming it — the series and the endpoint are one fact seen
+twice, and that is the only thing that makes the second computation worth having.
+
+### What the database does — and what it deliberately does not
+
+This metric has no `sql` member (see [Backends](#backends)): a period change is a
+choice of two rows and a division, and the read boundary returns a series. The SQL form
+that *would* be used is two index lookups, and the verification script runs it to show
+the two agree:
+
+```
+-> Rows fetched before execution
+-> Select #2 (subquery in projection; run only once)
+    -> Limit: 1 row(s)
+        -> Index range scan ... over (instrument_id = 13 AND '2024-02-01' <= trading_date)
+-> Select #3 (subquery in projection; run only once)
+    -> Limit: 1 row(s)
+        -> Index range scan ... over (instrument_id = 13 AND trading_date <= '2024-03-14') (reverse)
+
+two index lookups: 40.06720000 -> 41.84570000 = 0.0443879283, engine 0.04438793
+```
+
+Two seeks, no scan — and the engine still reads the period's rows instead, because
+that buys `observations` (how many sessions the period held) and the same read serves
+many periods. The trade-off is stated in both directions: the two-seek query is
+cheaper for one long period, and it cannot tell you how many sessions were in it.
+
+### Edge cases with a policy, not an accident
+
+| Situation | Behaviour | Why |
+|---|---|---|
+| A bound that is not a session | Snaps inward: the base is the first session at or after it, the end the last at or before it; both are reported | A weekend has no price. The nearest session inside the period is what a report is quoting, and echoing it makes the snap visible. |
+| A period with no session in it | `None` throughout, `observations` of `0`, counted as `undefined` | The base and end can cross when the period is narrower than a gap between sessions; there is then no pair of prices to divide. Same rule as an empty range. |
+| A base of `0` | `change` is `None`; the sessions and both prices are still reported | `x / 0` is not a ratio — the same rule as a zero previous close in metric 1, and for the same reason: the schema permits it. |
+| Start after end | `ValueError` | A caller's mistake, not data. The loader rejects it too, and quietly swapping the bounds would report a sign nobody asked for. |
+| An open bound | `None` means the series' first or last row | "This year to date" has one bound. |
+| An empty selection (`periods=()`) | No periods, and **no query** | Asking for nothing should not read the database. |
+| An instrument with no prices | One period, `None`, counted as `undefined` | Same as every metric: a newly listed instrument is a normal state. |
+
 ## Backend timings, measured
 
 Median of 25 warm calls per cell against MySQL, on the benchmark instrument: 500
 rows of history, 31 observations requested, a 30-observation window where the metric
-takes one. Reproduce with `scripts/verify_analytics.py`; absolute values drift with
-machine load, so read the ordering and the gaps rather than the digits.
+takes one (and all three named averages where the metric takes three). Reproduce with
+`scripts/verify_analytics.py`; absolute values drift with machine load, so read the
+ordering and the gaps rather than the digits.
 
 | Metric | `python` | `sql` | `pandas` |
 |---|---|---|---|
-| Cumulative returns | **0.67 ms** | — | 1.24 ms |
-| Maximum drawdown | **0.66 ms** | 1.18 ms | 0.85 ms |
-| Price extremes | **0.76 ms** | 1.48 ms | 0.90 ms |
-| Volume summaries | **0.72 ms** | 1.31 ms | 0.88 ms |
-| Daily returns | **1.52 ms** | 2.22 ms | 2.22 ms |
-| Moving average, window 30 | **1.52 ms** | 2.19 ms | 2.95 ms |
-| Rolling volatility, window 30 | **3.25 ms** | 3.34 ms | 3.96 ms |
+| Period change (one period) | **0.63 ms** | — | 1.09 ms |
+| Maximum drawdown | **0.68 ms** | 1.44 ms | 0.93 ms |
+| Cumulative returns | **0.72 ms** | — | 1.40 ms |
+| Volume summaries | **0.79 ms** | 1.16 ms | 1.04 ms |
+| Price extremes | **0.81 ms** | 1.73 ms | 0.99 ms |
+| Daily returns | **1.96 ms** | 2.13 ms | 2.20 ms |
+| Moving averages (7/30/90, one read) | **2.29 ms** | 4.32 ms | 4.24 ms |
+| Rolling volatility, window 30 | **3.01 ms** | 3.67 ms | 3.99 ms |
 
 What the table says, honestly:
 
@@ -1275,35 +1497,40 @@ What the table says, honestly:
   instruments, and windows consumed inside the database — and because a metric whose
   canonical form is a SQL window should not have a Python default that quietly
   becomes the only implementation.
-* **The moving average shows the widest gap (1.52 vs 2.19 ms)** because its SQL form
-  is the only one that makes the database build a temporary table: a frame aggregate
-  cannot be streamed. The Python rolling sum is a single pass with no allocation.
-* **Volatility is the one row where the gap closes** (`sql` 3.34 vs `python` 3.25):
-  both compute the deviation in Python, so the SQL backend's extra work is just
+* **The moving averages show the widest gap (2.29 vs 4.32 ms)** because their SQL form
+  is the only one that makes the database build a temporary table *per frame*: a frame
+  aggregate cannot be streamed, and three of them are nested. The Python path is three
+  passes over rows already in memory, with no allocation. Asking for all three in one
+  query is still cheaper than three calls — one sort, 120 rows, one round trip — but
+  the gap against Python is the price of pushing the frames down.
+* **Volatility is the one row where the gap nearly closes** (`sql` 3.67 vs `python`
+  3.01): both compute the deviation in Python, so the SQL backend's extra work is just
   `LAG` instead of a list shift, and the deviation dominates the total. That is the
   clearest statement of what the `sql` backend actually buys here — the *returns*,
   not the statistic.
-* **Cumulative returns is the cheapest metric** (0.67 ms) and has no SQL member: it
-  reads no warm-up row and computes a ratio, so the request is one query returning
-  exactly the requested range.
-* **Maximum drawdown is the cheapest metric with a `sql` member** (1.18 ms against
-  Python's 0.66 ms), and it is the clearest case of what the SQL path costs at this
+* **Period change is the cheapest metric** (0.63 ms) and has no SQL member: it reads
+  no warm-up row, returns one number per period, and several periods share the read.
+  **Cumulative returns is next** (0.72 ms), also without a SQL member: it reads no
+  warm-up row and computes a ratio, so the request is one query returning exactly the
+  requested range.
+* **Maximum drawdown is the cheapest metric with a `sql` member** (1.44 ms against
+  Python's 0.68 ms), and it is the clearest case of what the SQL path costs at this
   size: the whole scan is pushed into the database, a `ROWS BETWEEN UNBOUNDED
   PRECEDING` frame over 31 rows, buffered through a temporary table to return one
   float per row that Python then divides. `pandas` sits between the two because
   `cummax` is genuinely vectorised — this is the one metric where it beats `sql`.
-* **Price extremes is the slowest `sql` row relative to its Python form** (1.48 vs
-  0.76 ms, roughly double) because it asks *two* questions of the same frame: MySQL
+* **Price extremes is the slowest `sql` row relative to its Python form** (1.73 vs
+  0.81 ms, roughly double) because it asks *two* questions of the same frame: MySQL
   materialises the running minimum over the temporary table of the running maximum,
   so the row pays two buffered stages rather than one. The Python scan answers both
   in a single pass. It is one of the two metrics that read columns other than
   `close`, and the only one that reads two of them (`high` and `low`).
-* **Volume summaries is the cheapest `sql` row after the drawdown** (1.31 ms against
-  Python's 0.72 ms) and needs **one** buffered stage rather than the extremes' two,
+* **Volume summaries is the cheapest `sql` row after the drawdown** (1.16 ms against
+  Python's 0.79 ms) and needs **one** buffered stage rather than the extremes' two,
   because it asks one question of the frame — a running sum — rather than two
   extremes. It is the other metric that reads a column other than `close` (`volume`),
   and the window sums that same column rather than adding a read. Its `pandas` cost
-  is close to Python's (0.88 ms) because `cumsum` is a single vectorised pass, with
+  is close to Python's (1.04 ms) because `cumsum` is a single vectorised pass, with
   no second allocation.
 * **`pandas` is the slowest per instrument and that is not its use case.** Its cost
   is Series construction and the vectorised call over 500 rows; the same call over
@@ -1316,15 +1543,15 @@ What the table says, honestly:
 
 | Growth | Effect | Why |
 |---|---|---|
-| More rows per instrument (longer history) | The loader's range scan is bounded by the requested range, not the instrument's life: `pad + observations in range`. A 20-year history costs the same per request as a 1-year one. | The bounds are pushed into `WHERE`, which uses `uniq_price_instrument_trading_date`. Warm-up padding adds `pad` rows — 1 for a daily return, `window - 1` for a moving average, `window` for a volatility, and 0 for cumulative returns, maximum drawdown, price extremes and volume summaries, whose anchors are inside the range — a constant per request, independent of how much history exists. |
+| More rows per instrument (longer history) | The loader's range scan is bounded by the requested range, not the instrument's life: `pad + observations in range`. A 20-year history costs the same per request as a 1-year one. | The bounds are pushed into `WHERE`, which uses `uniq_price_instrument_trading_date`. Warm-up padding adds `pad` rows — 1 for a daily return, the longest window minus 1 for the named moving averages, `window` for a volatility, and 0 for cumulative returns, maximum drawdown, price extremes, volume summaries and period change, whose anchors are inside the range — a constant per request, independent of how much history exists. |
 | More instruments | Per-request cost is unchanged: one instrument, one query. Ranking across instruments is the case that changes the answer — it must not become one query per instrument. | Pending: the rankings metric will read the cross-section in one frame and group by instrument, which is what the `pandas` backend is for. |
-| More metrics on the same series | Free if they share the loader call. Each additional metric over the same rows adds arithmetic, not queries. | The loader is the only thing that reads, and it returns every column a metric asked for. |
+| More metrics on the same series | Free if they share the loader call. Each additional metric over the same rows adds arithmetic, not queries. | The loader is the only thing that reads, and it returns every column a metric asked for. The three named moving averages are the case it was built for: one read, three columns, three means. |
 | More concurrent readers | Linear in requests, with no shared mutable state in the engine. | The engine writes nothing. The API's response cache (see [api_optimisation.md](api_optimisation.md)) covers the snapshot reads, not the computed series, which depends on the requested range. |
 | A very long single series read whole | Becomes memory-bound, not query-bound, and is not the shape this engine is designed for: a range is what bounds the work. | If a full-history export is needed, that is an offline job over a DataFrame, not a request. |
 
 ## Tests
 
-`apps/analytics/tests/test_series.py` — the read boundary, 34 tests:
+`apps/analytics/tests/test_series.py` — the read boundary, 35 tests:
 
 * the whole series in exactly one query, in date order (query count pinned);
 * only the requested columns are selected — `source`, `ingestion_job_id`,
@@ -1334,11 +1561,12 @@ What the table says, honestly:
   history still returns every requested row, `pad` without a `start_date` is a
   no-op, and the window does not lag across instruments;
 * the window columns: `previous_close` is the previous session, the moving-average
-  column is the trailing mean, the running-max and running-min columns are the highest
-  and lowest close so far *within the rows returned* (so the date range anchors them),
-  the running-total column is the `volume` traded so far with the same in-range anchor
-  and shares the read with a window, the one-direction and two-direction reads are each
-  a single query, a database
+  columns are named after their windows and each is the trailing mean, the running-max
+  and running-min columns are the highest and lowest close so far *within the rows
+  returned* (so the date range anchors them), the running-total column is the `volume`
+  traded so far with the same in-range anchor and shares the read with a window, the
+  one-direction and two-direction reads are each a single query, **several
+  moving-average windows come back from one query**, a database
   partial-frame mean is passed through as data (the metric applies the completeness
   rule), and a window below 1 is rejected;
 * `PriceSeries` invariants: repeated or out-of-order dates raise, `in_range()`
@@ -1376,8 +1604,12 @@ What the table says, honestly:
   `EXPECTED_RETURN` fixture for all three sample instruments, and `backend="sql"`
   is rejected by name because there is no such backend.
 
-`apps/analytics/tests/test_moving_average.py` — the window, 23 tests:
+`apps/analytics/tests/test_moving_average.py` — the named series and the window, 34
+tests:
 
+* the vocabulary: three names in the conventional order, a selection answered in that
+  order however it was asked for, a repeated name computed once, an empty selection
+  empty, and an unknown name rejected with the list of known ones;
 * the hand-computed series, the `5/3` rounding, a window of 1 (the price itself),
   and a window exactly as long as the series (one value, on the last date);
 * incompleteness: a window longer than the history is `None` for every date with
@@ -1387,13 +1619,17 @@ What the table says, honestly:
   `O(n)` shortcut exact;
 * supplied (database) means are used, obey the same completeness rule, and agree
   with the computed ones when they are the true means;
-* the three backends agree, including when the history is shorter than the window
-  (where a `ROWS BETWEEN` frame would quietly return a partial mean);
-* the service: `padding == window - 1` and the first requested date carries a
-  value; the same dates read without warm-up leave holes; the window counts
-  observations rather than calendar days (prices on DAY1, DAY2 and DAY5 with a
-  window of 3 have a mean on DAY5 across a four-day hole); one query; a window
-  below 1 is rejected.
+* the three backends agree on **every named series**, including when the history is
+  shorter than the window (where a `ROWS BETWEEN` frame would quietly return a partial
+  mean);
+* the service: all three series and one query by default, the 7-session series'
+  hand-computed means on a twelve-session series, the pad being `max(window) - 1` — a
+  request for the 7-session series alone still reads past the 30-session pad, shown by
+  two paddings differing on a twelve-row history — the first requested date carrying a
+  value, the same dates read without warm-up leaving holes, the window counting
+  observations rather than calendar days (seven sessions with a three-day hole), a
+  subset selection, an empty selection that reads nothing, lookup by name, an empty
+  instrument, and name/backend validation.
 
 `apps/analytics/tests/test_rolling_volatility.py` — the deviation, 21 tests:
 
@@ -1488,23 +1724,50 @@ figures, 30 tests:
   total, a zero-volume opening session counted as `undefined`, an empty instrument, and
   backend validation.
 
+`apps/analytics/tests/test_percentage_change.py` — the period, 37 tests:
+
+* the five hand-computed periods in the table above, plus a signed loss, a
+  one-session period as `0`, and an empty series;
+* `percent_change` is asserted **exactly** `change x 100` for every period shape,
+  because it is derived from the reported ratio rather than recomputed from the prices;
+* snapping: a Saturday-to-Tuesday bound settles on Monday and reports both, an end past
+  the last session reports the last one, and a period with no observation in it is
+  `None` throughout with `observations` of `0` — including the case where the base and
+  the end cross because the period is narrower than a gap;
+* a base of `0` has no ratio while its sessions and both prices are still reported;
+* reversed bounds and mismatched lengths are rejected;
+* `pandas` agrees with `python` on a table of cases (labels, open bounds, exact bounds,
+  weekend bounds, an empty period, an empty series) and rejects the same reversed
+  period;
+* the service: the whole range's number, **the cross-metric check** that
+  `change == cumulative_returns.total` at several bases, a period that is not the
+  range, the span's interior not entering the answer, one period as one query, four
+  labelled periods as one query with their labels and values, the union read for
+  several periods, an open bound opening the read, both forms together rejected, an
+  empty selection that reads nothing, an empty instrument counted as `undefined`, an
+  observation count rather than a calendar span on a gapped instrument, and the absent
+  `sql` backend rejected by name.
+
 ## Deliberately not done yet
 
-* Metrics 8–9, each with its own sample, edge-case policy and trade-off note:
-  percentage change over a period, and the cross-sectional rankings.
-* **No HTTP endpoint yet.** The service layer is where a metric is defined, and
-  seven metrics in it is the right moment to fix the shape rather than the moment it
-  was settled: the results now share a `MetricResult` base with a `points` list, a
-  `padding` count, an echoed `window`, a nested summary object where a metric has
-  one, an overridable `undefined` count, and a consistent rendering rule, and that is
-  what the serializer, the filters and the query-parameter contract will be written
-  against. Until then, the metrics are called from Python and tested there.
+* **Metric 9 — the cross-sectional rankings.** The per-instrument read exists and the
+  snapshot grain models the answer; what is missing is a read that ranks many
+  instruments *without* becoming one query per instrument.
+* **No HTTP endpoint yet.** The service layer is where a metric is defined, and eight
+  metrics in it is the right moment to fix the shape rather than the moment it was
+  settled: the results now share a `MetricResult` base with a `points` list, a
+  `padding` count, an echoed `window` or set of named series, a nested summary object
+  where a metric has one, an overridable `undefined` count, and a consistent rendering
+  rule, and that is what the serializer, the filters and the query-parameter contract
+  will be written against. Until then, the metrics are called from Python and tested
+  there.
 * **No snapshot recalculation job yet.** `AnalyticSnapshot` already models the
-  grain — `(instrument, as_of_date, metric_type, lookback_days)` — and the moving
-  averages and volatility are its natural occupants, since a stored value is how a
-  series becomes rankable across instruments and how "what did we say on 12 March"
-  becomes answerable. It is needed by the rankings (metric 9) and by the audit
-  trail, not by a per-instrument series, and it is the next structural piece.
+  grain — `(instrument, as_of_date, metric_type, lookback_days)` — and the named moving
+  averages (`moving_average` with `lookback_days` 7/30/90), volatility and the period
+  change are its natural occupants, since a stored value is how a series becomes
+  rankable across instruments and how "what did we say on 12 March" becomes
+  answerable. It is needed by the rankings (metric 9) and by the audit trail, not by a
+  per-instrument series, and it is the next structural piece.
 * **No caching of computed series.** The range is part of the key, so a cache would
   multiply keys to save milliseconds over rows that are already a single indexed
   scan. The existing response cache covers the stored snapshot list.
@@ -1530,8 +1793,10 @@ single query and that the backends agree point for point, and prints the plans a
 the engine-versus-database comparisons quoted above — including the two
 `STDDEV_SAMP` and derived-table `MIN` cross-checks, the four-aggregate extremes
 check, the volume summary against the database's own `SUM`/`AVG`/`MAX`/`MIN`/`COUNT`,
-and the two nested-window rejections that explain why two metrics have no
-SQL member:
+the period change against the database's own two index lookups (with the cross-check
+that it equals the cumulative return over the same range), the three frames carried in
+the one moving-average statement, and the two nested-window rejections that explain
+why two of the three metrics without a SQL member lack one:
 
 ```powershell
 ./venv/Scripts/python.exe scripts/verify_analytics.py --rounds 30

@@ -25,6 +25,12 @@ computed on demand and a return read back from a stored snapshot are the same
 number at the same precision -- one precision in the system, not two. Eight
 places is a ten-thousandth of a basis point: far below any market's tick.
 
+**Counts are ``Decimal``, quantized to whole numbers.** Trading volume is a share
+count -- the column is a ``BIGINT`` -- so it is neither money nor a ratio. The
+quantizer is a normalisation for a session's volume and for a sum of them, and it
+rounds in exactly one place, the mean, which is reported beside the exact figures
+it was derived from.
+
 **Undefined is ``None``, never ``0`` and never ``inf``.** "No value" is a real
 answer here (the first day of a series has no return), and a zero would be a
 claim that the price did not move. It is serialized as JSON ``null``.
@@ -43,7 +49,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
@@ -429,6 +435,61 @@ def cumulative_returns_pandas(
 # --------------------------------------------------------------------------- #
 # Moving averages
 # --------------------------------------------------------------------------- #
+
+
+#: The conventional moving averages, as three *named* series rather than one
+#: statistic with a window parameter.
+#:
+#: 7, 30 and 90 are the windows a report quotes and the windows a stored snapshot
+#: is keyed by, so they are a closed vocabulary here: a caller asks for a name, and
+#: the name determines the window, the column, and (if it is ever snapshotted) the
+#: ``lookback_days``. An arbitrary window would let a caller compare a 7 against a
+#: 23 and call the two the same kind of statistic; three names make the comparison
+#: meaningful. Each series is the same :func:`moving_average` arithmetic.
+@dataclass(frozen=True)
+class MovingAverageSeries:
+    """One conventional moving average: the name it is asked for by, and its window."""
+
+    name: str
+    window: int
+
+
+MOVING_AVERAGE_SERIES: tuple[MovingAverageSeries, ...] = (
+    MovingAverageSeries(name="moving_average_7", window=7),
+    MovingAverageSeries(name="moving_average_30", window=30),
+    MovingAverageSeries(name="moving_average_90", window=90),
+)
+
+MOVING_AVERAGE_NAMES: tuple[str, ...] = tuple(
+    series.name for series in MOVING_AVERAGE_SERIES
+)
+
+MOVING_AVERAGE_BY_NAME: Mapping[str, MovingAverageSeries] = {
+    series.name: series for series in MOVING_AVERAGE_SERIES
+}
+
+
+def moving_average_series(
+    names: Sequence[str] | None = None,
+) -> tuple[MovingAverageSeries, ...]:
+    """The named series to compute, in the conventional order.
+
+    ``None`` is all three. An unknown name is an error rather than a silently
+    smaller selection: a caller who asks for ``moving_average_50`` should be given
+    the vocabulary, not handed two series out of three and left to notice.
+    """
+    if names is None:
+        return MOVING_AVERAGE_SERIES
+
+    unknown = sorted(set(names) - set(MOVING_AVERAGE_BY_NAME))
+    if unknown:
+        raise ValueError(
+            f"unknown moving average {', '.join(unknown)}; "
+            f"known: {', '.join(MOVING_AVERAGE_NAMES)}"
+        )
+
+    wanted = set(names)
+    return tuple(series for series in MOVING_AVERAGE_SERIES if series.name in wanted)
 
 
 @dataclass(frozen=True)
@@ -1324,3 +1385,232 @@ def summarize_volume(points: Sequence[VolumePoint]) -> VolumeSummary:
         sessions_below_average=below,
         zero_volume_sessions=sum(1 for point in points if point.volume == 0),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Percentage change over a selected period
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class SelectedPeriod:
+    """A period to measure a price change over, and the name to report it under.
+
+    ``start_date`` and ``end_date`` are inclusive calendar bounds, and ``None``
+    means "from the beginning" or "to the end" of the series. They are *not*
+    required to be trading days: the base and the end are the first and last
+    observations inside the bounds, which is what a report means by "the change
+    this month" when the month opens on a Saturday.
+    """
+
+    label: str | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+
+
+@dataclass(frozen=True)
+class PeriodChange:
+    """How much the price changed over one period, and which sessions did it.
+
+    ``change`` is the ratio ``(end - base) / base`` -- the same quantity metric 1
+    reports for one session and metric 2 accumulates across a range -- and
+    :attr:`percent_change` is that number in percent.
+
+    The two dates and two prices are part of the answer rather than diagnostics: a
+    requested bound is a calendar date, the observation actually used may be a
+    different one, and a caller has to be able to see which session was the base.
+    """
+
+    label: str | None
+    base_date: date | None
+    base_close: Decimal | None
+    end_date: date | None
+    end_close: Decimal | None
+    change: Decimal | None
+    observations: int
+
+    @property
+    def percent_change(self) -> Decimal | None:
+        """The same number in percent: exactly ``change`` x 100.
+
+        Derived from the reported ratio rather than recomputed from the prices, so
+        the two fields can never disagree and a reader can check one against the
+        other. The trade-off is stated rather than hidden: the percent carries the
+        ratio's eight places scaled up, not eight places of its own, so a 2% move
+        reads ``2.00000000`` from ``0.02000000`` and not ``2.00000001`` -- a
+        hundredth of a basis point, below any market's tick, in exchange for a
+        payload that is internally consistent.
+        """
+        return None if self.change is None else quantize_ratio(self.change * 100)
+
+
+def _period_bounds(
+    dates: Sequence[date],
+    start_date: date | None,
+    end_date: date | None,
+) -> tuple[int | None, int | None]:
+    """The observation indices that bound a period, or ``None`` when it has none.
+
+    The base is the first observation **at or after** ``start_date`` and the end is
+    the last **at or before** ``end_date``: a requested bound is a calendar date, and
+    the nearest session inside it is the price a report is quoted against.
+
+    A period containing no observation at all has no base and no end, and the answer
+    is ``None`` rather than an error -- the same rule as a range with no rows. Note
+    that this includes a period narrower than the gap between two sessions, where the
+    base would snap forward past the end: there is no session in the period, so there
+    is no change over it.
+    """
+    if not dates:
+        return None, None
+
+    base = (
+        0
+        if start_date is None
+        else next(
+            (
+                index
+                for index, trading_date in enumerate(dates)
+                if trading_date >= start_date
+            ),
+            None,
+        )
+    )
+    end = (
+        len(dates) - 1
+        if end_date is None
+        else next(
+            (
+                index
+                for index in range(len(dates) - 1, -1, -1)
+                if dates[index] <= end_date
+            ),
+            None,
+        )
+    )
+
+    if base is None or end is None or base > end:
+        return None, None
+    return base, end
+
+
+def _change_at(
+    dates: Sequence[date],
+    closes: Sequence[Decimal],
+    base: int | None,
+    end: int | None,
+    label: str | None,
+) -> PeriodChange:
+    """The answer for two observation indices, or an all-``None`` one."""
+    if base is None or end is None:
+        return PeriodChange(
+            label=label,
+            base_date=None,
+            base_close=None,
+            end_date=None,
+            end_close=None,
+            change=None,
+            observations=0,
+        )
+
+    base_close = Decimal(closes[base])
+    end_close = Decimal(closes[end])
+
+    return PeriodChange(
+        label=label,
+        base_date=dates[base],
+        base_close=base_close,
+        end_date=dates[end],
+        end_close=end_close,
+        # A base of zero has no ratio, the same rule as a zero previous close in a
+        # daily return and for the same reason: the table permits it.
+        change=(
+            None
+            if base_close == 0
+            else quantize_ratio((end_close - base_close) / base_close)
+        ),
+        observations=end - base + 1,
+    )
+
+
+def period_change(
+    dates: Sequence[date],
+    closes: Sequence[Decimal],
+    *,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    label: str | None = None,
+) -> PeriodChange:
+    """The price change between two dates, snapped to the observations between them.
+
+    Definitions, with ``t0`` the first observation at or after ``start_date`` and
+    ``t1`` the last at or before ``end_date``::
+
+        change(t0, t1) = (close(t1) - close(t0)) / close(t0)
+
+    The metric's whole window is the *choice* of those two observations, and that
+    choice is a filter rather than a frame: the sessions in between do not enter the
+    arithmetic at all (though ``observations`` counts them). This is why there is no
+    ``sql`` member and no ``pad`` -- see the note on
+    :data:`apps.analytics.services.PERIOD_CHANGE_BACKENDS`. A base that snapped to a
+    row before ``start_date`` would move the period, which is the opposite of what
+    the caller asked for.
+
+    A base and an end in the same session is a change of ``0`` over one observation,
+    a true statement rather than a degenerate case. A period with no observation in
+    it reports ``None`` throughout.
+    """
+    if len(dates) != len(closes):
+        raise ValueError("dates and closes must be the same length")
+    if start_date and end_date and start_date > end_date:
+        raise ValueError("start_date must not be after end_date")
+
+    base, end = _period_bounds(dates, start_date, end_date)
+    return _change_at(dates, closes, base, end, label)
+
+
+def period_change_pandas(
+    dates: Sequence[date],
+    closes: Sequence[Decimal],
+    *,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    label: str | None = None,
+) -> PeriodChange:
+    """The same answer, with the period's bounds found by binary search.
+
+    ``Index.searchsorted`` is the reference for locating the base and the end, and
+    locating them is the whole of this metric's window: the two backends differ in
+    how they find the observations, and the division on top of them is shared, as the
+    quantizers are shared in every metric. ``side="left"`` for the base, the first
+    observation at or after the bound, and ``side="right"`` less one for the end, the
+    last at or before it -- the asymmetry is what makes a bound that *is* a trading
+    day settle on that day from both directions.
+    """
+    import pandas as pd
+
+    if len(dates) != len(closes):
+        raise ValueError("dates and closes must be the same length")
+    if start_date and end_date and start_date > end_date:
+        raise ValueError("start_date must not be after end_date")
+
+    if not dates:
+        return _change_at(dates, closes, None, None, label)
+
+    index = pd.to_datetime(pd.Index(list(dates)))
+
+    if start_date is None:
+        base = 0
+    else:
+        position = int(index.searchsorted(pd.Timestamp(start_date), side="left"))
+        base = None if position >= len(index) else position
+
+    if end_date is None:
+        end = len(index) - 1
+    else:
+        position = int(index.searchsorted(pd.Timestamp(end_date), side="right")) - 1
+        end = None if position < 0 else position
+
+    if base is None or end is None or base > end:
+        return _change_at(dates, closes, None, None, label)
+    return _change_at(dates, closes, base, end, label)

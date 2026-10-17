@@ -206,7 +206,7 @@ def load_price_series(
     pad: int = 0,
     fields: Sequence[str] = (),
     with_previous_close: bool = False,
-    moving_average_window: int | None = None,
+    moving_average_windows: Sequence[int] = (),
     with_running_max: bool = False,
     with_running_extremes: bool = False,
     with_running_total: bool = False,
@@ -232,10 +232,14 @@ def load_price_series(
         *session*, not the previous row of some other instrument. Note that the
         window is computed over the rows this query returns -- which is exactly
         why ``pad`` exists.
-    moving_average_window
+    moving_average_windows
         Add ``AVG(close) OVER (ROWS BETWEEN window - 1 PRECEDING AND CURRENT ROW)``
-        as a ``moving_average`` column: the trailing mean the metric would
-        otherwise compute in Python, computed by the database instead.
+        as a ``moving_average_<window>`` column, for each window asked for: the
+        trailing mean the metric would otherwise compute in Python, computed by the
+        database instead. A sequence rather than one window because the conventional
+        averages are computed together -- three windows over one read cost one query,
+        one sort and one buffer, where three calls would cost three of each, and the
+        single ``pad`` covers them all.
     with_running_max
         Add ``MAX(close) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)``
         as a ``running_max`` column: the highest close so far, which is the peak a
@@ -293,19 +297,24 @@ def load_price_series(
             partition_by=[F("instrument_id")],
             order_by=F("trading_date").asc(),
         )
-    if moving_average_window is not None:
-        if moving_average_window < 1:
-            raise ValueError("moving_average_window must be at least 1")
-        window_columns["moving_average"] = Window(
-            expression=Avg("close", output_field=PRICE_FIELD),
-            partition_by=[F("instrument_id")],
-            order_by=F("trading_date").asc(),
-            # The trailing mean, the current row included. A database frame
-            # averages however many rows it has, so the first rows of a range are
-            # a partial mean; the metric applies the completeness rule, and the
-            # two routes agree because that rule is stated in one place.
-            frame=RowRange(start=-(moving_average_window - 1), end=0),
-        )
+    if moving_average_windows:
+        for window in moving_average_windows:
+            if window < 1:
+                raise ValueError("moving_average_windows must all be at least 1")
+            window_columns[f"moving_average_{window}"] = Window(
+                expression=Avg("close", output_field=PRICE_FIELD),
+                partition_by=[F("instrument_id")],
+                order_by=F("trading_date").asc(),
+                # The trailing mean, the current row included. A database frame
+                # averages however many rows it has, so the first rows of a range
+                # are a partial mean; the metric applies the completeness rule, and
+                # the two routes agree because that rule is stated in one place.
+                #
+                # One column per window, named after it: three frame aggregates
+                # over the same rows, which the database computes in one pass over
+                # one sorted buffer rather than three.
+                frame=RowRange(start=-(window - 1), end=0),
+            )
     if with_running_max:
         window_columns["running_max"] = Window(
             expression=Max("close", output_field=PRICE_FIELD),

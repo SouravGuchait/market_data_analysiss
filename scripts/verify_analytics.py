@@ -48,13 +48,13 @@ from apps.analytics import services  # noqa: E402
 from apps.analytics.metrics import (  # noqa: E402
     RATIO_DECIMAL_PLACES,
     TRADING_DAYS_PER_YEAR,
+    SelectedPeriod,
 )
 from apps.analytics.series import load_price_series  # noqa: E402
 from apps.instruments.models import Instrument  # noqa: E402
 from apps.marketdata.models import PriceRecord  # noqa: E402
 
 PAD_CASES = (1, 89)
-MA_WINDOW = 30
 VOL_WINDOW = 30
 
 
@@ -122,11 +122,11 @@ def check_warm_up(instrument, mid, end, first_dates):
 
 
 def check_moving_average(instrument, mid, end):
-    print("\n-- moving average window --")
+    print("\n-- moving averages (three named series, one read) --")
 
     def request(backend="sql"):
-        return services.moving_average_for_instrument(
-            instrument, window=MA_WINDOW, start_date=mid, end_date=end, backend=backend
+        return services.moving_averages_for_instrument(
+            instrument, start_date=mid, end_date=end, backend=backend
         )
 
     print(explain(captured_sql(request)))
@@ -134,12 +134,30 @@ def check_moving_average(instrument, mid, end):
     reference = request("python")
     for backend in services.MOVING_AVERAGE_BACKENDS:
         result = request(backend)
-        assert result.points == reference.points, f"{backend} disagrees on the mean"
+        for left, right in zip(result.series, reference.series):
+            assert left.points == right.points, (
+                f"{backend} disagrees on {left.name}"
+            )
         print(
-            f"  {backend:>7}: {len(result.points)} points, padding={result.padding}, "
-            f"last={result.points[-1].value}"
+            f"  {backend:>7}: {len(result.series)} series {result.windows}, "
+            f"padding={result.padding}, undefined={result.undefined}"
         )
-    print("  one request: 1 query (asserted above)")
+
+    for named in reference.series:
+        print(
+            f"    {named.name:<18} window={named.window:<3} "
+            f"last={named.points[-1].value}"
+        )
+    print("  one request for all three: 1 query (asserted above)")
+
+    # The three windows are one read: the SQL carries all three frames, which the
+    # plan above shows as three window aggregates over one sorted buffer.
+    sql = captured_sql(request)
+    for window in reference.windows:
+        assert f"ROWS BETWEEN {window - 1} PRECEDING AND CURRENT ROW" in sql, (
+            f"the window for {window} is missing from the query"
+        )
+    print("  all three frames are in the one statement")
 
 
 def check_volatility(instrument, mid, end):
@@ -422,6 +440,79 @@ def check_volume(instrument, mid, end):
     print(line)
 
 
+def check_percentage_change(instrument, mid, end, dates):
+    print("\n-- percentage change over a selected period --")
+
+    def request(**kwargs):
+        return services.percentage_change_for_instrument(
+            instrument, start_date=mid, end_date=end, **kwargs
+        )
+
+    captured_sql(request)
+    result = request()
+    period = result.periods[0]
+    print(
+        f"  {period.base_date} {period.base_close} -> {period.end_date} "
+        f"{period.end_close}: change={period.change} percent={period.percent_change} "
+        f"over {period.observations} sessions"
+    )
+
+    cumulative = services.cumulative_returns_for_instrument(
+        instrument, start_date=mid, end_date=end
+    )
+    print(f"  the cumulative-return series over the same range ends on {cumulative.total}")
+    assert period.change == cumulative.total, "the two ways of seeing it disagree"
+
+    for backend in services.PERIOD_CHANGE_BACKENDS:
+        other = request(backend=backend)
+        assert other.periods == result.periods, f"{backend} disagrees"
+    print("  python and pandas agree; one period is 1 query (asserted above)")
+
+    # Several periods at once: one read over their union, and one number each.
+    periods = (
+        SelectedPeriod(label="last 5", start_date=dates[-5], end_date=end),
+        SelectedPeriod(label="last 21", start_date=dates[-21], end_date=end),
+        SelectedPeriod(label="window", start_date=mid, end_date=end),
+        SelectedPeriod(label="to date", end_date=end),
+    )
+    captured_sql(
+        lambda: services.percentage_change_for_instrument(instrument, periods=periods)
+    )
+    many = services.percentage_change_for_instrument(instrument, periods=periods)
+    print(
+        f"  four periods, read over {many.start_date} .. {many.end_date}, in 1 query:"
+    )
+    for change in many.periods:
+        print(
+            f"    {change.label:<8} {change.base_date} -> {change.end_date}  "
+            f"change={change.change}  percent={change.percent_change}"
+        )
+
+    # The SQL form that is deliberately not used, run to show that it agrees: two
+    # index lookups rather than a read of the period.
+    endpoint_sql = (
+        "SELECT "
+        f"(SELECT close FROM marketdata_pricerecord WHERE instrument_id = {instrument.pk} "
+        f"AND trading_date >= '{mid}' ORDER BY trading_date ASC LIMIT 1), "
+        f"(SELECT close FROM marketdata_pricerecord WHERE instrument_id = {instrument.pk} "
+        f"AND trading_date <= '{end}' ORDER BY trading_date DESC LIMIT 1)"
+    )
+    print(explain(endpoint_sql))
+    with connection.cursor() as cursor:
+        cursor.execute(endpoint_sql)
+        base_close, end_close = cursor.fetchone()
+
+    from_mysql = (Decimal(end_close) - Decimal(base_close)) / Decimal(base_close)
+    print(
+        f"  two index lookups: {base_close} -> {end_close} = {float(from_mysql):.10f}, "
+        f"engine {period.change}"
+    )
+    assert abs(float(period.change) - float(from_mysql)) < 1e-8, (
+        "the engine and the database's own endpoints disagree"
+    )
+    print("  and the endpoint query is two index lookups, not a scan of the period")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--instrument-id", type=int, default=None)
@@ -485,6 +576,7 @@ def main() -> int:
     check_drawdown(instrument, mid, end)
     check_extremes(instrument, mid, end)
     check_volume(instrument, mid, end)
+    check_percentage_change(instrument, mid, end, dates)
 
     print(f"\nOK (window {mid} .. {end})")
     return 0

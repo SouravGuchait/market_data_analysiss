@@ -225,19 +225,42 @@ class LoaderTests(TestCase):
             start_date=DAY3,
             end_date=DAY5,
             pad=2,
-            moving_average_window=3,
+            moving_average_windows=(3,),
         )
 
         # (100 + 102 + 101) / 3, then (102 + 101 + 103) / 3, then
         # (101 + 103 + 104) / 3. Quantized, not compared raw: what the driver
         # hands back for an average has whatever scale the backend chose for it
         # (SQLite returned twelve places here), and normalising that is the
-        # engine's job, not the loader's.
+        # engine's job, not the loader's. One column per window, named after it.
         self.assertEqual(
-            [quantize_price(value) for value in series.column("moving_average")[2:]],
+            [quantize_price(value) for value in series.column("moving_average_3")[2:]],
             [Decimal("101"), Decimal("102"), Decimal("102.66666667")],
         )
         self.assertEqual(series.padding, 2)
+
+    def test_several_moving_average_windows_come_back_from_one_query(self):
+        """The three conventional windows are one read, not three: the columns are
+        named after their windows and the single ``pad`` covers the longest."""
+        with self.assertNumQueries(1):
+            series = load_price_series(
+                self.aapl,
+                start_date=DAY5,
+                end_date=DAY5,
+                pad=6,
+                moving_average_windows=(7, 30),
+            )
+
+        self.assertEqual(sorted(series.columns), ["close", "moving_average_30", "moving_average_7"])
+        # DAY5's 7-window mean has only five rows to work with -- (100 + 102 + 101 +
+        # 103 + 104) / 5 -- which is exactly the partial frame the loader passes
+        # through and the metric is what declines to report.
+        self.assertEqual(
+            quantize_price(series.column("moving_average_7")[-1]), Decimal("102")
+        )
+        self.assertEqual(
+            quantize_price(series.column("moving_average_30")[-1]), Decimal("102")
+        )
 
     def test_a_database_average_of_a_partial_frame_is_still_returned_as_data(self):
         """The loader does not hide it; the *metric* applies the completeness rule.
@@ -247,10 +270,10 @@ class LoaderTests(TestCase):
         the metric decide -- and what makes a supplied mean comparable with a
         computed one.
         """
-        series = load_price_series(self.aapl, moving_average_window=7)
+        series = load_price_series(self.aapl, moving_average_windows=(7,))
 
-        self.assertEqual(quantize_price(series.column("moving_average")[0]), Decimal("100"))
-        self.assertEqual(quantize_price(series.column("moving_average")[1]), Decimal("101"))
+        self.assertEqual(quantize_price(series.column("moving_average_7")[0]), Decimal("100"))
+        self.assertEqual(quantize_price(series.column("moving_average_7")[1]), Decimal("101"))
 
     def test_both_window_columns_can_be_read_together_in_one_query(self):
         with self.assertNumQueries(1):
@@ -259,15 +282,15 @@ class LoaderTests(TestCase):
                 start_date=DAY2,
                 pad=1,
                 with_previous_close=True,
-                moving_average_window=2,
+                moving_average_windows=(2,),
             )
 
         self.assertEqual(series.column("previous_close")[1], Decimal("100"))
-        self.assertEqual(series.column("moving_average")[1], Decimal("101"))
+        self.assertEqual(series.column("moving_average_2")[1], Decimal("101"))
 
     def test_a_moving_average_window_below_one_is_rejected(self):
         with self.assertRaises(ValueError):
-            load_price_series(self.aapl, moving_average_window=0)
+            load_price_series(self.aapl, moving_average_windows=(0,))
 
     def test_the_running_max_column_is_the_highest_close_so_far(self):
         series = load_price_series(
@@ -308,12 +331,12 @@ class LoaderTests(TestCase):
                 start_date=DAY2,
                 pad=1,
                 with_previous_close=True,
-                moving_average_window=2,
+                moving_average_windows=(2,),
                 with_running_max=True,
             )
 
         self.assertEqual(series.column("previous_close")[1], Decimal("100"))
-        self.assertEqual(series.column("moving_average")[1], Decimal("101"))
+        self.assertEqual(series.column("moving_average_2")[1], Decimal("101"))
         self.assertEqual(series.column("running_max")[1], Decimal("102"))
 
     def test_the_running_extremes_columns_come_back_from_one_query(self):
@@ -393,11 +416,11 @@ class LoaderTests(TestCase):
                 start_date=DAY1,
                 end_date=DAY5,
                 fields=("volume",),
-                moving_average_window=2,
+                moving_average_windows=(2,),
                 with_running_total=True,
             )
 
-        self.assertEqual(series.column("moving_average")[1], Decimal("101"))
+        self.assertEqual(series.column("moving_average_2")[1], Decimal("101"))
         self.assertEqual(series.column("running_total")[1], Decimal("2000"))
 
     # ----------------------------------------------------------------- #

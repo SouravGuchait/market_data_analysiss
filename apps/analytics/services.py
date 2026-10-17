@@ -22,7 +22,9 @@ from .metrics import (
     ExtremePoint,
     ExtremesSummary,
     MovingAveragePoint,
+    PeriodChange,
     ReturnPoint,
+    SelectedPeriod,
     VolatilityPoint,
     VolumePoint,
     VolumeSummary,
@@ -36,6 +38,9 @@ from .metrics import (
     extreme_series_pandas,
     moving_average,
     moving_average_pandas,
+    moving_average_series,
+    period_change,
+    period_change_pandas,
     rolling_volatility,
     rolling_volatility_pandas,
     summarize_drawdown,
@@ -133,6 +138,17 @@ def get_latest_snapshot(instrument, metric_type, *, lookback_days=None):
 #: Both are computed over rows the loader has already returned, which costs one
 #: query either way.
 #:
+#: Percentage change over a period has no ``sql`` member for a third and different
+#: reason: it has no window at all. Its "window" is a *choice of two rows* -- the
+#: first observation at or after the base, the last at or before the end -- and the
+#: engine's read boundary returns a series, not a pair. The SQL form would be two
+#: ``ORDER BY ... LIMIT 1`` subqueries (which two scalar subqueries do in one
+#: statement), a different query shape rather than a window over the rows the loader
+#: already has, so it is left out rather than smuggled in as a second read path for
+#: a subtraction. Reading the period's rows instead costs one indexed range scan and
+#: buys ``observations`` -- how many sessions the period held -- which the
+#: two-endpoint query could not report.
+#:
 #: Maximum drawdown *does* have a SQL member, which is the test of that rule
 #: rather than an exception to it: its window -- the running maximum -- is a
 #: plain frame over the closes, so ``MAX(close) OVER (ROWS BETWEEN UNBOUNDED
@@ -153,6 +169,7 @@ VOLATILITY_BACKENDS = ("sql", "python", "pandas")
 DRAWDOWN_BACKENDS = ("sql", "python", "pandas")
 EXTREME_BACKENDS = ("sql", "python", "pandas")
 VOLUME_BACKENDS = ("sql", "python", "pandas")
+PERIOD_CHANGE_BACKENDS = ("python", "pandas")
 
 
 @dataclass(frozen=True)
@@ -213,11 +230,79 @@ class CumulativeReturns(MetricResult):
 
 
 @dataclass(frozen=True)
-class MovingAverages(MetricResult):
-    """One moving-average answer, and the window it was asked for."""
+class NamedMovingAverage:
+    """One named moving-average series: the name, its window, and its points."""
 
-    window: int = 0
-    points: list[MovingAveragePoint] = field(default_factory=list)
+    name: str
+    window: int
+    points: list[MovingAveragePoint]
+
+
+@dataclass(frozen=True)
+class MovingAverages(MetricResult):
+    """The conventional moving averages (7, 30, 90), from one read.
+
+    ``series`` holds one entry per named series, in the conventional order, rather
+    than one flat list of points: a point belongs to exactly one window, and
+    flattening the three would lose the only thing that distinguishes them. There is
+    therefore no single ``window`` on this result -- the windows are on the series,
+    and :attr:`windows` collects them for a caller checking what came back.
+    """
+
+    series: tuple[NamedMovingAverage, ...] = ()
+
+    @property
+    def windows(self) -> tuple[int, ...]:
+        """The windows computed, in the conventional order."""
+        return tuple(named.window for named in self.series)
+
+    def named(self, name: str) -> NamedMovingAverage:
+        """One series by name, or ``KeyError`` naming what this result has."""
+        for named in self.series:
+            if named.name == name:
+                return named
+        raise KeyError(
+            f"{name!r} was not computed; this result has "
+            f"{[named.name for named in self.series]}"
+        )
+
+    @property
+    def undefined(self) -> int:
+        """How many points across all of the series carry no value.
+
+        The base class counts ``point.value`` over one ``points`` list and this result
+        has three, so it sums over them. One number covering all three is what a
+        caller wants to see: a young instrument has a long run of ``None`` at the
+        front of the 90-day series and none at the front of the 7-day one, and the sum
+        is the total that has to be explained.
+        """
+        return sum(
+            1 for named in self.series for point in named.points if point.value is None
+        )
+
+
+@dataclass(frozen=True)
+class PeriodChanges(MetricResult):
+    """One answer per selected period, all from the same single read.
+
+    ``points`` is deliberately empty: this metric has no per-date series -- *that*
+    series is metric 2's, seen from a different base -- and a point here would be a
+    period, not a date, which is what :attr:`periods` holds. A result is built the
+    same way for one period as for several, so the shape does not change with the
+    number asked for. ``start_date``/``end_date`` echo the span that was read, which
+    for several periods is their union.
+    """
+
+    periods: tuple[PeriodChange, ...] = ()
+
+    @property
+    def undefined(self) -> int:
+        """Periods with no measurable change: an empty period, or a base of zero.
+
+        Overrides the base class, which counts ``point.value``; this result's answers
+        are periods rather than points.
+        """
+        return sum(1 for period in self.periods if period.change is None)
 
 
 @dataclass(frozen=True)
@@ -390,61 +475,94 @@ def cumulative_returns_for_instrument(
     )
 
 
-def moving_average_for_instrument(
+def moving_averages_for_instrument(
     instrument,
     *,
-    window: int,
+    names: Sequence[str] | None = None,
     start_date: date | None = None,
     end_date: date | None = None,
     backend: str = "sql",
 ) -> MovingAverages:
-    """The trailing mean of ``window`` observations, for one instrument.
+    """The conventional moving averages for one instrument, in one query.
 
-    The loader reads ``window - 1`` observations before ``start_date``, so the
-    first requested date has a full window rather than a ``null`` that the
-    database could have answered. This is the metric that makes the loader's
-    general ``pad`` worth having: one row of warm-up was enough for a return, a
-    90-day average needs 89.
+    ``names`` selects from the closed vocabulary -- ``moving_average_7``,
+    ``moving_average_30``, ``moving_average_90`` -- and defaults to all three. There
+    is deliberately no ``window`` parameter: the windows a report quotes are a
+    convention rather than a knob, and naming them is what makes one 7-day average
+    comparable with another 7-day average instead of with whatever number happened to
+    be passed.
 
-    In the ``sql`` backend the mean itself comes from
-    ``AVG(close) OVER (ROWS BETWEEN window - 1 PRECEDING AND CURRENT ROW)``, so
-    the number is computed where the rows are; the other two compute it in Python
-    over the same rows. All three agree, including on the partial windows at the
-    start of a history shorter than the lookback, because the completeness rule
+    The loader reads ``max(window) - 1`` observations before ``start_date``, so the
+    first requested date already has a full window for the longest series asked for.
+    This is the metric that makes the loader's general ``pad`` worth having: one row
+    of warm-up was enough for a return, a 90-day average needs 89.
+
+    Asking for all three costs **one** read of ``pad + observations`` rows, and
+    answering all three from it costs three rolling sums over rows already in memory.
+    Three separate calls would read 6, 29 and 89 warm-up rows over three queries;
+    this reads 89 over one. What is given up is stated rather than hidden: a caller
+    who wants only the 7-day series still reads 89 warm-up rows, which is why
+    ``names`` exists.
+
+    In the ``sql`` backend the three means come from three ``AVG(close) OVER (ROWS
+    BETWEEN window - 1 PRECEDING AND CURRENT ROW)`` annotations over the same rows,
+    evaluated in one pass over one sorted buffer; the other two compute them in
+    Python over the same rows. All three agree, including on the partial windows at
+    the start of a history shorter than the lookback, because the completeness rule
     (``sample_size == window``) is applied identically to a supplied mean.
     """
     _reject_backend(backend, MOVING_AVERAGE_BACKENDS)
-    if window < 1:
-        raise ValueError("window must be at least 1")
 
-    series = load_price_series(
+    wanted = moving_average_series(names)
+    if not wanted:
+        # An empty selection asks for nothing, so it reads nothing.
+        return MovingAverages(
+            symbol=instrument.symbol,
+            backend=backend,
+            start_date=start_date,
+            end_date=end_date,
+            padding=0,
+            series=(),
+        )
+
+    windows = tuple(average.window for average in wanted)
+    data = load_price_series(
         instrument,
         start_date=start_date,
         end_date=end_date,
-        pad=window - 1,
-        moving_average_window=window if backend == "sql" else None,
+        pad=max(windows) - 1,
+        moving_average_windows=windows if backend == "sql" else (),
     )
 
-    if backend == "sql":
-        points = moving_average(
-            series.dates,
-            series.closes,
-            window,
-            values=series.column("moving_average"),
+    computed: list[NamedMovingAverage] = []
+    for average in wanted:
+        if backend == "sql":
+            points = moving_average(
+                data.dates,
+                data.closes,
+                average.window,
+                values=data.column(f"moving_average_{average.window}"),
+            )
+        elif backend == "pandas":
+            points = moving_average_pandas(data.dates, data.closes, average.window)
+        else:
+            points = moving_average(data.dates, data.closes, average.window)
+
+        computed.append(
+            NamedMovingAverage(
+                name=average.name,
+                window=average.window,
+                points=points[data.padding :],
+            )
         )
-    elif backend == "pandas":
-        points = moving_average_pandas(series.dates, series.closes, window)
-    else:
-        points = moving_average(series.dates, series.closes, window)
 
     return MovingAverages(
-        symbol=series.symbol,
+        symbol=data.symbol,
         backend=backend,
         start_date=start_date,
         end_date=end_date,
-        padding=series.padding,
-        window=window,
-        points=points[series.padding :],
+        padding=data.padding,
+        series=tuple(computed),
     )
 
 
@@ -696,4 +814,97 @@ def volume_summaries_for_instrument(
         padding=series.padding,
         summary=summarize_volume(points),
         points=points[series.padding :],
+    )
+
+
+def percentage_change_for_instrument(
+    instrument,
+    *,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    periods: Sequence[SelectedPeriod] | None = None,
+    backend: str = "python",
+) -> PeriodChanges:
+    """The price change over each selected period, for one instrument.
+
+    One period, from ``start_date`` to ``end_date``, or several from ``periods`` --
+    a sequence of :class:`~apps.analytics.metrics.SelectedPeriod`, which is a label
+    and two bounds. The two forms are mutually exclusive, because accepting both
+    invites a caller to pass a range *and* a list of ranges and have one of them
+    silently ignored.
+
+    **Every period is answered from one read.** The loader reads the union of the
+    requested spans once and each period's bounds are snapped inside it, so "the
+    change this week, this month and this quarter" is one query rather than three --
+    which is the whole reason ``periods`` exists.
+
+    The base and the end of a period are the first and last *observations* inside its
+    bounds, and both are reported back on the answer: a request names calendar dates,
+    and a report that says "1 March to 31 March" is quoting the sessions in between.
+    ``pad`` is ``0``, because a base that snapped to the row before the period would
+    be the change *into* the period -- a different question, and one that metric 1
+    answers for that date.
+
+    For a period that is exactly the requested range, the answer is the number metric
+    2's series ends on: ``close(last) / close(first) - 1``. It is computed here from
+    the two prices rather than by taking that series' last point, and a test asserts
+    the two agree -- the series and the endpoint are the same fact seen twice, which
+    is the only thing that makes the second one worth having.
+
+    There is no ``sql`` backend -- see :data:`PERIOD_CHANGE_BACKENDS` -- so ``python``
+    is the default, and ``pandas`` locates the bounds by binary search instead of a
+    scan.
+    """
+    _reject_backend(backend, PERIOD_CHANGE_BACKENDS)
+
+    if periods is None:
+        selected: tuple[SelectedPeriod, ...] = (
+            SelectedPeriod(label=None, start_date=start_date, end_date=end_date),
+        )
+    else:
+        if start_date is not None or end_date is not None:
+            raise ValueError("pass either start_date/end_date or periods, not both")
+        selected = tuple(periods)
+
+    if not selected:
+        # An empty selection asks for nothing, so it reads nothing.
+        return PeriodChanges(
+            symbol=instrument.symbol, backend=backend, padding=0, periods=()
+        )
+
+    # The union of the requested spans. A period with no bound means "from the
+    # beginning" or "to the end" of the series, so the union loses that bound too and
+    # the read starts at the first row rather than at a date.
+    read_start = (
+        None
+        if any(period.start_date is None for period in selected)
+        else min(period.start_date for period in selected)
+    )
+    read_end = (
+        None
+        if any(period.end_date is None for period in selected)
+        else max(period.end_date for period in selected)
+    )
+
+    data = load_price_series(instrument, start_date=read_start, end_date=read_end)
+
+    compute = period_change_pandas if backend == "pandas" else period_change
+    changes = tuple(
+        compute(
+            data.dates,
+            data.closes,
+            start_date=period.start_date,
+            end_date=period.end_date,
+            label=period.label,
+        )
+        for period in selected
+    )
+
+    return PeriodChanges(
+        symbol=data.symbol,
+        backend=backend,
+        start_date=read_start,
+        end_date=read_end,
+        padding=data.padding,
+        periods=changes,
     )
