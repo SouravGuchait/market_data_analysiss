@@ -80,7 +80,7 @@ def test_report_has_a_rule_table_and_a_failure_sample(tmp_path):
     job = ingest_file(user=user, path=path).job
     report = report_for(job)
 
-    assert report["status"] == JobStatus.SUCCEEDED
+    assert report["status"] == JobStatus.COMPLETED
     assert report["rows_accepted"] == 1
     assert {rule["rule"] for rule in report["rules"]} == set(ROW_RULES)
     assert report["sample_failures"] == []
@@ -97,6 +97,6 @@ def test_ingest_upload_stores_the_file_and_loads_it(tmp_path):
     with override_settings(MEDIA_ROOT=tmp_path):
         result = ingest_upload(user=user, uploaded_file=upload)
 
-    assert result.job.status == JobStatus.SUCCEEDED
+    assert result.job.status == JobStatus.COMPLETED
     assert PriceRecord.objects.count() == 1
     assert result.job.files.count() == 1

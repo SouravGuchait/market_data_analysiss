@@ -16,11 +16,13 @@ from pathlib import Path
 
 from django.core.exceptions import ValidationError
 from django.core.files.storage import default_storage
+from django.db import IntegrityError, transaction
+from django.utils import timezone
 
 from .etl import storage
 from .etl.pipeline import IngestionPolicy, IngestionResult, run_ingestion
 from .etl.reporting import job_report
-from .models import IngestionJob, SourceType
+from .models import IngestionJob, JobStatus, SourceType
 
 VALID_SOURCE_TYPES = {choice.value for choice in SourceType}
 
@@ -75,7 +77,7 @@ def create_job(*, created_by, source_type):
     """Creates a pending ingestion job owned by ``created_by``.
 
     Only the owner and the source type may be set. Status, timestamps, and row
-    counts are all owned by the pipeline: a client sending ``status: succeeded``
+    counts are all owned by the pipeline: a client sending ``status: completed``
     is rejected rather than trusted.
     """
     if source_type not in VALID_SOURCE_TYPES:
@@ -170,7 +172,8 @@ def run_job(
          file format, or a ``fetcher`` callable for the API source — plus an
          optional :class:`~apps.ingestion.etl.pipeline.IngestionPolicy`.
     out: an :class:`~apps.ingestion.etl.pipeline.IngestionResult`; the job row is
-         updated in place and ends ``succeeded``, ``partial``, or ``failed``.
+         updated in place and ends ``completed``, ``completed_with_errors``, or
+         ``failed``.
 
     Business purpose: the single call that turns a job request into loaded rows,
     so every trigger — API, command, test — shares the same validation,
@@ -276,3 +279,167 @@ def report_for(job) -> dict:
     the rule table and the failure sample cannot drift apart.
     """
     return job_report(job)
+
+
+# --------------------------------------------------------------------------- #
+# Asynchronous entry points (the Celery path)
+# --------------------------------------------------------------------------- #
+#
+# The synchronous functions above run the load inside the caller's request. The
+# functions below hand the same load to a worker: they create the job row, hand
+# the worker its primary key, and return. Everything that decides *what* the
+# load does still lives in ``etl`` — the queue changes when the work happens,
+# not what it means.
+
+
+def policy_payload(policy: IngestionPolicy | None, *, sheet_name: str | None = None) -> dict:
+    """Flatten a policy into the JSON frozen on the job row.
+
+    The submitter's choices travel with the job rather than with the worker.
+    That is what makes the queue safe: a job submitted on Monday does on
+    Thursday exactly what it asked for on Monday, even if the API's defaults
+    have moved in between.
+    """
+    resolved = policy or IngestionPolicy()
+    payload = {
+        "on_invalid": resolved.on_invalid,
+        "on_existing": resolved.on_existing,
+        "chunk_size": resolved.chunk_size,
+        "max_errors": resolved.max_errors,
+        "run_calendar_check": resolved.run_calendar_check,
+    }
+    if sheet_name:
+        payload["sheet_name"] = sheet_name
+    return payload
+
+
+def create_or_get_job(*, created_by, source_type, idempotency_key, policy=None):
+    """Create a job, or return the one this submission already created.
+
+    Returns ``(job, created)``. The dedupe is enforced by a database constraint,
+    not by a prior ``SELECT``: two concurrent submissions of the same file both
+    attempt the insert, one wins, and the loser is turned into a lookup by the
+    ``IntegrityError``. A read-then-write check would leave a window in which
+    both requests see "no existing job" and both create one.
+    """
+    try:
+        with transaction.atomic():
+            job = IngestionJob.objects.create(
+                created_by=created_by,
+                source_type=source_type,
+                idempotency_key=idempotency_key,
+                policy=policy if isinstance(policy, dict) else policy_payload(policy),
+            )
+        return job, True
+    except IntegrityError:
+        existing = IngestionJob.objects.filter(
+            created_by=created_by, idempotency_key=idempotency_key
+        ).first()
+        if existing is None:  # a different constraint fired; not ours to swallow
+            raise
+        return existing, False
+
+
+def enqueue_ingestion_job(job) -> str:
+    """Hand a committed job to the worker and record the task id.
+
+    Contract
+    --------
+    in : an :class:`~apps.ingestion.models.IngestionJob` that has already been
+         committed, with its source file stored.
+    out: the Celery task id (empty if the broker returned none).
+
+    Business purpose: the single place a job becomes work. It is called *after*
+    the job's transaction commits — a worker that started before the row was
+    visible would claim nothing, and worse, could be told to load a file whose
+    row did not exist yet.
+    """
+    # Imported here rather than at module scope so that importing the service
+    # layer never requires a live Celery application.
+    from .tasks import process_ingestion_job
+
+    async_result = process_ingestion_job.delay(str(job.pk))
+    task_id = getattr(async_result, "id", "") or ""
+    if task_id:
+        IngestionJob.objects.filter(pk=job.pk).update(celery_task_id=task_id)
+    return task_id
+
+
+def submit_upload(
+    *,
+    user,
+    uploaded_file,
+    source_type: str | None = None,
+    policy: IngestionPolicy | None = None,
+    sheet_name: str | None = None,
+    idempotency_key: str | None = None,
+):
+    """Store an upload, create-or-reuse its job, and queue it. Returns (job, created).
+
+    Contract
+    --------
+    in : the owning user, an ``UploadedFile``, and an optional client-supplied
+         ``Idempotency-Key``.
+    out: ``(job, created)`` — the job to report on, and whether this call is the
+         one that created it.
+
+    Business purpose: the asynchronous equivalent of
+    :func:`ingest_upload`. Two properties matter here:
+
+    * the file is hashed *before* the job exists, so "the same file uploaded
+      twice" collapses onto one job rather than relying on the browser to be
+      well-behaved; and
+    * the task is enqueued only after the file and its row are committed, so a
+      worker can never be told to load something that is not there yet.
+    """
+    name = storage.safe_filename(uploaded_file.name)
+    storage.validate_extension(name)
+    storage.assert_within_size(uploaded_file.size)
+
+    resolved_type = source_type or infer_source_type(name)
+
+    # The digest is the default identity of a submission. A client that supplies
+    # its own key gets to name the operation (so a retry after a timeout maps to
+    # the same job even if the bytes were re-encoded in transit).
+    digest = storage.checksum_of_upload(uploaded_file)
+    key = (idempotency_key or f"file:{digest}")[:128]
+
+    job, created = create_or_get_job(
+        created_by=user,
+        source_type=resolved_type,
+        idempotency_key=key,
+        policy=policy_payload(policy, sheet_name=sheet_name),
+    )
+    if not created:
+        # A replay. Return the original job, still queued or already finished —
+        # never a second load.
+        return job, False
+
+    try:
+        storage.store_upload(job=job, uploaded_file=uploaded_file)
+    except Exception as exc:  # storage failed after the row existed
+        IngestionJob.objects.filter(pk=job.pk).update(
+            status=JobStatus.FAILED,
+            last_error=f"{type(exc).__name__}: {exc}"[:2000],
+        )
+        raise
+
+    enqueue_ingestion_job(job)
+    return job, True
+
+
+def cancel_job(job) -> IngestionJob:
+    """Ask a job to stop, or cancel one that has not started.
+
+    A ``pending`` job is simply marked terminal — it will never be claimed,
+    because the claim only matches ``pending``. A ``processing`` job is marked
+    terminal too, and the running attempt notices at its next chunk boundary and
+    finishes as ``cancelled``. Cancellation is therefore cooperative: it stops
+    the load quickly, but between chunk boundaries, not mid-write.
+    """
+    if job.is_terminal:
+        return job
+    job.status = JobStatus.CANCELLED
+    job.completed_at = timezone.now()
+    job.save(update_fields=["status", "completed_at"])
+    return job

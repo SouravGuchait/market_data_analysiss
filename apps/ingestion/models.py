@@ -15,11 +15,48 @@ class SourceType(models.TextChoices):
 
 
 class JobStatus(models.TextChoices):
+    """The lifecycle of a job, as stored on the row.
+
+    The database is the single source of business truth: Celery's own result is
+    never consulted to answer "did this load succeed". A worker may die, Redis
+    may be flushed, the result backend may be disabled entirely — the job row
+    still says exactly where the load got to.
+
+    ``PENDING``      created, not yet claimed by a worker (or queued for retry).
+    ``PROCESSING``   a worker holds it and is loading rows. ``heartbeat_at``
+                     advances while it runs, which is what makes a crashed
+                     worker detectable rather than an indefinite hang.
+    ``COMPLETED``    finished; every row was accepted, no calendar gap.
+    ``COMPLETED_WITH_ERRORS``  finished; some rows were rejected or a trading
+                     day was missing. The load is complete for what arrived.
+    ``FAILED``       nothing usable was loaded, or the attempt was abandoned
+                     after exhausting retries.
+    ``CANCELLED``    a terminal state a client asked for; a running attempt
+                     checks for it and stops at the next chunk boundary.
+    """
+
     PENDING = "pending", "Pending"
-    RUNNING = "running", "Running"
-    SUCCEEDED = "succeeded", "Succeeded"
+    PROCESSING = "processing", "Processing"
+    COMPLETED = "completed", "Completed"
+    COMPLETED_WITH_ERRORS = "completed_with_errors", "Completed with errors"
     FAILED = "failed", "Failed"
-    PARTIAL = "partial", "Partial"
+    CANCELLED = "cancelled", "Cancelled"
+
+    @classmethod
+    def terminal(cls) -> frozenset[str]:
+        """States a job never leaves.
+
+        Used to make repeated task execution a no-op: if a job is already
+        terminal, a redelivered message must not load the file a second time.
+        """
+        return frozenset(
+            {cls.COMPLETED, cls.COMPLETED_WITH_ERRORS, cls.FAILED, cls.CANCELLED}
+        )
+
+    @classmethod
+    def active(cls) -> frozenset[str]:
+        """States in which a load is in flight (or waiting to be)."""
+        return frozenset({cls.PENDING, cls.PROCESSING})
 
 
 class IngestionJob(models.Model):
@@ -38,7 +75,7 @@ class IngestionJob(models.Model):
     )
     source_type = models.CharField(max_length=16, choices=SourceType.choices)
     status = models.CharField(
-        max_length=16, choices=JobStatus.choices, default=JobStatus.PENDING
+        max_length=32, choices=JobStatus.choices, default=JobStatus.PENDING
     )
 
     requested_at = models.DateTimeField(auto_now_add=True)
@@ -50,8 +87,75 @@ class IngestionJob(models.Model):
     rows_rejected = models.PositiveIntegerField(default=0)
     error_summary = models.TextField(blank=True, default="")
 
+    # --- worker bookkeeping ------------------------------------------------ #
+    # The submission's deduplication key. Unique *per owner*: a client that
+    # times out and retries with the same key gets the original job back rather
+    # than a second load, while two different users uploading identical bytes
+    # still get their own jobs. Blank on the plain create endpoint, which asks
+    # for a job without a file and so has nothing to deduplicate on.
+    idempotency_key = models.CharField(max_length=128, blank=True, null=True)
+
+    # The Celery task currently (or last) responsible. Recorded so a stale job
+    # can be tied back to the message that abandoned it.
+    celery_task_id = models.CharField(max_length=64, blank=True, default="", db_index=True)
+
+    # How many times a worker has *started* this job. Bounded by the task's
+    # max_retries; a count that keeps rising is the signal of a poison message.
+    attempts = models.PositiveSmallIntegerField(default=0)
+
+    # Progress, advanced as chunks are committed. ``rows_processed`` is
+    # monotonic and survives a retry, so a resumed run reports honestly.
+    rows_processed = models.PositiveIntegerField(default=0)
+
+    # Written by the worker on a cadence while it runs. A PROCESSING job whose
+    # heartbeat has gone cold is how a crashed worker is detected.
+    heartbeat_at = models.DateTimeField(null=True, blank=True)
+
+    # The last infrastructure failure, in one line. Distinct from
+    # ``error_summary`` (which describes data quality): this is "why did the
+    # attempt die", kept for the operator and never shown as a row finding.
+    last_error = models.TextField(blank=True, default="")
+
+    # The resume point for a chunked run: cumulative counters plus the ordered
+    # row offset already committed. Empty for a job that has never run.
+    checkpoint = models.JSONField(default=dict, blank=True)
+
+    # The ingestion policy the submission asked for, frozen at submit time. The
+    # worker reads it from here rather than from the request, so a queued job
+    # does exactly what its submitter chose even if the API default later moves.
+    policy = models.JSONField(default=dict, blank=True)
+
     class Meta:
         ordering = ["-requested_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["created_by", "idempotency_key"],
+                name="uniq_job_owner_idempotency_key",
+            ),
+        ]
+        indexes = [
+            # Stale-job sweeps scan "PROCESSING with a cold heartbeat"; this is
+            # the index that keeps that scan off a full table read.
+            models.Index(fields=["status", "heartbeat_at"], name="idx_job_status_heartbeat"),
+        ]
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in JobStatus.terminal()
+
+    @property
+    def progress_percent(self) -> int:
+        """Whole-number progress, or ``-1`` when the source has no known total.
+
+        We deliberately do not guess a total for a streamed file: counting rows
+        up front would mean a second pass over a file we opened once. When the
+        checkpoint carries a ``total`` (an API page count, a worksheet's row
+        count) the percentage is real; otherwise it is reported as unknown.
+        """
+        total = (self.checkpoint or {}).get("total")
+        if not total:
+            return -1
+        return min(99, int(self.rows_processed * 100 / total))
 
     def __str__(self):
         return f"{self.source_type} job {self.pk} ({self.status})"

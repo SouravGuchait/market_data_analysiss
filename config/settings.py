@@ -181,5 +181,58 @@ LOGGING = {
     "loggers": {
         "django.request": {"handlers": ["console"], "level": "WARNING", "propagate": False},
         "market_data": {"handlers": ["console"], "level": "INFO", "propagate": False},
+        "market_data.tasks": {"handlers": ["console"], "level": "INFO", "propagate": False},
     },
 }
+
+# --------------------------------------------------------------------------- #
+# Celery / Redis
+# --------------------------------------------------------------------------- #
+# Redis is the broker. There is no result backend on purpose: business status
+# lives on IngestionJob, so losing a Redis key can never lose a job.
+CELERY_BROKER_URL = env("CELERY_BROKER_URL", default="redis://127.0.0.1:6379/0")
+CELERY_RESULT_BACKEND = env("CELERY_RESULT_BACKEND", default=None)
+CELERY_TASK_IGNORE_RESULT = True
+
+# --- delivery semantics ---------------------------------------------------- #
+# Acknowledge *after* the task returns, and hand the message back if the worker
+# process dies. Together these mean at-least-once delivery: a crash re-delivers
+# the job. That is only safe because processing is idempotent. Exactly-once is
+# not a property a broker offers, and this project does not pretend otherwise.
+CELERY_TASK_ACKS_LATE = True
+CELERY_TASK_REJECT_ON_WORKER_LOST = True
+# One message in flight per process. A worker that prefetches a bag of jobs
+# holds them hostage if it dies.
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+
+# --- timeouts and broker resilience ---------------------------------------- #
+CELERY_TASK_TIME_LIMIT = env.int("CELERY_TASK_TIME_LIMIT", default=30 * 60)
+CELERY_TASK_SOFT_TIME_LIMIT = env.int("CELERY_TASK_SOFT_TIME_LIMIT", default=25 * 60)
+# A worker must be able to start while Redis is briefly away, and reconnect.
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+CELERY_BROKER_CONNECTION_MAX_RETRIES = env.int("CELERY_BROKER_CONNECTION_MAX_RETRIES", default=10)
+
+# --- serialization / clock ------------------------------------------------- #
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TIMEZONE = "UTC"
+CELERY_ENABLE_UTC = True
+
+# Eager mode is off by default so an accidental real .delay() fails loudly in a
+# test instead of silently running a load inside a request. Tests opt in per
+# case, or call the task with .apply().
+CELERY_TASK_ALWAYS_EAGER = env.bool("CELERY_TASK_ALWAYS_EAGER", default=False)
+CELERY_TASK_EAGER_PROPAGATES = env.bool("CELERY_TASK_EAGER_PROPAGATES", default=False)
+
+# --- domain knobs the worker reads ----------------------------------------- #
+# A PROCESSING job with no heartbeat for this long is treated as abandoned.
+INGESTION_STALE_AFTER_SECONDS = env.int("INGESTION_STALE_AFTER_SECONDS", default=15 * 60)
+# How often the running task refreshes rows_processed/heartbeat_at.
+INGESTION_HEARTBEAT_SECONDS = env.int("INGESTION_HEARTBEAT_SECONDS", default=5)
+# Retry policy: attempts after the first, and the exponential base in seconds.
+INGESTION_MAX_RETRIES = env.int("INGESTION_MAX_RETRIES", default=5)
+INGESTION_RETRY_BACKOFF_SECONDS = env.int("INGESTION_RETRY_BACKOFF_SECONDS", default=10)
+INGESTION_RETRY_BACKOFF_MAX_SECONDS = env.int(
+    "INGESTION_RETRY_BACKOFF_MAX_SECONDS", default=15 * 60
+)

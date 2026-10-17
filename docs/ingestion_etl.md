@@ -14,6 +14,13 @@ python manage.py ingest_prices `
   --email analyst@example.test
 ```
 
+> The same engine also runs on a Celery worker, for batches too large to hold a
+> request open. The queue endpoint, the job state machine, retries, checkpoints,
+> and stale-job recovery are documented in
+> [celery_async.md](celery_async.md). This document describes the engine itself,
+> which both paths share — the worker calls exactly the `services` functions
+> below.
+
 ## Entry points
 
 `apps/ingestion/services.py` is the only module other layers call; everything
@@ -34,6 +41,8 @@ under `etl/` is implementation.
 |---|---|---|---|
 | `POST` | `/api/v1/ingestion/` | authenticated | create a `pending` job (no file) |
 | `POST` | `/api/v1/ingestion/upload/` | authenticated | upload a file and run the load; returns the job and its report |
+| `POST` | `/api/v1/ingestion/submit/` | authenticated | queue the file for a worker (`202`); see [celery_async.md](celery_async.md) |
+| `POST` | `/api/v1/ingestion/<uuid>/cancel/` | owner | ask a running job to stop at the next chunk |
 | `GET` | `/api/v1/ingestion/<uuid>/report/` | owner | the data-quality report |
 | `GET` | `/api/v1/ingestion/<uuid>/rule-summaries/` | owner | one PASS/FAIL row per rule |
 
@@ -76,7 +85,7 @@ the row is skipped.
 
 **`on_invalid` — what a partly-bad batch means**
 
-- `skip` (default): keep every valid row, report the rest, finish **partial**.
+- `skip` (default): keep every valid row, report the rest, finish **completed_with_errors**.
 - `abort`: one bad row rolls the whole batch back and the job finishes **failed**.
 
 **`on_existing` — what a repeated `(instrument, trading_date)` means**
@@ -131,6 +140,6 @@ python manage.py ingest_prices --file sample_data/synthetic/batches/prices_batch
 python manage.py ingest_prices --file sample_data/synthetic/dirty/prices_dirty.csv --email analyst@example.test
 ```
 
-The six clean batches load 360 rows and finish `succeeded`. The dirty batch
-finishes `partial` with `received=15`, `accepted=2`, `rejected=13`, one finding
+The six clean batches load 360 rows and finish `completed`. The dirty batch
+finishes `completed_with_errors` with `received=15`, `accepted=2`, `rejected=13`, one finding
 per rule as listed in `sample_data/synthetic/EXPECTED_RESULTS.md`.

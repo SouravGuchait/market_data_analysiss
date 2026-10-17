@@ -118,6 +118,72 @@ class IngestionJobUploadAPIView(APIView):
         )
 
 
+class IngestionJobSubmitAPIView(APIView):
+    """Accepts a file, records a job, and hands it to a worker.
+
+    This is the asynchronous twin of ``upload/``. Where that endpoint blocks
+    until the load is done and returns its report, this one stores the file,
+    commits the job, enqueues it, and returns immediately with ``202 Accepted``.
+    The client then polls ``GET /<id>/`` for status, or ``/<id>/report/`` for the
+    data-quality verdict once it is terminal.
+
+    ``created: false`` with ``200 OK`` means the submission was a replay: a
+    client that already sent these exact bytes (or the same ``Idempotency-Key``)
+    gets the original job back rather than a second load. That is what makes a
+    retry after a timeout safe.
+    """
+
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request):
+        serializer = IngestionUploadSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        policy = IngestionPolicy(
+            on_invalid=data["on_invalid"],
+            on_existing=data["on_existing"],
+        )
+
+        try:
+            job, created = services.submit_upload(
+                user=request.user,
+                uploaded_file=data["file"],
+                source_type=data.get("source_type"),
+                sheet_name=data.get("sheet_name"),
+                policy=policy,
+                # A client-supplied key names the *operation*, so a retry maps to
+                # the same job even if the bytes were re-encoded in transit.
+                idempotency_key=request.headers.get("Idempotency-Key") or None,
+            )
+        except (UnsafeFileError, ValueError) as exc:
+            raise ValidationError({"file": [str(exc)]}) from exc
+
+        return Response(
+            {"job": IngestionJobSerializer(job).data, "created": created},
+            status=status.HTTP_202_ACCEPTED if created else status.HTTP_200_OK,
+        )
+
+
+class IngestionJobCancelAPIView(APIView):
+    """Requests cancellation of a job that has not finished.
+
+    Cancellation is cooperative. A pending job is simply marked terminal and is
+    never claimed. A running job is marked terminal too, and the worker notices
+    at its next chunk boundary — so the load stops quickly, but between chunks,
+    not in the middle of a write. Cancelling an already-terminal job is a no-op
+    and returns the job unchanged, which makes the endpoint safe to retry.
+    """
+
+    permission_classes = [IsAuthenticated, IsJobOwner]
+
+    def post(self, request, pk):
+        job = get_object_or_404(services.get_job_queryset(), pk=pk)
+        self.check_object_permissions(request, job)
+        return Response(IngestionJobSerializer(services.cancel_job(job)).data)
+
+
 class IngestionJobRetrieveAPIView(generics.RetrieveAPIView):
     """Retrieves the status of one job.
 
