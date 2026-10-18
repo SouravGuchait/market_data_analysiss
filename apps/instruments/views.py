@@ -1,6 +1,8 @@
 """Instrument endpoints: thin adapters over the services module."""
 from rest_framework import generics
 
+from drf_spectacular.utils import extend_schema
+
 from . import services
 from .filters import InstrumentFilter
 from .serializers import (
@@ -10,6 +12,16 @@ from .serializers import (
 )
 
 
+@extend_schema(
+    tags=["Instruments"],
+    summary="List instruments",
+    description=(
+        "Filter by `symbol`, `exchange`, `asset_type`, and `is_active`; search "
+        "`symbol` or `name`; order by `symbol`, `name`, `asset_type`, or "
+        "`created_at`. Warning: `is_active` accepts only `true`/`false` -- any "
+        "other value is silently ignored."
+    ),
+)
 class InstrumentListAPIView(generics.ListAPIView):
     """Lists instruments, filterable by symbol, exchange, and asset type.
 
@@ -27,6 +39,11 @@ class InstrumentListAPIView(generics.ListAPIView):
         return services.get_instrument_queryset()
 
 
+@extend_schema(
+    tags=["Instruments"],
+    summary="Retrieve an instrument",
+    description="One instrument by primary key, with its exchange nested.",
+)
 class InstrumentRetrieveAPIView(generics.RetrieveAPIView):
     """Retrieves a single instrument with its exchange nested."""
 
@@ -36,6 +53,11 @@ class InstrumentRetrieveAPIView(generics.RetrieveAPIView):
         return services.get_instrument_queryset()
 
 
+@extend_schema(
+    tags=["Instruments"],
+    summary="List exchanges",
+    description="All exchanges. Deliberately unpaginated.",
+)
 class ExchangeListAPIView(generics.ListAPIView):
     """Lists exchanges.
 

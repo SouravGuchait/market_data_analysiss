@@ -18,12 +18,20 @@ from rest_framework import generics
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 
+from drf_spectacular.utils import (
+    OpenApiParameter,
+    OpenApiTypes,
+    PolymorphicProxySerializer,
+    extend_schema,
+)
+
 from apps.common import cache
 from apps.common.views import CachedReadMixin
 from apps.instruments.models import Instrument
 
 from . import services
 from .metrics import MOVING_AVERAGE_NAMES, RANKING_MEASURES, SelectedPeriod
+from .models import AnalyticSnapshot
 from .serializers import (
     AnalyticSnapshotSerializer,
     CumulativeReturnsSerializer,
@@ -45,6 +53,45 @@ from .serializers import (
 logger = logging.getLogger("market_data.analytics")
 
 
+@extend_schema(
+    tags=["Analytics"],
+    summary="Stored metric snapshots for an instrument",
+    description=(
+        "The analytical snapshots the pipeline wrote for one instrument. This "
+        "reads stored rows; the engine computed on demand is "
+        "`/analytics/instruments/{id}/series/`. Filter by `metric_type`, "
+        "`lookback_days`, and an inclusive date range; order by `as_of_date`, "
+        "`metric_type`, or `value`."
+    ),
+    parameters=[
+        OpenApiParameter(
+            name="metric_type",
+            type=OpenApiTypes.STR,
+            location=OpenApiParameter.QUERY,
+            enum=["return", "moving_average", "volatility", "drawdown"],
+            description="Exact metric type.",
+        ),
+        OpenApiParameter(
+            name="lookback_days",
+            type=OpenApiTypes.INT,
+            location=OpenApiParameter.QUERY,
+            description="Exact lookback window in days.",
+        ),
+        OpenApiParameter(
+            name="start_date",
+            type=OpenApiTypes.DATE,
+            location=OpenApiParameter.QUERY,
+            description="Inclusive lower bound (YYYY-MM-DD).",
+        ),
+        OpenApiParameter(
+            name="end_date",
+            type=OpenApiTypes.DATE,
+            location=OpenApiParameter.QUERY,
+            description="Inclusive upper bound (YYYY-MM-DD).",
+        ),
+    ],
+    responses={200: AnalyticSnapshotSerializer(many=True)},
+)
 class AnalyticSnapshotListAPIView(CachedReadMixin, generics.ListAPIView):
     """Lists the analytical metrics recorded for one instrument.
 
@@ -57,6 +104,12 @@ class AnalyticSnapshotListAPIView(CachedReadMixin, generics.ListAPIView):
     snapshot, which bumps the namespace version, so the response is cached
     read-through. See :mod:`apps.common.cache`.
     """
+
+    #: Empty on purpose: DRF uses it for schema introspection and as the default
+    #: queryset, while ``get_queryset()`` below builds the real one. Without it,
+    #: docs generation would call ``get_queryset()`` and fail on the absent URL
+    #: kwarg.
+    queryset = AnalyticSnapshot.objects.none()
 
     serializer_class = AnalyticSnapshotSerializer
     ordering_fields = ["as_of_date", "metric_type", "value"]
@@ -364,6 +417,104 @@ class QueryParameterMixin:
             )
 
 
+#: The response envelope for a computed series: the concrete serializer depends
+#: on ``metric``, so the schema presents them as a ``oneOf``.
+METRIC_SERIES_RESPONSE = PolymorphicProxySerializer(
+    component_name="MetricSeries",
+    serializers=[
+        DailyReturnsSerializer,
+        CumulativeReturnsSerializer,
+        MovingAveragesSerializer,
+        RollingVolatilitySerializer,
+        MaximumDrawdownSerializer,
+        PriceExtremesSerializer,
+        VolumeSummariesSerializer,
+        PercentageChangeSerializer,
+    ],
+    resource_type_field_name=None,
+)
+
+
+@extend_schema(
+    tags=["Analytics"],
+    summary="Compute one metric for one instrument",
+    description=(
+        "Computes one metric on demand from stored prices over an optional date "
+        "range. `metric` selects which one (default `returns`) and the remaining "
+        "parameters are that metric's own inputs. Unpaginated by design: the "
+        "response is one object whose `points` are the series, beside `padding` "
+        "and `undefined`. A parameter the chosen metric does not take is a `400` "
+        "rather than silently ignored."
+    ),
+    parameters=[
+        OpenApiParameter(
+            name="metric",
+            type=OpenApiTypes.STR,
+            location=OpenApiParameter.QUERY,
+            enum=[
+                "returns",
+                "cumulative_returns",
+                "moving_averages",
+                "volatility",
+                "drawdown",
+                "extremes",
+                "volume",
+                "percentage_change",
+            ],
+            description="Which metric to compute. Defaults to `returns`.",
+        ),
+        OpenApiParameter(
+            name="start_date",
+            type=OpenApiTypes.DATE,
+            location=OpenApiParameter.QUERY,
+            description="Inclusive lower bound (YYYY-MM-DD).",
+        ),
+        OpenApiParameter(
+            name="end_date",
+            type=OpenApiTypes.DATE,
+            location=OpenApiParameter.QUERY,
+            description="Inclusive upper bound (YYYY-MM-DD).",
+        ),
+        OpenApiParameter(
+            name="backend",
+            type=OpenApiTypes.STR,
+            location=OpenApiParameter.QUERY,
+            enum=["sql", "python", "pandas"],
+            description=(
+                "Computation backend. Only accepted where the metric has one: "
+                "`cumulative_returns` and `percentage_change` take `python` or "
+                "`pandas`."
+            ),
+        ),
+        OpenApiParameter(
+            name="window",
+            type=OpenApiTypes.INT,
+            location=OpenApiParameter.QUERY,
+            description="`volatility` only: rolling window, at least 2. Default 30.",
+        ),
+        OpenApiParameter(
+            name="names",
+            type=OpenApiTypes.STR,
+            location=OpenApiParameter.QUERY,
+            description=(
+                "`moving_averages` only: comma-separated names from "
+                "`moving_average_7`, `moving_average_30`, `moving_average_90`. "
+                "Defaults to all three."
+            ),
+        ),
+        OpenApiParameter(
+            name="periods",
+            type=OpenApiTypes.STR,
+            location=OpenApiParameter.QUERY,
+            description=(
+                "`percentage_change` only: a JSON array of periods, e.g. "
+                '`[{"label": "q1", "start_date": "2024-01-01", '
+                '"end_date": "2024-03-31"}]`. `label` is optional.'
+            ),
+        ),
+    ],
+    responses={200: METRIC_SERIES_RESPONSE},
+)
 class MetricSeriesAPIView(QueryParameterMixin, generics.GenericAPIView):
     """Computes one metric for one instrument, over an optional date range.
 
@@ -491,6 +642,72 @@ class MetricSeriesAPIView(QueryParameterMixin, generics.GenericAPIView):
         return tuple(periods)
 
 
+@extend_schema(
+    tags=["Analytics"],
+    summary="Rank instruments by one measure",
+    description=(
+        "Cross-sectional comparison: no instrument in the path, because the "
+        "answer is about symbols. `measure` is `return` or `volume` (default "
+        "`return`); `limit` truncates after ranking, so returned rows keep their "
+        "real places. A parameter this endpoint does not take is a `400`."
+    ),
+    parameters=[
+        OpenApiParameter(
+            name="measure",
+            type=OpenApiTypes.STR,
+            location=OpenApiParameter.QUERY,
+            enum=["return", "volume"],
+            description="The measure to rank by. Defaults to `return`.",
+        ),
+        OpenApiParameter(
+            name="instrument_ids",
+            type=OpenApiTypes.STR,
+            location=OpenApiParameter.QUERY,
+            description=(
+                "Comma-separated instrument ids to rank. Defaults to every "
+                "instrument priced in the window."
+            ),
+        ),
+        OpenApiParameter(
+            name="start_date",
+            type=OpenApiTypes.DATE,
+            location=OpenApiParameter.QUERY,
+            description="Inclusive lower bound (YYYY-MM-DD).",
+        ),
+        OpenApiParameter(
+            name="end_date",
+            type=OpenApiTypes.DATE,
+            location=OpenApiParameter.QUERY,
+            description="Inclusive upper bound (YYYY-MM-DD).",
+        ),
+        OpenApiParameter(
+            name="lookback",
+            type=OpenApiTypes.INT,
+            location=OpenApiParameter.QUERY,
+            description="Per-instrument session count (at least 1). Defaults to the whole range.",
+        ),
+        OpenApiParameter(
+            name="descending",
+            type=OpenApiTypes.BOOL,
+            location=OpenApiParameter.QUERY,
+            description="True for best-first. Defaults to true.",
+        ),
+        OpenApiParameter(
+            name="limit",
+            type=OpenApiTypes.INT,
+            location=OpenApiParameter.QUERY,
+            description="Return at most this many rows (at least 0). Defaults to all.",
+        ),
+        OpenApiParameter(
+            name="backend",
+            type=OpenApiTypes.STR,
+            location=OpenApiParameter.QUERY,
+            enum=["python", "pandas"],
+            description="Computation backend. Defaults to `python`.",
+        ),
+    ],
+    responses={200: RankingSerializer},
+)
 class RankingAPIView(QueryParameterMixin, generics.GenericAPIView):
     """Ranks instruments by one measure over one window.
 

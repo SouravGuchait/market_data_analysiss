@@ -112,6 +112,28 @@ job id for the asynchronous ETL. It adds no models and changes none of the
 routes below; see [docs/public_api.md](docs/public_api.md) for the full route
 table, examples, and the synchronous-versus-asynchronous discussion.
 
+### Interactive documentation
+
+The API documents itself at **`/docs/`**: a Swagger UI generated from the views
+and their serializers by
+[drf-spectacular](https://drf-spectacular.readthedocs.io/), so the reference
+cannot drift from the code. Paste an access token into **Authorize** (the JWT
+scheme) to call protected endpoints straight from the browser.
+
+| URL | What it is |
+|---|---|
+| `/docs/` | Swagger UI — browsable, with try-it-out |
+| `/docs/redoc/` | ReDoc — the same schema as continuous prose |
+| `/docs/schema/` | The raw OpenAPI 3 document |
+
+The routes are mounted in `config/urls.py` and served unconditionally; wrap them
+in `if settings.DEBUG:` to keep the schema out of production. Regenerate the
+document without a server:
+
+```powershell
+python manage.py spectacular --file openapi.yaml --validate
+```
+
 | # | Method | Endpoint | Access | Purpose |
 |---|---|---|---|---|
 | 1 | `GET` | `/api/v1/instruments/` | authenticated | list instruments, filter and search |

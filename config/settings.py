@@ -26,6 +26,7 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "rest_framework",
     "rest_framework_simplejwt.token_blacklist",
+    "drf_spectacular",
     "django_filters",
     "apps.accounts.apps.AccountsConfig",
     "apps.common.apps.CommonConfig",
@@ -129,6 +130,9 @@ MEDIA_ROOT = BASE_DIR / "media"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 REST_FRAMEWORK = {
+    # The OpenAPI schema behind /docs/ is generated from the views and their
+    # serializers, so the docs cannot drift from what the API actually serves.
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
     "DEFAULT_PARSER_CLASSES": ["rest_framework.parsers.JSONParser"],
     "DEFAULT_AUTHENTICATION_CLASSES": [
@@ -149,6 +153,74 @@ REST_FRAMEWORK = {
         "rest_framework.filters.OrderingFilter",
         "rest_framework.filters.SearchFilter",
     ],
+}
+
+# --------------------------------------------------------------------------- #
+# OpenAPI schema and interactive docs (/docs/)
+# --------------------------------------------------------------------------- #
+# drf-spectacular derives the schema from the views and serializers, so the
+# documentation is generated from the same code the API runs rather than a
+# hand-written copy that can drift. config/urls.py serves the schema at
+# /docs/schema/ and two readers over it: Swagger UI at /docs/ and ReDoc at
+# /docs/redoc/.
+SPECTACULAR_SETTINGS = {
+    "TITLE": "Market Data Intelligence & Analytics API",
+    "VERSION": "1.0.0",
+    "DESCRIPTION": (
+        "REST API for ingesting market prices, storing them, and computing "
+        "analytics over them.\n\n"
+        "## Authentication\n\n"
+        "Most endpoints require a JWT bearer token. Obtain one from "
+        "`POST /api/v1/auth/login/` (or `register/`) and send it as "
+        "`Authorization: Bearer <access>`. Use the **Authorize** button above to "
+        "paste an access token; Swagger UI then attaches it to every request.\n\n"
+        "`register/`, `login/`, and `token/refresh/` are the only anonymous "
+        "endpoints.\n\n"
+        "## Response envelope\n\n"
+        "Success bodies are the resource itself. Every error is shaped as "
+        '`{"error": {"code": ..., "message": ..., "fields": {...}}}`.\n\n'
+        "## Pagination\n\n"
+        "List endpoints return "
+        '`{"count", "next", "previous", "results"}` and accept `page` and '
+        "`page_size` (default 25, maximum 100). `/instruments/exchanges/` and "
+        "`/ingestion/<uuid>/rule-summaries/` are deliberately unpaginated.\n\n"
+        "## Roles\n\n"
+        "A user is either an `analyst` or an `administrator`. Platform-wide "
+        "reports and the audit log are administrator-only."
+    ),
+    # The schema endpoint is not itself an API resource, so it stays out of the
+    # documented paths.
+    "SERVE_INCLUDE_SCHEMA": False,
+    # Paths are shown without the shared /api/v1 prefix, so the docs read as
+    # resources rather than as a wall of repeated prefixture.
+    "SCHEMA_PATH_PREFIX": "/api/v1",
+    # A request and a response can name the same serializer differently (input
+    # excludes read-only fields), so give each direction its own component.
+    "COMPONENT_SPLIT_REQUEST": True,
+    "SWAGGER_UI_SETTINGS": {
+        # Keep the pasted bearer token across page reloads.
+        "persistAuthorization": True,
+        "filter": True,
+        "displayRequestDuration": True,
+        "tryItOutEnabled": True,
+    },
+    "TAGS": [
+        {"name": "Auth", "description": "Registration, login, tokens, and the current user."},
+        {"name": "Public API", "description": "The flatter facade: /stocks/, /jobs/, and /me/."},
+        {"name": "Instruments", "description": "Reference data: instruments and exchanges."},
+        {"name": "Market Data", "description": "Stored price history."},
+        {"name": "Ingestion", "description": "Upload files, run the ETL, and read a job's data-quality report."},
+        {"name": "Analytics", "description": "Stored metric snapshots and the on-demand metrics engine."},
+        {"name": "Reports", "description": "Aggregates over ingestion activity and the audit log."},
+    ],
+    # Two components call a field `source_type` with different choice sets -- a
+    # job records all five source types, an upload accepts only the three file
+    # formats -- so name them explicitly rather than let the collision be
+    # auto-renamed.
+    "ENUM_NAME_OVERRIDES": {
+        "SourceTypeEnum": "apps.ingestion.models.SourceType.choices",
+        "UploadSourceTypeEnum": ["csv", "json", "xlsx"],
+    },
 }
 
 SIMPLE_JWT = {

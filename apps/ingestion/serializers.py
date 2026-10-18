@@ -130,3 +130,58 @@ class IngestionUploadSerializer(serializers.Serializer):
         except UnsafeFileError as exc:
             raise serializers.ValidationError(str(exc)) from exc
         return value
+
+
+# --------------------------------------------------------------------------- #
+# Output shapes for the interactive API docs (/docs/)
+#
+# The report is a computed document and the upload/submit endpoints return an
+# envelope around a job. None of these has a request serializer that also names
+# them, so they are declared here and referenced from the views'
+# ``@extend_schema``. They are documentation schemas; the views render the same
+# dictionaries the services produce.
+# --------------------------------------------------------------------------- #
+
+
+class JobReportRuleSerializer(serializers.Serializer):
+    rule = serializers.CharField(read_only=True)
+    passed = serializers.IntegerField(read_only=True)
+    failed = serializers.IntegerField(read_only=True)
+    status = serializers.CharField(read_only=True)
+
+
+class JobReportFailureSerializer(serializers.Serializer):
+    row_number = serializers.IntegerField(read_only=True)
+    rule = serializers.CharField(read_only=True)
+    field = serializers.CharField(read_only=True, allow_null=True)
+    detail = serializers.CharField(read_only=True, allow_null=True)
+
+
+class JobReportSerializer(serializers.Serializer):
+    """The data-quality report assembled by ``etl.reporting.job_report``."""
+
+    job_id = serializers.UUIDField(read_only=True)
+    source_type = serializers.CharField(read_only=True)
+    status = serializers.CharField(read_only=True)
+    rows_received = serializers.IntegerField(read_only=True)
+    rows_accepted = serializers.IntegerField(read_only=True)
+    rows_rejected = serializers.IntegerField(read_only=True)
+    error_summary = serializers.CharField(read_only=True, allow_blank=True)
+    started_at = serializers.DateTimeField(read_only=True, allow_null=True)
+    completed_at = serializers.DateTimeField(read_only=True, allow_null=True)
+    rules = JobReportRuleSerializer(many=True, read_only=True)
+    sample_failures = JobReportFailureSerializer(many=True, read_only=True)
+
+
+class IngestionUploadResponseSerializer(serializers.Serializer):
+    """`POST /ingestion/upload/`: the finished job and its report."""
+
+    job = IngestionJobSerializer(read_only=True)
+    report = JobReportSerializer(read_only=True)
+
+
+class IngestionSubmitResponseSerializer(serializers.Serializer):
+    """`POST /ingestion/submit/`: the queued job and whether it was created."""
+
+    job = IngestionJobSerializer(read_only=True)
+    created = serializers.BooleanField(read_only=True)

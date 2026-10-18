@@ -17,7 +17,7 @@ class UserSerializer(serializers.ModelSerializer):
         model = get_user_model()
         fields = ["id", "email", "first_name", "last_name", "roles"]
 
-    def get_roles(self, obj):
+    def get_roles(self, obj) -> list[str]:
         return [obj.role]
 
 
@@ -85,3 +85,52 @@ class LogoutSerializer(serializers.Serializer):
 
     def save(self, **kwargs) -> None:
         RefreshToken(self.validated_data["refresh"]).blacklist()
+
+
+# --------------------------------------------------------------------------- #
+# Output shapes for the interactive API docs (/docs/)
+#
+# Registration and login return a token pair alongside the user, and the usage
+# endpoint returns a computed aggregate rather than a model row. None of them has
+# a request serializer that also describes the response, so they are named here
+# and referenced from the views' ``@extend_schema``. They are documentation
+# schemas: the views render the same dictionaries they always did.
+# --------------------------------------------------------------------------- #
+
+
+class RegistrationResponseSerializer(serializers.Serializer):
+    """`POST /auth/register/`: the created user and a fresh token pair."""
+
+    user = UserSerializer(read_only=True)
+    access = serializers.CharField(read_only=True)
+    refresh = serializers.CharField(read_only=True)
+
+
+class LoginResponseSerializer(serializers.Serializer):
+    """`POST /auth/login/`: the token pair plus the user it belongs to."""
+
+    access = serializers.CharField(read_only=True)
+    refresh = serializers.CharField(read_only=True)
+    user = UserSerializer(read_only=True)
+
+
+class UsageJobsSerializer(serializers.Serializer):
+    total = serializers.IntegerField(read_only=True)
+    by_status = serializers.DictField(child=serializers.IntegerField(), read_only=True)
+    rows_received = serializers.IntegerField(read_only=True)
+    rows_accepted = serializers.IntegerField(read_only=True)
+    rows_rejected = serializers.IntegerField(read_only=True)
+
+
+class UsagePricesSerializer(serializers.Serializer):
+    records_imported = serializers.IntegerField(read_only=True)
+    instruments_covered = serializers.IntegerField(read_only=True)
+    earliest_date = serializers.DateField(read_only=True, allow_null=True)
+    latest_date = serializers.DateField(read_only=True, allow_null=True)
+
+
+class UserUsageSerializer(serializers.Serializer):
+    """`GET /auth/usage/` and `GET /me/analytics/`: the caller's activity summary."""
+
+    jobs = UsageJobsSerializer(read_only=True)
+    prices = UsagePricesSerializer(read_only=True)

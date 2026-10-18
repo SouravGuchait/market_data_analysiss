@@ -13,10 +13,16 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from drf_spectacular.utils import (
+    OpenApiParameter,
+    OpenApiTypes,
+    extend_schema,
+)
+
 from apps.accounts import services as account_services
-from apps.accounts.serializers import UserSerializer
+from apps.accounts.serializers import UserSerializer, UserUsageSerializer
 from apps.analytics import services as analytics_services
-from apps.analytics.models import MetricType
+from apps.analytics.models import AnalyticSnapshot, MetricType
 from apps.analytics.serializers import AnalyticSnapshotSerializer
 from apps.common.permissions import IsJobOwner
 from apps.ingestion import services as ingestion_services
@@ -24,7 +30,9 @@ from apps.ingestion.etl.errors import UnsafeFileError
 from apps.ingestion.etl.pipeline import IngestionPolicy
 from apps.ingestion.serializers import (
     IngestionJobSerializer,
+    IngestionSubmitResponseSerializer,
     IngestionUploadSerializer,
+    JobReportSerializer,
 )
 from apps.instruments import services as instrument_services
 from apps.instruments.filters import InstrumentFilter
@@ -33,10 +41,29 @@ from apps.instruments.serializers import (
     InstrumentListSerializer,
 )
 from apps.marketdata import services as price_services
+from apps.marketdata.models import PriceRecord
 from apps.marketdata.serializers import PriceRecordSerializer
 
 from . import services as api_services
 from .serializers import InstrumentQualitySerializer
+
+
+#: The inclusive `start_date`/`end_date` pair shared by every range-scoped read
+#: in the facade, documented once so the four endpoints that take it agree.
+DATE_RANGE_PARAMETERS = [
+    OpenApiParameter(
+        name="start_date",
+        type=OpenApiTypes.DATE,
+        location=OpenApiParameter.QUERY,
+        description="Inclusive lower bound (YYYY-MM-DD).",
+    ),
+    OpenApiParameter(
+        name="end_date",
+        type=OpenApiTypes.DATE,
+        location=OpenApiParameter.QUERY,
+        description="Inclusive upper bound (YYYY-MM-DD).",
+    ),
+]
 
 
 def parse_date_range(params):
@@ -71,6 +98,11 @@ class StockScopedMixin:
         )
 
 
+@extend_schema(
+    tags=["Public API"],
+    summary="Current user",
+    responses={200: UserSerializer},
+)
 class MeView(APIView):
     """The authenticated caller's own profile.
 
@@ -84,6 +116,12 @@ class MeView(APIView):
         return Response(UserSerializer(request.user).data)
 
 
+@extend_schema(
+    tags=["Public API"],
+    summary="Your activity summary",
+    description="The same activity summary as `GET /api/v1/auth/usage/`.",
+    responses={200: UserUsageSerializer},
+)
 class MeAnalyticsView(APIView):
     """The caller's own activity summary.
 
@@ -98,6 +136,15 @@ class MeAnalyticsView(APIView):
         return Response(account_services.get_user_usage_statistics(request.user))
 
 
+@extend_schema(
+    tags=["Public API"],
+    summary="List stocks",
+    description=(
+        "Filter by `symbol`, `exchange`, `asset_type`, and `is_active`; search "
+        "`symbol` or `name`; order by `symbol`, `name`, `asset_type`, or "
+        "`created_at`. Warning: `is_active` accepts only `true`/`false`."
+    ),
+)
 class StockListAPIView(generics.ListAPIView):
     """Lists stocks, filterable and searchable like the instruments table.
 
@@ -115,6 +162,11 @@ class StockListAPIView(generics.ListAPIView):
         return instrument_services.get_instrument_queryset()
 
 
+@extend_schema(
+    tags=["Public API"],
+    summary="Retrieve a stock by symbol",
+    description="Matched case-insensitively, with the exchange nested.",
+)
 class StockDetailAPIView(StockScopedMixin, generics.RetrieveAPIView):
     """Retrieves one stock by symbol, case-insensitively, with its exchange nested."""
 
@@ -124,6 +176,16 @@ class StockDetailAPIView(StockScopedMixin, generics.RetrieveAPIView):
         return self.get_stock()
 
 
+@extend_schema(
+    tags=["Public API"],
+    summary="Price history for a stock",
+    description=(
+        "One stock's stored prices, optionally bounded by an inclusive date "
+        "range. Order by `trading_date`, `close`, or `volume`."
+    ),
+    parameters=DATE_RANGE_PARAMETERS,
+    responses={200: PriceRecordSerializer(many=True)},
+)
 class StockHistoryAPIView(StockScopedMixin, generics.ListAPIView):
     """Lists one stock's price history, optionally within a date range.
 
@@ -131,6 +193,10 @@ class StockHistoryAPIView(StockScopedMixin, generics.ListAPIView):
     renders only OHLC/volume/source, which is why the queryset is the join-free one
     from the service layer.
     """
+
+    #: Empty queryset for DRF's schema introspection; ``get_queryset()`` below
+    #: resolves the stock from the URL and applies the date range.
+    queryset = PriceRecord.objects.none()
 
     serializer_class = PriceRecordSerializer
     ordering_fields = ["trading_date", "close", "volume"]
@@ -143,12 +209,37 @@ class StockHistoryAPIView(StockScopedMixin, generics.ListAPIView):
         )
 
 
+@extend_schema(
+    tags=["Public API"],
+    summary="Stored metrics for a stock",
+    description=(
+        "The analytical snapshots the pipeline wrote for one stock. Reads stored "
+        "rows; the engine computed on demand is "
+        "`/analytics/instruments/{id}/series/`. Filter by `metric_type` and an "
+        "inclusive date range; order by `as_of_date`, `metric_type`, or `value`."
+    ),
+    parameters=[
+        *DATE_RANGE_PARAMETERS,
+        OpenApiParameter(
+            name="metric_type",
+            type=OpenApiTypes.STR,
+            location=OpenApiParameter.QUERY,
+            enum=["return", "moving_average", "volatility", "drawdown"],
+            description="Exact metric type.",
+        ),
+    ],
+    responses={200: AnalyticSnapshotSerializer(many=True)},
+)
 class StockAnalyticsAPIView(StockScopedMixin, generics.ListAPIView):
     """Lists the analytical snapshots recorded for one stock.
 
     Reads stored metric rows -- the ones the pipeline wrote -- and is not the
     on-demand engine; that lives at ``/analytics/instruments/<id>/series/``.
     """
+
+    #: Empty queryset for DRF's schema introspection; ``get_queryset()`` below
+    #: resolves the stock from the URL and applies the filters.
+    queryset = AnalyticSnapshot.objects.none()
 
     serializer_class = AnalyticSnapshotSerializer
     ordering_fields = ["as_of_date", "metric_type", "value"]
@@ -178,6 +269,17 @@ class StockAnalyticsAPIView(StockScopedMixin, generics.ListAPIView):
         )
 
 
+@extend_schema(
+    tags=["Public API"],
+    summary="Price-coverage review for a stock",
+    description=(
+        "The sessions the exchange was open that this stock has no price for, "
+        "over an optional inclusive range. An omitted range reviews everything "
+        "on file."
+    ),
+    parameters=DATE_RANGE_PARAMETERS,
+    responses={200: InstrumentQualitySerializer},
+)
 class StockQualityAPIView(StockScopedMixin, APIView):
     """Reviews one stock's price coverage over a range.
 
@@ -194,6 +296,29 @@ class StockQualityAPIView(StockScopedMixin, APIView):
         return Response(InstrumentQualitySerializer(quality).data)
 
 
+@extend_schema(
+    tags=["Public API"],
+    summary="Queue an ETL load",
+    description=(
+        "Stores the file, records the job, hands it to a worker, and answers "
+        "`202` with the job to poll. A repeat of the same bytes (or the same "
+        "`Idempotency-Key`) is a `200` replay rather than a second load."
+    ),
+    parameters=[
+        OpenApiParameter(
+            name="Idempotency-Key",
+            type=OpenApiTypes.STR,
+            location=OpenApiParameter.HEADER,
+            required=False,
+            description="Names the operation so a retry maps to the same job.",
+        ),
+    ],
+    request=IngestionUploadSerializer,
+    responses={
+        202: IngestionSubmitResponseSerializer,
+        200: IngestionSubmitResponseSerializer,
+    },
+)
 class JobETLAPIView(APIView):
     """Queues an ETL load and returns the job to poll.
 
@@ -234,6 +359,14 @@ class JobETLAPIView(APIView):
         )
 
 
+@extend_schema(
+    tags=["Public API"],
+    summary="ETL job status",
+    description=(
+        "One job's status and progress. Another user's job is a `403`; a "
+        "missing one is a `404`."
+    ),
+)
 class JobDetailAPIView(generics.RetrieveAPIView):
     """Retrieves one ETL job's status.
 
@@ -254,6 +387,15 @@ class JobDetailAPIView(generics.RetrieveAPIView):
         return job
 
 
+@extend_schema(
+    tags=["Public API"],
+    summary="Data-quality report for a job",
+    description=(
+        "The PASS/FAIL verdict per rule, the row counts, and a sample of the "
+        "rejected rows for one job."
+    ),
+    responses={200: JobReportSerializer},
+)
 class JobQualityAPIView(APIView):
     """Returns the data-quality report for one ETL job.
 

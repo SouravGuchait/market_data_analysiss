@@ -1,7 +1,13 @@
 from django.urls import path
-from rest_framework_simplejwt.views import TokenRefreshView
 
-from .views import LoginView, LogoutView, MeView, RegisterView, UserUsageView
+from .views import (
+    LoginView,
+    LogoutView,
+    MeView,
+    RegisterView,
+    TokenRefreshView,
+    UserUsageView,
+)
 
 
 app_name = "accounts"

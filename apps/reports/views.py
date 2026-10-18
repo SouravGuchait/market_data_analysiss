@@ -19,13 +19,29 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from drf_spectacular.utils import extend_schema
+
 from apps.accounts.permissions import IsAdministrator
 
 from . import services
 from .filters import AuditEventFilter
-from .serializers import AuditEventSerializer
+from .serializers import (
+    AuditEventSerializer,
+    PlatformAnalyticsSerializer,
+    UserAnalyticsSerializer,
+)
 
 
+@extend_schema(
+    tags=["Reports"],
+    summary="Your own ingestion analytics",
+    description=(
+        "Self-scoped: computed from the caller's own jobs, with no path or "
+        "`user` parameter. Outcome buckets, record totals, run times, the most "
+        "recent job, and daily/by-source/by-status counts."
+    ),
+    responses={200: UserAnalyticsSerializer},
+)
 class UserAnalyticsView(APIView):
     """The authenticated user's own ingestion analytics.
 
@@ -43,6 +59,16 @@ class UserAnalyticsView(APIView):
         return Response(services.get_user_analytics(request.user))
 
 
+@extend_schema(
+    tags=["Reports"],
+    summary="Platform-wide ingestion analytics",
+    description=(
+        "Administrator only. The same measurements as `/reports/me/` over every "
+        "job, plus the user leaderboard and a failure summary. An anonymous "
+        "caller gets `401`; an analyst gets `403`."
+    ),
+    responses={200: PlatformAnalyticsSerializer},
+)
 class PlatformAnalyticsView(APIView):
     """Platform-wide ingestion analytics, for administrators only.
 
@@ -62,6 +88,16 @@ class PlatformAnalyticsView(APIView):
         return Response(services.get_platform_analytics())
 
 
+@extend_schema(
+    tags=["Reports"],
+    summary="Audit log",
+    description=(
+        "The paginated, filterable audit log. Administrator only. Filter by "
+        "`action`, `object_type`, `object_id`, `user` (actor email), "
+        "`request_id`, and a `since`/`until` datetime range; search across the "
+        "recorded fields; order by `created_at`, `action`, or `object_type`."
+    ),
+)
 class AuditEventListView(generics.ListAPIView):
     """The paginated audit log, for administrators only.
 

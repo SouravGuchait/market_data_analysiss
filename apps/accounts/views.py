@@ -7,19 +7,51 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
-from rest_framework_simplejwt.views import TokenObtainPairView
+from rest_framework_simplejwt.views import (
+    TokenObtainPairView,
+    TokenRefreshView as SimpleJWTTokenRefreshView,
+)
+
+from drf_spectacular.utils import extend_schema
 
 from apps.common.views import CachedReadMixin
 
 from . import services
 from .serializers import (
-    LogoutSerializer,
+    LoginResponseSerializer,
     LoginSerializer,
+    LogoutSerializer,
     RegisterSerializer,
+    RegistrationResponseSerializer,
     UserSerializer,
+    UserUsageSerializer,
 )
 
 
+@extend_schema(
+    tags=["Auth"],
+    summary="Refresh an access token",
+    description=(
+        "Exchanges a refresh token for a new access token. Refresh tokens are "
+        "rotated on use: the response carries a new `refresh` as well as a new "
+        "`access`, and the previous refresh token is blacklisted."
+    ),
+)
+class TokenRefreshView(SimpleJWTTokenRefreshView):
+    """A named subclass of SimpleJWT's refresh view, only to tag it in the docs."""
+
+
+@extend_schema(
+    tags=["Auth"],
+    summary="Register an account",
+    description=(
+        "Creates a new account -- always with the `analyst` role -- and returns "
+        "the user with a fresh access/refresh token pair. A `role` or `roles` "
+        "field in the body is rejected: roles are changed by an administrator."
+    ),
+    request=RegisterSerializer,
+    responses={201: RegistrationResponseSerializer},
+)
 class RegisterView(CreateAPIView):
     permission_classes = [AllowAny]
     throttle_classes = [ScopedRateThrottle]
@@ -43,6 +75,16 @@ class RegisterView(CreateAPIView):
         )
 
 
+@extend_schema(
+    tags=["Auth"],
+    summary="Log in",
+    description=(
+        "Exchanges `email` and `password` for an access/refresh token pair. "
+        "Login uses **email**, not username. Rate limited to 10 requests/minute."
+    ),
+    request=LoginSerializer,
+    responses={200: LoginResponseSerializer},
+)
 class LoginView(TokenObtainPairView):
     permission_classes = [AllowAny]
     throttle_classes = [ScopedRateThrottle]
@@ -50,6 +92,13 @@ class LoginView(TokenObtainPairView):
     serializer_class = LoginSerializer
 
 
+@extend_schema(
+    tags=["Auth"],
+    summary="Log out",
+    description="Blacklists the supplied refresh token so it cannot be used again.",
+    request=LogoutSerializer,
+    responses={205: None},
+)
 class LogoutView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -60,6 +109,12 @@ class LogoutView(APIView):
         return Response(status=status.HTTP_205_RESET_CONTENT)
 
 
+@extend_schema(
+    tags=["Auth"],
+    summary="Current user",
+    description="The authenticated caller's own profile.",
+    responses={200: UserSerializer},
+)
 class MeView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -67,6 +122,11 @@ class MeView(APIView):
         return Response(UserSerializer(request.user).data)
 
 
+@extend_schema(
+    tags=["Auth"],
+    summary="Usage statistics",
+    responses={200: UserUsageSerializer},
+)
 class UserUsageView(CachedReadMixin, APIView):
     """The authenticated user's own activity summary.
 

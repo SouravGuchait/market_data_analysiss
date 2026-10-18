@@ -14,6 +14,13 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from drf_spectacular.utils import (
+    OpenApiParameter,
+    OpenApiTypes,
+    extend_schema,
+    extend_schema_view,
+)
+
 from apps.audit import services as audit
 from apps.audit.events import AuditAction
 from apps.common.permissions import IsJobOwner
@@ -21,15 +28,64 @@ from apps.common.permissions import IsJobOwner
 from . import services
 from .etl.errors import UnsafeFileError
 from .etl.pipeline import IngestionPolicy
+from .models import IngestionJob, IngestionRuleSummary, IngestionValidationError
 from .serializers import (
     IngestionJobCreateSerializer,
     IngestionJobSerializer,
     IngestionRuleSummarySerializer,
+    IngestionSubmitResponseSerializer,
+    IngestionUploadResponseSerializer,
     IngestionUploadSerializer,
     IngestionValidationErrorSerializer,
+    JobReportSerializer,
 )
 
 
+@extend_schema_view(
+    get=extend_schema(
+        tags=["Ingestion"],
+        summary="List your ingestion jobs",
+        description=(
+            "Only the caller's own jobs are returned -- the queryset is scoped "
+            "to the authenticated user before filtering. Filter by `status` and "
+            "`source_type`; order by `requested_at`, `status`, or `rows_received`."
+        ),
+        parameters=[
+            OpenApiParameter(
+                name="status",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
+                enum=[
+                    "pending",
+                    "processing",
+                    "completed",
+                    "completed_with_errors",
+                    "failed",
+                    "cancelled",
+                ],
+                description="Exact job status.",
+            ),
+            OpenApiParameter(
+                name="source_type",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
+                enum=["csv", "json", "xlsx", "api", "manual"],
+                description="Exact source type.",
+            ),
+        ],
+        responses={200: IngestionJobSerializer(many=True)},
+    ),
+    post=extend_schema(
+        tags=["Ingestion"],
+        summary="Create a job",
+        description=(
+            "Records a job without a file. `source_type` is the only writable "
+            "field; statuses, timestamps, and row counts are never accepted."
+        ),
+        request=IngestionJobCreateSerializer,
+        responses={201: IngestionJobSerializer},
+    ),
+)
 class IngestionJobListCreateAPIView(generics.ListCreateAPIView):
     """Lists the caller's own jobs, and creates a new one.
 
@@ -37,6 +93,10 @@ class IngestionJobListCreateAPIView(generics.ListCreateAPIView):
     never updated or deleted through the API: list and create are the whole
     surface, so the class declares exactly those two actions.
     """
+
+    #: Empty queryset for DRF's schema introspection; ``get_queryset()`` below
+    #: scopes the real one to the caller.
+    queryset = IngestionJob.objects.none()
 
     ordering_fields = ["requested_at", "status", "rows_received"]
     ordering = ["-requested_at"]
@@ -83,6 +143,18 @@ class IngestionJobListCreateAPIView(generics.ListCreateAPIView):
         return Response(IngestionJobSerializer(job).data, status=status.HTTP_201_CREATED)
 
 
+@extend_schema(
+    tags=["Ingestion"],
+    summary="Upload a file and run the load",
+    description=(
+        "Uploads a `multipart/form-data` file and runs the ETL synchronously, "
+        "returning `201` with the finished job and its data-quality report. "
+        "`source_type` is inferred from the extension when omitted. The file is "
+        "validated before the job exists, so a bad file is a `400` and no job."
+    ),
+    request=IngestionUploadSerializer,
+    responses={201: IngestionUploadResponseSerializer},
+)
 class IngestionJobUploadAPIView(APIView):
     """Uploads a source file and runs the synchronous ETL in one request.
 
@@ -151,6 +223,34 @@ class IngestionJobUploadAPIView(APIView):
         )
 
 
+@extend_schema(
+    tags=["Ingestion"],
+    summary="Submit a file to the worker",
+    description=(
+        "The asynchronous twin of `upload/`: stores the file, records the job, "
+        "enqueues it, and returns immediately. `202` for a new job, `200` when "
+        "the `Idempotency-Key` (or the file's SHA-256 by default) matches one "
+        "already submitted by the caller -- a safe retry after a timeout. An "
+        "`api` source cannot be queued."
+    ),
+    parameters=[
+        OpenApiParameter(
+            name="Idempotency-Key",
+            type=OpenApiTypes.STR,
+            location=OpenApiParameter.HEADER,
+            required=False,
+            description=(
+                "Client-supplied key naming the operation. A repeat with the "
+                "same key replays the original job instead of queueing twice."
+            ),
+        ),
+    ],
+    request=IngestionUploadSerializer,
+    responses={
+        202: IngestionSubmitResponseSerializer,
+        200: IngestionSubmitResponseSerializer,
+    },
+)
 class IngestionJobSubmitAPIView(APIView):
     """Accepts a file, records a job, and hands it to a worker.
 
@@ -215,6 +315,17 @@ class IngestionJobSubmitAPIView(APIView):
         )
 
 
+@extend_schema(
+    tags=["Ingestion"],
+    summary="Cancel a job",
+    description=(
+        "Cooperative cancellation: a pending job is marked terminal and never "
+        "claimed; a running job stops at its next chunk boundary. Cancelling an "
+        "already-terminal job is a no-op that returns the job unchanged."
+    ),
+    request=None,
+    responses={200: IngestionJobSerializer},
+)
 class IngestionJobCancelAPIView(APIView):
     """Requests cancellation of a job that has not finished.
 
@@ -248,6 +359,14 @@ class IngestionJobCancelAPIView(APIView):
         return Response(IngestionJobSerializer(job).data)
 
 
+@extend_schema(
+    tags=["Ingestion"],
+    summary="Job status",
+    description=(
+        "One job's status and progress. Another user's job is a `403` (the row "
+        "exists); a missing one is a `404`."
+    ),
+)
 class IngestionJobRetrieveAPIView(generics.RetrieveAPIView):
     """Retrieves the status of one job.
 
@@ -269,6 +388,15 @@ class IngestionJobRetrieveAPIView(generics.RetrieveAPIView):
         return job
 
 
+@extend_schema(
+    tags=["Ingestion"],
+    summary="Data-quality report",
+    description=(
+        "The PASS/FAIL verdict per rule, the row counts, and a sample of the "
+        "rejected rows for one job."
+    ),
+    responses={200: JobReportSerializer},
+)
 class IngestionJobReportAPIView(APIView):
     """Returns the data-quality report for one job.
 
@@ -285,8 +413,29 @@ class IngestionJobReportAPIView(APIView):
         return Response(services.report_for(job))
 
 
+@extend_schema(
+    tags=["Ingestion"],
+    summary="Rejected rows",
+    description=(
+        "The validation errors recorded against one job, in file order. Filter "
+        "by `error_code`; order by `row_number` or `error_code`."
+    ),
+    parameters=[
+        OpenApiParameter(
+            name="error_code",
+            type=OpenApiTypes.STR,
+            location=OpenApiParameter.QUERY,
+            description="Exact error code, e.g. `negative_volume`.",
+        ),
+    ],
+    responses={200: IngestionValidationErrorSerializer(many=True)},
+)
 class IngestionJobValidationErrorListAPIView(generics.ListAPIView):
     """Lists the validation errors recorded against one job."""
+
+    #: Empty queryset for DRF's schema introspection; ``get_queryset()`` below
+    #: resolves the job from the URL.
+    queryset = IngestionValidationError.objects.none()
 
     serializer_class = IngestionValidationErrorSerializer
     ordering_fields = ["row_number", "error_code"]
@@ -301,6 +450,15 @@ class IngestionJobValidationErrorListAPIView(generics.ListAPIView):
         )
 
 
+@extend_schema(
+    tags=["Ingestion"],
+    summary="Rule verdicts",
+    description=(
+        "One PASS/FAIL row per rule for one job. Unpaginated. Order by "
+        "`rule_name`, `passed`, or `failed`."
+    ),
+    responses={200: IngestionRuleSummarySerializer(many=True)},
+)
 class IngestionJobRuleSummaryListAPIView(generics.ListAPIView):
     """Lists the rule-level PASS/FAIL verdicts for one job.
 
@@ -308,6 +466,10 @@ class IngestionJobRuleSummaryListAPIView(generics.ListAPIView):
     one row per rule. A page wrapper around a dozen rows would add noise, the same
     reasoning as the exchanges endpoint.
     """
+
+    #: Empty queryset for DRF's schema introspection; ``get_queryset()`` below
+    #: resolves the job from the URL.
+    queryset = IngestionRuleSummary.objects.none()
 
     serializer_class = IngestionRuleSummarySerializer
     ordering_fields = ["rule_name", "passed", "failed"]
