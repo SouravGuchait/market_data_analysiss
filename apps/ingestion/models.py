@@ -148,6 +148,14 @@ class IngestionJob(models.Model):
                 fields=["created_by", "-requested_at"],
                 name="idx_job_owner_requested",
             ),
+            # The reporting reads group one owner's jobs by status -- the three
+            # outcome buckets and the ``by_status`` breakdown -- and the
+            # platform-wide report groups every job by status. Fixing the owner
+            # and ordering by status inside it turns both into an index read
+            # rather than a scan plus a sort. ``by_source`` and the daily counts
+            # are not served by this index; they are served by the owner filter
+            # plus a sort over the owner's (small) job set.
+            models.Index(fields=["created_by", "status"], name="idx_job_owner_status"),
         ]
 
     @property

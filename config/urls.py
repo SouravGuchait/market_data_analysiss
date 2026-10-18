@@ -13,6 +13,7 @@ urlpatterns = [
     path("api/v1/market-data/", include("apps.marketdata.urls")),
     path("api/v1/ingestion/", include("apps.ingestion.urls")),
     path("api/v1/analytics/", include("apps.analytics.urls")),
+    path("api/v1/reports/", include("apps.reports.urls")),
     # The public facade. Last so the domain namespaces above match first.
     path("api/v1/", include("apps.api.urls")),
 ]

@@ -45,7 +45,7 @@ python manage.py test
 python -m pytest            # both run the same suite via pytest.ini
 ```
 
-429 tests run against in-memory SQLite with a fast MD5 password hasher, so no
+1020 tests run against in-memory SQLite with a fast MD5 password hasher, so no
 MySQL server is needed and the whole suite finishes in a few seconds.
 Development and production stay on MySQL — only `config/settings.py` sees the
 swap, gated on whether tests are running.
@@ -131,6 +131,9 @@ table, examples, and the synchronous-versus-asynchronous discussion.
 | 15 | `GET` | `/api/v1/analytics/instruments/<id>/series/` | authenticated | one metric computed on demand for an instrument |
 | 16 | `GET` | `/api/v1/analytics/rankings/` | authenticated | instruments ranked by one measure |
 | 17 | `GET` | `/api/v1/auth/usage/` | authenticated | activity statistics |
+| 18 | `GET` | `/api/v1/reports/me/` | authenticated | the caller's own ingestion analytics |
+| 19 | `GET` | `/api/v1/reports/platform/` | **administrator** | platform-wide ingestion analytics |
+| 20 | `GET` | `/api/v1/reports/audit-events/` | **administrator** | paginated audit log |
 
 Instruments, prices, and analytics are **read-only** through the API — those
 rows are written by the ingestion pipeline, never by a client. There are two
@@ -269,6 +272,22 @@ were left out.
 > *different* metric, such as `?metric=moving_averages&window=7`. Ignoring it would
 > return a three-series answer that looks like it honoured the window.
 
+**`GET /api/v1/reports/audit-events/`**
+
+| Parameter | Match | Accepted values | Example |
+|---|---|---|---|
+| `action` | exact | any recorded action, e.g. `ingestion.upload_loaded` | `?action=ingestion.upload_loaded` |
+| `object_type` | exact | e.g. `IngestionJob`, `User` | `?object_type=IngestionJob` |
+| `object_id` | exact | the target's id | `?object_id=8f0c2e7a-…` |
+| `user` | exact, **case-insensitive email** | an actor's email | `?user=analyst@example.com` |
+| `request_id` | exact | a request id | `?request_id=req-9` |
+| `since`, `until` | inclusive bounds | ISO 8601 datetime | `?since=2024-03-12T00:00:00Z` |
+| `ordering` | sort | `created_at`, `action`, `object_type`; prefix `-` to reverse | `?ordering=created_at` |
+| `search` | substring | `action`, `object_type`, `object_id`, `request_id`, actor email | `?search=upload` |
+| `page`, `page_size` | pagination | `page_size` ≤ 100 | `?page_size=50` |
+
+Default order is `created_at` descending — newest first. Administrator only.
+
 **Endpoints with no query parameters**
 
 These take path or body parameters only. A `GET` sent with a query string still
@@ -289,6 +308,8 @@ returns `200` — the parameters are simply ignored.
 | `GET /api/v1/ingestion/<uuid>/report/` | path: `uuid` — the report has no parameters |
 | `GET /api/v1/instruments/<id>/` | path: `id` — instrument primary key |
 | `GET /api/v1/instruments/exchanges/` | none — and deliberately **unpaginated** |
+| `GET /api/v1/reports/me/` | none — the report is about the caller, so there is nothing to name |
+| `GET /api/v1/reports/platform/` | none — administrator only, and it aggregates everything |
 
 **Pagination on every list.** `PageNumberPagination`, `page_size=25` by default,
 `max_page_size=100`, overridable with `?page_size=`. Responses are always
@@ -668,6 +689,43 @@ Every list joins its foreign keys through `select_related` in the service layer,
 so query counts stay constant rather than growing with page size — asserted in
 tests via `assertNumQueries` (3 for instruments, 4 for prices, 2 for job detail).
 
+### Reporting
+
+`apps/reports` answers questions *about* the data the pipeline produced rather
+than serving it. It has **no models** — every report is an aggregate over rows
+another app owns — and it is read-only and uncached.
+
+| Method | Endpoint | Access | Purpose |
+|---|---|---|---|
+| `GET` | `/api/v1/reports/me/` | authenticated, **self-scoped** | the caller's own ingestion analytics |
+| `GET` | `/api/v1/reports/platform/` | **administrator only** | platform-wide aggregates and failure summaries |
+| `GET` | `/api/v1/reports/audit-events/` | **administrator only** | paginated audit log |
+
+The per-user report returns the job outcome buckets (successful, partially
+successful, failed), the record totals, the average and maximum run time, the most
+recent job, daily job counts, and counts grouped by source and status — all from
+Django ORM annotations and aggregations, in a constant five queries. There is no
+path parameter and no `user` query parameter: the report is built from
+`filter(created_by=request.user)`, so another user's jobs are never selected.
+
+The platform report takes the same measurements over every job and adds the user
+leaderboard and a failure summary (the failed count, the most recent failures with
+their error lines, and the validation rules ranked by rows rejected), in a
+constant seven queries. It is guarded by `IsAuthenticated, IsAdministrator`, so an
+anonymous caller gets `401` and an analyst `403`.
+
+The audit log is the one report that returns stored rows rather than an aggregate:
+a paginated, filterable, administrator-only page of `AuditEvent`s. It is what the
+rest of the application *writes* into — an append-only record of a recalled set of
+operations (job created/queued, upload loaded, job cancelled, role changed; the
+exact vocabulary is in `apps/audit/events.py`) — and it is read back here. Nothing
+sensitive can be written to it: `record_event` sanitizes every event's metadata
+through a deny-list of credential keys before the row is stored. See
+[docs/reports.md](docs/reports.md) for the sample dataset, the expected page, the
+API examples, and the design notes (conditional aggregation, one-to-many join
+inflation, `rows_received` versus `rows_processed`, and audit events versus logs
+versus job status).
+
 ## Ingestion ETL
 
 Price batches are loaded synchronously by `apps.ingestion.etl` — one pipeline for
@@ -757,7 +815,7 @@ Instrument 1 ──────< AnalyticSnapshot   (CASCADE, a snapshot is wort
 | `IngestionValidationError` | `BigAutoField` | `error_code` indexed |
 | `IngestionRuleSummary` | `BigAutoField` | unique `(job, rule_name)` — one PASS/FAIL row per rule |
 | `AnalyticSnapshot` | `BigAutoField` | unique `(instrument, as_of_date, metric_type, lookback_days)` |
-| `AuditEvent` | `BigAutoField` | `request_id` indexed |
+| `AuditEvent` | `BigAutoField` | `request_id` indexed; `(user, -created_at)` and `(-created_at)` indexed |
 
 **Deletion policy, decided per relationship rather than globally:**
 
@@ -807,11 +865,12 @@ market_data_analysiss/
 │   ├── accounts/             # Custom user model, login, roles
 │   ├── analytics/            # AnalyticSnapshot
 │   ├── api/                  # Public facade: /stocks/, /jobs/, /me/
-│   ├── audit/                # AuditEvent
+│   ├── audit/                # AuditEvent: append-only, records + sanitizes actions
 │   ├── common/               # Shared permissions and the error envelope
 │   ├── ingestion/            # IngestionJob, IngestionFile, IngestionValidationError, IngestionRuleSummary
 │   ├── instruments/          # Exchange, Instrument
-│   └── marketdata/           # PriceRecord, TradingCalendar
+│   ├── marketdata/           # PriceRecord, TradingCalendar
+│   └── reports/              # Read-only reporting: user, platform, audit log
 ├── scripts/                  # Local utility scripts, including sample-data generation
 ├── templates/                # Project-wide templates
 ├── static/                   # Source static assets
@@ -837,7 +896,15 @@ market_data_analysiss/
   `IngestionValidationError` (one per rejected row), and `IngestionRuleSummary`
   (one PASS/FAIL per rule) children.
 - `apps/analytics/`: `AnalyticSnapshot`, one metric per instrument, date, and lookback.
-- `apps/audit/`: `AuditEvent`, append-only records of privileged actions.
+- `apps/audit/`: `AuditEvent`, append-only records of privileged actions. The
+  write path is `apps.audit.services.record_event` (guarded by the event
+  vocabulary and the never-log sanitizer in `apps/audit/events.py`); the read path
+  is the audit-log report.
+- `apps/reports/`: read-only reporting — the per-user (`/api/v1/reports/me/`),
+  platform (`/api/v1/reports/platform/`, administrator only), and audit-log
+  (`/api/v1/reports/audit-events/`, administrator only) endpoints documented in
+  [docs/reports.md](docs/reports.md). No models: each report aggregates rows
+  another app owns, or pages them.
 - `templates/`, `static/`, and `media/`: project templates, static assets, and local uploaded media.
 - `.env`: ignored local configuration. `.env.example`: safe key-only template.
 
