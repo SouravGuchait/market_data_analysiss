@@ -727,6 +727,20 @@ See [docs/celery_async.md](docs/celery_async.md) for the state machine, the retr
 classification, the nine failure scenarios and how each is tested, the
 transaction boundaries, and the measured performance on large files.
 
+## Ingestion ETL
+
+Price batches are loaded synchronously by `apps.ingestion.etl` — one pipeline for
+CSV, JSON, XLSX, and API sources, with per-rule PASS/FAIL reporting and a job row
+for every run. Run it from the shell:
+
+```powershell
+python manage.py ingest_prices --file path\to\prices.csv --email analyst@example.test
+```
+
+Row rejection, duplicate handling, and the transaction boundary are decided by an
+explicit `IngestionPolicy`. See [docs/ingestion_etl.md](docs/ingestion_etl.md) for
+the module contracts, the rules, and the sample-dataset results.
+
 ## Database schema
 
 The shape is a star schema: `Instrument` is the

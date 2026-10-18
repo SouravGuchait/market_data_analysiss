@@ -10,6 +10,7 @@ class SourceType(models.TextChoices):
     CSV = "csv", "CSV"
     JSON = "json", "JSON"
     XLSX = "xlsx", "Excel workbook"
+    XLSX = "xlsx", "Excel workbook"
     API = "api", "API"
     MANUAL = "manual", "Manual"
 
@@ -220,10 +221,49 @@ class IngestionValidationError(models.Model):
             # "Show me every row that failed this rule" is the main access path.
             models.Index(fields=["error_code"], name="idx_validation_error_code"),
             models.Index(fields=["job", "row_number"], name="idx_validation_job_row"),
+            models.Index(fields=["job", "row_number"], name="idx_validation_job_row"),
         ]
 
     def __str__(self):
         return f"{self.error_code} at row {self.row_number}"
+
+
+class RuleStatus(models.TextChoices):
+    PASS = "pass", "PASS"
+    FAIL = "fail", "FAIL"
+
+
+class IngestionRuleSummary(models.Model):
+    """How one rule fared across one job: rows that passed it, rows that failed.
+
+    This is the rule-level PASS/FAIL record. Per-row failure detail lives in
+    ``IngestionValidationError``; a row with no failure for a rule is, by
+    construction, a pass for that rule, so storing a row per (row, rule) would
+    be redundant bulk. Counting is cheap and answers "did this rule hold?".
+    """
+
+    job = models.ForeignKey(
+        IngestionJob, on_delete=models.CASCADE, related_name="rule_summaries"
+    )
+    rule_name = models.CharField(max_length=64)
+    passed = models.PositiveIntegerField(default=0)
+    failed = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["rule_name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["job", "rule_name"], name="uniq_rule_summary_job_rule"
+            ),
+        ]
+
+    @property
+    def status(self):
+        """FAIL if any row failed this rule, otherwise PASS."""
+        return RuleStatus.PASS if self.failed == 0 else RuleStatus.FAIL
+
+    def __str__(self):
+        return f"{self.rule_name}: {self.passed} pass / {self.failed} fail"
 
 
 class RuleStatus(models.TextChoices):

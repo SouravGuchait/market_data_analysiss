@@ -6,6 +6,12 @@ from .models import (
     IngestionRuleSummary,
     IngestionValidationError,
 )
+from .models import (
+    IngestionFile,
+    IngestionJob,
+    IngestionRuleSummary,
+    IngestionValidationError,
+)
 
 
 class IngestionFileInline(admin.TabularInline):
@@ -16,6 +22,14 @@ class IngestionFileInline(admin.TabularInline):
 class ValidationErrorInline(admin.TabularInline):
     model = IngestionValidationError
     extra = 0
+    fields = ("row_number", "field_name", "error_code", "detail")
+
+
+class RuleSummaryInline(admin.TabularInline):
+    model = IngestionRuleSummary
+    extra = 0
+    fields = ("rule_name", "passed", "failed")
+    readonly_fields = ("rule_name", "passed", "failed")
     fields = ("row_number", "field_name", "error_code", "detail")
 
 
@@ -79,6 +93,14 @@ class IngestionValidationErrorAdmin(admin.ModelAdmin):
     list_display = ("job", "row_number", "field_name", "error_code")
     list_filter = ("error_code",)
     search_fields = ("job__id", "error_code")
+    raw_id_fields = ("job",)
+
+
+@admin.register(IngestionRuleSummary)
+class IngestionRuleSummaryAdmin(admin.ModelAdmin):
+    list_display = ("job", "rule_name", "passed", "failed")
+    list_filter = ("rule_name",)
+    search_fields = ("job__id", "rule_name")
     raw_id_fields = ("job",)
 
 
