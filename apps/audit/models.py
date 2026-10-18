@@ -34,6 +34,15 @@ class AuditEvent(models.Model):
     class Meta:
         ordering = ["-created_at"]
         indexes = [
+            # The administrator's log is the whole table, newest first, with no
+            # owner filter -- and this is the one table in the project that grows
+            # without bound. ``idx_audit_user_created`` cannot serve that read,
+            # because a leading ``user`` column is exactly what an unfiltered
+            # listing does not have; without this index the default page sorts
+            # every row before returning any. Measured, not assumed: see
+            # docs/reports.md (report 3), where the plan goes from
+            # ``USE TEMP B-TREE FOR ORDER BY`` to an ordered index scan.
+            models.Index(fields=["-created_at"], name="idx_audit_created"),
             # "Everything user X did, newest first" and "what happened to
             # object Y" are the two questions asked of this table.
             models.Index(

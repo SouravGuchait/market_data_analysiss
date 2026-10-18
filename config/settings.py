@@ -33,6 +33,7 @@ INSTALLED_APPS = [
     "apps.ingestion.apps.IngestionConfig",
     "apps.analytics.apps.AnalyticsConfig",
     "apps.audit.apps.AuditConfig",
+    "apps.reports.apps.ReportsConfig",
 ]
 
 MIDDLEWARE = [

@@ -14,6 +14,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.audit import services as audit
+from apps.audit.events import AuditAction
 from apps.common.permissions import IsJobOwner
 
 from . import services
@@ -67,6 +69,17 @@ class IngestionJobListCreateAPIView(generics.ListCreateAPIView):
             source_type=serializer.validated_data["source_type"],
         )
 
+        # The creation is the auditable decision; the load it later triggers is a
+        # separate operation. Recorded after the job exists, so the row names a
+        # real object id.
+        audit.record_event(
+            action=AuditAction.JOB_CREATED,
+            request=request,
+            object_type="IngestionJob",
+            object_id=job.pk,
+            metadata={"source_type": job.source_type},
+        )
+
         return Response(IngestionJobSerializer(job).data, status=status.HTTP_201_CREATED)
 
 
@@ -108,6 +121,26 @@ class IngestionJobUploadAPIView(APIView):
             # source type could not be resolved. Either way it is the client's
             # input, not a server fault.
             raise ValidationError({"file": [str(exc)]}) from exc
+
+        # A synchronous load is one auditable operation: the file arrived and was
+        # loaded in the same request. The outcome and the policy decisions travel
+        # in the metadata, so the log answers "what did this upload actually do"
+        # without a second query.
+        audit.record_event(
+            action=AuditAction.UPLOAD_LOADED,
+            request=request,
+            object_type="IngestionJob",
+            object_id=result.job.pk,
+            metadata={
+                "source_type": result.job.source_type,
+                "status": result.job.status,
+                "on_invalid": policy.on_invalid,
+                "on_existing": policy.on_existing,
+                "rows_received": result.job.rows_received,
+                "rows_accepted": result.job.rows_accepted,
+                "rows_rejected": result.job.rows_rejected,
+            },
+        )
 
         return Response(
             {
@@ -160,6 +193,22 @@ class IngestionJobSubmitAPIView(APIView):
         except (UnsafeFileError, ValueError) as exc:
             raise ValidationError({"file": [str(exc)]}) from exc
 
+        # Only the call that *created* the job records an event. A replay is not a
+        # new decision -- nothing was queued and nothing changed -- and logging it
+        # would let a retry loop fill the trail with duplicates of one operation.
+        if created:
+            audit.record_event(
+                action=AuditAction.JOB_QUEUED,
+                request=request,
+                object_type="IngestionJob",
+                object_id=job.pk,
+                metadata={
+                    "source_type": job.source_type,
+                    "on_invalid": policy.on_invalid,
+                    "on_existing": policy.on_existing,
+                },
+            )
+
         return Response(
             {"job": IngestionJobSerializer(job).data, "created": created},
             status=status.HTTP_202_ACCEPTED if created else status.HTTP_200_OK,
@@ -181,7 +230,22 @@ class IngestionJobCancelAPIView(APIView):
     def post(self, request, pk):
         job = get_object_or_404(services.get_job_queryset(), pk=pk)
         self.check_object_permissions(request, job)
-        return Response(IngestionJobSerializer(services.cancel_job(job)).data)
+
+        # Cancelling an already-terminal job is a no-op and is not recorded: the
+        # log records decisions, and "do nothing, it is already cancelled" is not
+        # one. The status before the call is what makes that distinction.
+        was_active = not job.is_terminal
+        job = services.cancel_job(job)
+        if was_active:
+            audit.record_event(
+                action=AuditAction.JOB_CANCELLED,
+                request=request,
+                object_type="IngestionJob",
+                object_id=job.pk,
+                metadata={"source_type": job.source_type},
+            )
+
+        return Response(IngestionJobSerializer(job).data)
 
 
 class IngestionJobRetrieveAPIView(generics.RetrieveAPIView):
