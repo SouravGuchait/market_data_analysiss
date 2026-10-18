@@ -106,6 +106,12 @@ except `register`, `login`, and `token/refresh`. Each app owns its URL namespace
 (`app_name` in `urls.py`), so routes are referenced as
 `reverse("instruments:list")` rather than by hardcoded path.
 
+A flatter public surface — `/api/v1/stocks/`, `/api/v1/jobs/`, `/api/v1/me/` —
+sits on top of these same services, keyed by symbol for stocks and returning a
+job id for the asynchronous ETL. It adds no models and changes none of the
+routes below; see [docs/public_api.md](docs/public_api.md) for the full route
+table, examples, and the synchronous-versus-asynchronous discussion.
+
 | # | Method | Endpoint | Access | Purpose |
 |---|---|---|---|---|
 | 1 | `GET` | `/api/v1/instruments/` | authenticated | list instruments, filter and search |
@@ -800,6 +806,7 @@ market_data_analysiss/
 ├── apps/
 │   ├── accounts/             # Custom user model, login, roles
 │   ├── analytics/            # AnalyticSnapshot
+│   ├── api/                  # Public facade: /stocks/, /jobs/, /me/
 │   ├── audit/                # AuditEvent
 │   ├── common/               # Shared permissions and the error envelope
 │   ├── ingestion/            # IngestionJob, IngestionFile, IngestionValidationError, IngestionRuleSummary
@@ -819,6 +826,9 @@ market_data_analysiss/
 - `config/`: project-level settings, URL routing, and ASGI/WSGI server entry points.
 - `apps/accounts/`: the custom `User` model (email login), JWT endpoints, and the
   analyst/administrator role field.
+- `apps/api/`: the public facade (`/stocks/`, `/jobs/`, `/me/`) — thin views with
+  no models, delegating to the domain services. Documented in
+  [docs/public_api.md](docs/public_api.md).
 - `apps/common/`: `IsOwner` for object-level ownership checks and the single
   `{"error": {...}}` response envelope used by every endpoint.
 - `apps/instruments/`: `Exchange` and `Instrument`, the reference-data dimension table.

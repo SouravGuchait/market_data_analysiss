@@ -13,6 +13,8 @@ urlpatterns = [
     path("api/v1/market-data/", include("apps.marketdata.urls")),
     path("api/v1/ingestion/", include("apps.ingestion.urls")),
     path("api/v1/analytics/", include("apps.analytics.urls")),
+    # The public facade. Last so the domain namespaces above match first.
+    path("api/v1/", include("apps.api.urls")),
 ]
 
 if settings.DEBUG:

@@ -561,6 +561,25 @@ def load_price_series(
     return series
 
 
+def calendar_sessions(instrument, start_date: date, end_date: date):
+    """The calendar sessions open to one instrument over a date range.
+
+    Returns a queryset of :class:`~apps.marketdata.models.TradingCalendar` rows,
+    so a caller may count it or exclude the priced dates from it. The optional
+    exchange on a calendar row is honoured: a row scoped to another exchange is
+    not this instrument's session, while an unscoped row applies to all of them.
+    Defined once because both :func:`missing_trading_dates` and the quality
+    summary need the same scope; two copies could disagree about which sessions
+    existed.
+    """
+    calendar = TradingCalendar.objects.filter(date__gte=start_date, date__lte=end_date)
+    if instrument.exchange_id is not None:
+        calendar = calendar.filter(
+            Q(exchange_id=instrument.exchange_id) | Q(exchange__isnull=True)
+        )
+    return calendar
+
+
 def missing_trading_dates(
     instrument,
     start_date: date,
@@ -581,16 +600,13 @@ def missing_trading_dates(
     One query, and it is a join the database does well: the calendar is small and
     the price side is an index range scan.
     """
-    calendar = TradingCalendar.objects.filter(date__gte=start_date, date__lte=end_date)
-    if instrument.exchange_id is not None:
-        calendar = calendar.filter(
-            Q(exchange_id=instrument.exchange_id) | Q(exchange__isnull=True)
-        )
-
     covered = PriceRecord.objects.filter(
         instrument=instrument, trading_date__gte=start_date, trading_date__lte=end_date
     ).values("trading_date")
 
     return list(
-        calendar.exclude(date__in=covered).order_by("date").values_list("date", flat=True)
+        calendar_sessions(instrument, start_date, end_date)
+        .exclude(date__in=covered)
+        .order_by("date")
+        .values_list("date", flat=True)
     )
