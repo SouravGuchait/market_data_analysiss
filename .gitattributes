@@ -1,0 +1,16 @@
+# Shell scripts must reach the image with LF endings. Docker runs the shebang
+# literally, so a CRLF file copied from a Windows checkout fails with
+# "/bin/sh^M: bad interpreter" at container start.
+*.sh text eol=lf
+
+# Dockerfiles and compose files are read by tooling on any platform; normalise.
+Dockerfile text eol=lf
+Dockerfile.* text eol=lf
+*.dockerfile text eol=lf
+docker-compose*.yml text eol=lf
+docker-compose*.yaml text eol=lf
+
+# Makefiles are tab-sensitive and GNU make treats a stray CR as part of the
+# recipe, so keep them LF even on a Windows checkout.
+Makefile text eol=lf
+*.mk text eol=lf

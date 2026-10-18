@@ -38,6 +38,43 @@ python manage.py check --database default
 python manage.py runserver
 ```
 
+## Running with Docker
+
+The whole stack — Django, MySQL, Redis, and a Celery worker — runs from
+`docker-compose.yml`, with development conveniences layered by
+`docker-compose.override.yml` (bind-mounted source, `DEBUG`, published ports).
+
+```powershell
+Copy-Item .env.example .env         # fill in the secrets
+docker compose up --build           # migrate runs first and gates web + worker
+```
+
+Then: `http://127.0.0.1:8000/docs/` (API docs), `/admin/`, and the probes
+`/healthz` (liveness) and `/readyz` (readiness, per-dependency).
+
+For routine work, `scripts/dev.ps1` (PowerShell) and `Makefile` provide the same
+commands under short names — `dev_build`, `dev_up`, `dev_rebuild`, `dev_down`,
+`dev_logs`, `dev_ps`, `dev_shell`, `dev_manage`, `dev_migrate`, `dev_test`,
+`dev_clean`, plus `prod_config`/`prod_build`/`prod_up`/`prod_rebuild`/`prod_down`.
+Dot-source once and use them directly:
+
+```powershell
+. .\scripts\dev.ps1
+dev_build                     # build the image
+dev_up                        # start the stack, detached
+dev_manage createsuperuser    # any manage.py command
+dev_manage ingestion_status   # database / broker / queue
+dev_logs                      # follow the logs
+dev_down                      # stop (keep data)
+```
+
+(With GNU make installed it is `make dev_up`, `make dev_test`, and so on.)
+
+`docker-compose.yml` alone is the production shape (`prod_config` renders it).
+Full instructions — health checks, dev-versus-prod, the shortcut table, backups
+and recovery, schema-migration risks, and AWS notes — are in
+[docs/docker_deployment.md](docs/docker_deployment.md).
+
 ## Running tests
 
 ```powershell
@@ -992,10 +1029,16 @@ market_data_analysiss/
 │   ├── instruments/          # Exchange, Instrument
 │   ├── marketdata/           # PriceRecord, TradingCalendar
 │   └── reports/              # Read-only reporting: user, platform, audit log
-├── scripts/                  # Local utility scripts, including sample-data generation
+├── scripts/                  # Utility scripts: dev.ps1 shortcuts, bench, sample data
 ├── templates/                # Project-wide templates
 ├── static/                   # Source static assets
 ├── media/                    # Local user-upload destination; ignored by Git
+├── docker/                   # Container entrypoint
+├── Dockerfile                # Application image (web, worker, migrate share it)
+├── docker-compose.yml        # Production-shaped service graph
+├── docker-compose.override.yml  # Development overlay (bind mount, DEBUG, ports)
+├── .dockerignore             # Keeps secrets and generated state out of the image
+├── Makefile                  # dev_*/prod_* shortcuts for the compose stack
 ├── .env                      # Local secrets/configuration; ignored by Git
 ├── .env.example              # Safe environment-variable template
 ├── requirements.txt          # Python dependency constraints
@@ -1050,14 +1093,44 @@ python manage.py startapp analytics apps\analytics
 python manage.py startapp audit apps\audit
 python manage.py startapp common apps\common
 ```
-Progress that I've made:
-initialized a clean app-based project structure.
-Explaind which files Django generates and which folders we create ourselves.
-Set up the config package and the initial Django settings.
-Configure environment variables using a .env file locally and provide a safe .env.example.
-Configured MySQL, static/media settings, logging, and installed apps.
-Create a requirements.txt with compatible, deliberately selected dependency versions.
-Provide a .gitignore and explain what must never be committed.
-Add a minimal smoke test and the commands to run it.
-Use small steps. For each file, explain its purpose and provide the complete contents. Do not introduce Celery tasks, business logic, or all database models yet.
-Never hardcoded real credentials. Verify that the project starts, the database connection works, and the health check passes before proceeding.
+
+## Personal progress
+
+### Bootstrap
+
+- [x] Initialized a clean app-based project structure.
+- [x] Explained which files Django generates and which folders we create ourselves.
+- [x] Set up the `config` package and the initial Django settings.
+- [x] Configured environment variables using a `.env` file locally and provided a safe `.env.example`.
+- [x] Configured MySQL, static/media settings, logging, and installed apps.
+- [x] Created a `requirements.txt` with compatible, deliberately selected dependency versions.
+- [x] Provided a `.gitignore` and explained what must never be committed.
+- [x] Added a minimal smoke test and the commands to run it.
+- [x] Used small steps: for each file, explained its purpose and provided the complete contents, without introducing Celery tasks, business logic, or all the database models at once.
+- [x] Never hardcoded real credentials; verified that the project starts, the database connection works, and the health check passes before proceeding.
+
+### Authentication and foundation
+
+- [x] Built the custom `User` with email login and the `analyst` / `administrator` roles.
+- [x] Added JWT authentication: register, login, logout, token refresh, `me`, and usage.
+- [x] Added `apps/common`: the single `{"error": {...}}` response envelope, ownership permissions, and the shared pagination class.
+
+### Domain apps
+
+- [x] Built the reference-data reads: `Exchange` and `Instrument`, with filter, search, and ordering.
+- [x] Built the market-data fact table `PriceRecord` and the price-history endpoint.
+- [x] Built the ingestion ETL: one pipeline for CSV, JSON, XLSX, and API sources, with per-rule PASS/FAIL reporting, an explicit ingestion policy, and the job, file, validation-error, and rule-summary models.
+- [x] Moved large loads onto Celery workers over Redis: submit and cancel, idempotent submission, retries, heartbeats, and recovery — the job row stays the source of truth.
+- [x] Built the analytics engine: daily and cumulative returns, moving averages, rolling volatility, maximum drawdown, price extremes, volume summaries, percentage change, and cross-sectional rankings — stored snapshots plus an on-demand, multi-backend (SQL / Python / Pandas) surface.
+- [x] Built read-only reporting: per-user and platform analytics, and the append-only, sanitized audit log.
+
+### Cross-cutting concerns
+
+- [x] Added observability: a trace id on every request, one latency log line per request, slow-request escalation, and rotating log files.
+- [x] Added a read-through Redis cache with stampede control that degrades to the database on any cache error.
+- [x] Added the flat public API facade — `/api/v1/stocks/`, `/api/v1/jobs/`, `/api/v1/me/` — over the same services.
+
+### Quality
+
+- [x] Grew the suite past 1,000 tests, run against in-memory SQLite with no MySQL or broker required.
+- [x] Generated the API documentation from the code: an OpenAPI 3 schema served as Swagger UI at `/docs/`, with ReDoc at `/docs/redoc/` and the raw document at `/docs/schema/`.

@@ -1,0 +1,42 @@
+# Keep the build context small and, more importantly, keep secrets and generated
+# state out of the image. Copying .env into a layer would bake credentials into
+# the image history even if a later layer removed the file.
+.git
+.gitignore
+.gitattributes
+
+# Secrets -- never in an image. Compose injects them at run time instead.
+.env
+.env.*
+!.env.example
+
+# Local virtualenvs and Python caches
+venv/
+.venv/
+validation_venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Test, lint, and coverage artifacts
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Generated / runtime state
+logs/
+media/
+staticfiles/
+outputs/
+work/
+*.log
+
+# Editor and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Documentation of past benchmark runs is not needed at run time.
+docs/benchmarks/

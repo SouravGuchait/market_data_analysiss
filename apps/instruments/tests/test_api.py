@@ -1,6 +1,6 @@
 """Tests for the instrument endpoints."""
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
 from apps.common.tests.mixins import AuthenticatedAPITestCase
 from apps.instruments import services
@@ -89,6 +89,7 @@ class InstrumentListTests(AuthenticatedAPITestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["count"], 2)
         self.assertEqual(response.data["results"][0]["symbol"], "AAPL")
+
 
     def test_list_requires_authentication(self):
         self.assertEqual(self.client.get("/api/v1/instruments/").status_code, 401)
@@ -225,6 +226,22 @@ class InstrumentListTests(AuthenticatedAPITestCase):
         # exercised without needing more than 100 fixtures.
         self.assertEqual(len(response.data["results"]), 7)
 
+
+class InstrumentListTests(AuthenticatedAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.nasdaq = Exchange.objects.create(
+            code="NASDAQ", name="Nasdaq", timezone="America/New_York"
+        )
+        self.aapl = Instrument.objects.create(
+            symbol="AAPL", name="Apple Inc.", asset_type=AssetType.EQUITY,
+            exchange=self.nasdaq, currency="USD",
+        )
+        self.spy = Instrument.objects.create(
+            symbol="SPY", name="SPDR S&P 500 ETF Trust", asset_type=AssetType.ETF,
+            exchange=self.nasdaq, currency="USD",
+        )
+
     def test_an_unknown_query_parameter_is_ignored(self):
         response = self.get_as(self.user, "/api/v1/instruments/?bogus=1&another=2")
 
@@ -282,3 +299,38 @@ class ExchangeListTests(AuthenticatedAPITestCase):
         self.assertEqual(
             self.client.get("/api/v1/instruments/exchanges/").status_code, 401
         )
+
+
+@override_settings(API_CACHE_ENABLED=True)
+class ReferenceCacheTests(AuthenticatedAPITestCase):
+    def setUp(self):
+        super().setUp()
+        self.exchange = Exchange.objects.create(
+            code="NASDAQ", name="Nasdaq", timezone="America/New_York"
+        )
+        Instrument.objects.create(
+            symbol="AAPL", name="Apple Inc.", asset_type=AssetType.EQUITY,
+            exchange=self.exchange, currency="USD",
+        )
+
+    def test_instrument_list_repeats_from_cache(self):
+        first = self.get_as(self.user, "/api/v1/instruments/")
+        second = self.get_as(self.user, "/api/v1/instruments/")
+
+        self.assertEqual(first["X-Cache"], "MISS")
+        self.assertEqual(second["X-Cache"], "HIT")
+        self.assertEqual(first.content, second.content)
+
+    def test_reference_write_invalidates_cached_list(self):
+        self.assertEqual(
+            self.get_as(self.user, "/api/v1/instruments/")["X-Cache"], "MISS"
+        )
+        with self.captureOnCommitCallbacks(execute=True):
+            Instrument.objects.create(
+                symbol="MSFT", name="Microsoft", asset_type=AssetType.EQUITY,
+                exchange=self.exchange, currency="USD",
+            )
+
+        response = self.get_as(self.user, "/api/v1/instruments/")
+        self.assertEqual(response["X-Cache"], "MISS")
+        self.assertEqual(response.data["count"], 2)

@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import random
 import time
 import uuid
 
@@ -151,6 +152,19 @@ def get_version(namespace: str) -> int:
 # when the shared counter has gone missing -- see below.
 _fallback_versions: dict[str, int] = {}
 
+#: Bit width of a fallback version. This is not arbitrary: Django's Redis backend
+#: stores a Python ``int`` verbatim and advances the counter with Redis ``INCR``,
+#: which is a *signed 64-bit* operation. A value at or above ``2**63`` makes INCR
+#: fail with "value is not an integer or out of range", after which the namespace
+#: can never be invalidated again -- it would keep serving stale bodies until
+#: every entry's TTL happened to expire. 62 bits leaves an order of magnitude of
+#: headroom while keeping the space of possible versions far larger than any real
+#: number of invalidations. (LocMemCache never surfaces this: it increments a
+#: Python int, which has no width.)
+_FALLBACK_VERSION_BITS = 62
+
+_random = random.SystemRandom()
+
 
 def _version_after_a_lost_counter(namespace: str) -> int:
     """A version guaranteed to differ from every one already in use.
@@ -162,15 +176,15 @@ def _version_after_a_lost_counter(namespace: str) -> int:
     bodies: exactly the failure the version exists to prevent.
 
     Versions only ever have to *differ* from the ones before them, so the
-    replacement is a random 122-bit number rather than the counter we no longer
-    have. The process-local record rules out the two collisions that are
-    nameable -- a repeat within this process, and the initial version every
-    namespace starts at -- which is what makes the guarantee exact instead of
-    merely very likely.
+    replacement is a random number rather than the counter we no longer have. It
+    is bounded to :data:`_FALLBACK_VERSION_BITS` bits so that the *next*
+    :func:`invalidate` can still ``INCR`` it on Redis. The process-local record
+    rules out the two collisions that are nameable -- a repeat within this
+    process, and the initial version every namespace starts at.
     """
-    candidate = uuid.uuid4().int
+    candidate = _random.randrange(1, 2**_FALLBACK_VERSION_BITS)
     while candidate in (INITIAL_VERSION, _fallback_versions.get(namespace)):
-        candidate = uuid.uuid4().int
+        candidate = _random.randrange(1, 2**_FALLBACK_VERSION_BITS)
     _fallback_versions[namespace] = candidate
     return candidate
 
@@ -186,13 +200,19 @@ def invalidate(*namespaces: str) -> None:
         try:
             cache.incr(key)
         except ValueError:
-            # The counter is absent, or is not the integer it should be.
+            # No counter yet -- the ordinary first invalidation of a namespace --
+            # or it was evicted. Either way, seed a fresh bounded version.
             _set(key, _version_after_a_lost_counter(namespace), None)
         except Exception as error:  # noqa: BLE001
-            # The cache is unavailable. Nothing is being served from it either,
-            # so the next request reads the database and the answer is still
-            # correct -- it is only slower until Redis comes back.
+            # The counter cannot be incremented: it holds a value outside Redis's
+            # 64-bit integer range (a counter seeded by an older build, before the
+            # bound above), a wrong type, or the cache is unreachable. Re-seed it
+            # so the namespace is not permanently frozen -- a *different* version
+            # only forces recomputation, it can never serve a stale body. When the
+            # cache is genuinely down the re-seed is a no-op and the next request
+            # reads the database.
             _degraded("incr", error)
+            _set(key, _version_after_a_lost_counter(namespace), None)
 
 
 def invalidate_after_commit(*namespaces: str) -> None:

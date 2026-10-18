@@ -108,6 +108,16 @@ if TESTING:
     # documented test-only hasher and is never used outside tests.
     PASSWORD_HASHERS = ["django.contrib.auth.hashers.MD5PasswordHasher"]
 
+# In production the web process serves its own static files through WhiteNoise,
+# straight out of STATIC_ROOT -- the Django admin's CSS is the one that matters,
+# since `runserver` is not used. It sits directly after SecurityMiddleware, the
+# position WhiteNoise documents. Off in development (runserver already serves
+# static files) and off under tests, so the suite never depends on collected
+# files being present. Requires `collectstatic` to have run (the container
+# entrypoint does it before gunicorn starts).
+if not DEBUG and not TESTING:
+    MIDDLEWARE.insert(1, "whitenoise.middleware.WhiteNoiseMiddleware")
+
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
     {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},
@@ -275,6 +285,7 @@ else:
 # Cached reads are switchable without a code change, so a deployment can turn
 # them off if a stale answer is ever worse than a slow one.
 API_CACHE_ENABLED = env.bool("API_CACHE_ENABLED", default=True)
+SERVE_API_DOCS = env.bool("SERVE_API_DOCS", default=DEBUG)
 
 # Snapshots are append-only and written by the pipeline, so this TTL is a
 # backstop behind explicit invalidation rather than the primary mechanism.
@@ -282,6 +293,7 @@ API_CACHE_ANALYTICS_TTL = env.int("API_CACHE_ANALYTICS_TTL", default=300)
 # The usage summary aggregates the whole price table for one owner: expensive
 # enough to be worth caching, cheap enough that a 60s TTL goes unnoticed.
 API_CACHE_USAGE_TTL = env.int("API_CACHE_USAGE_TTL", default=60)
+API_CACHE_REFERENCE_TTL = env.int("API_CACHE_REFERENCE_TTL", default=300)
 # Stampede control. A request that misses takes the lock and computes; the others
 # wait this long for the winner before computing for themselves, so a cold key
 # costs one heavy query instead of one per concurrent request. The lock is an
@@ -390,7 +402,7 @@ if not TESTING:
 # --------------------------------------------------------------------------- #
 # Redis is the broker. There is no result backend on purpose: business status
 # lives on IngestionJob, so losing a Redis key can never lose a job.
-CELERY_BROKER_URL = env("CELERY_BROKER_URL", default="redis://127.0.0.1:6379/0")
+CELERY_BROKER_URL = env("CELERY_BROKER_URL", default="redis://redis:6379/0")
 CELERY_RESULT_BACKEND = env("CELERY_RESULT_BACKEND", default=None)
 CELERY_TASK_IGNORE_RESULT = True
 

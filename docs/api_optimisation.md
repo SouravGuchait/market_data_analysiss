@@ -322,7 +322,7 @@ in a test, in `curl`, or in a production log — without attaching a profiler.
 
 | Setting | Default | Purpose |
 |---|---|---|
-| `REDIS_CACHE_URL` | *(empty)* | Set it (e.g. `redis://127.0.0.1:6379/1`) to use Redis; empty falls back to `LocMemCache` |
+| `REDIS_CACHE_URL` | *(empty)* | Set it (e.g. `redis://redis:6379/1`, the Compose service name) to use Redis; empty falls back to `LocMemCache` |
 | `CACHE_KEY_PREFIX` | `market_data` | Namespaces the keyspace |
 | `REDIS_CACHE_TIMEOUT` | 1 | Connect/socket timeout, in seconds |
 | `API_CACHE_ENABLED` | `True` | Kill switch; cached reads off, API unchanged |

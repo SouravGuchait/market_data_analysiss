@@ -31,6 +31,35 @@ class DownBackend:
         return explode
 
 
+class UnincrementableBackend:
+    """A cache whose counter cannot be incremented.
+
+    This is what Redis does when the stored counter is outside its signed 64-bit
+    integer range -- or is the wrong type: ``INCR`` raises instead of advancing.
+    LocMemCache cannot present this, because it increments a Python int, whose
+    size is unbounded; the point of the stand-in is to reach the failure on a
+    test host that has no Redis.
+    """
+
+    class ResponseError(Exception):
+        pass
+
+    def __init__(self):
+        self.store: dict = {}
+
+    def incr(self, key, *args, **kwargs):
+        raise self.ResponseError("value is not an integer or out of range")
+
+    def set(self, key, value, timeout=None):
+        self.store[key] = value
+
+    def get(self, key, default=None):
+        return self.store.get(key, default)
+
+    def delete(self, key):
+        self.store.pop(key, None)
+
+
 @override_settings(API_CACHE_ENABLED=True)
 class CacheTestCase(TestCase):
     """Base case with a cache that is on, empty, and version-free."""
@@ -128,6 +157,30 @@ class InvalidationTests(CacheTestCase):
         cache.invalidate("unit")
 
         self.assertGreater(cache.get_version("unit"), first)
+
+    def test_the_fallback_version_stays_within_redis_integer_range(self):
+        """The counter is advanced with Redis ``INCR``, a signed 64-bit
+        operation. A fallback version at or above ``2**63`` would be stored but
+        could never be incremented, silently freezing the namespace -- so the
+        fallback must fit. Regression guard: the original used a 122-bit
+        ``uuid4().int``, which LocMemCache happily increments and Redis cannot."""
+        version = cache._version_after_a_lost_counter("unit")
+
+        self.assertGreater(version, 0)
+        self.assertLess(version, 2**63)
+
+    def test_a_counter_redis_cannot_increment_is_reseeded_not_frozen(self):
+        """An unincrementable counter (an out-of-range value left by an older
+        build, or a wrong type) must be replaced rather than blocking every
+        future invalidation of the namespace."""
+        backend = UnincrementableBackend()
+
+        with mock.patch("apps.common.cache.cache", backend):
+            cache.invalidate("unit")
+            version = cache.get_version("unit")
+
+        self.assertGreater(version, 0)
+        self.assertLess(version, 2**63)
 
     def test_a_lost_version_counter_cannot_resurrect_orphaned_entries(self):
         """Eviction of the counter must not restart the count and re-adopt entries.

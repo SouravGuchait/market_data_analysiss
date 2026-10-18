@@ -670,7 +670,7 @@ validity — means each test has exactly one reason to fail.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `CELERY_BROKER_URL` | `redis://127.0.0.1:6379/0` | Redis as broker |
+| `CELERY_BROKER_URL` | `redis://redis:6379/0` | Redis as broker (`redis` is the Compose service name) |
 | `CELERY_RESULT_BACKEND` | `None` | deliberately unset |
 | `CELERY_TASK_IGNORE_RESULT` | `True` | results are not stored anywhere |
 | `CELERY_TASK_ACKS_LATE` | `True` | ack after the task returns |

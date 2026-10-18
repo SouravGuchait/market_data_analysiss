@@ -1,0 +1,178 @@
+# Market Data Intelligence & Analytics Pipeline -- Compose definition.
+#
+# THIS FILE IS THE PRODUCTION SHAPE. The image carries the code, nothing is
+# bind-mounted, only the web port is published, and DEBUG defaults to off.
+#
+#   docker compose up                                  -> development
+#       (compose also merges docker-compose.override.yml: bind-mounted source,
+#        DEBUG on, MySQL/Redis ports published, gunicorn --reload)
+#
+#   docker compose -f docker-compose.yml up -d         -> production shape
+#       (add your own -f for a cloud overlay; see docs/docker_deployment.md)
+#
+# Configuration comes from the git-ignored .env file via `env_file`, then the
+# `x-app-env` anchor overlays the values that must differ inside the network --
+# chiefly the service names (`mysql`, `redis`) in place of a host machine. The
+# anchor wins over env_file, so the same image runs against managed services by
+# changing only these keys.
+#
+# Secrets are never baked into the image (.dockerignore excludes .env); they
+# enter the container at run time.
+
+name: market-data
+
+# Shared pieces, referenced by every application service.
+x-app-image: &app-image
+  build:
+    context: .
+    dockerfile: Dockerfile
+
+x-app-env: &app-env
+  DB_HOST: mysql
+  DB_PORT: "3306"
+  DB_USER: ${MYSQL_APP_USER:-market_data}
+  DB_PASSWORD: ${MYSQL_APP_PASSWORD:-market_data_local_pw}
+  REDIS_HOST: redis
+  CELERY_BROKER_URL: redis://redis:6379/0
+  REDIS_CACHE_URL: redis://redis:6379/1
+  DJANGO_DEBUG: "False"
+
+services:
+  # ----------------------------------------------------------------------- #
+  # Dependencies
+  # ----------------------------------------------------------------------- #
+  mysql:
+    image: mysql:8.0
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_DATABASE: ${DB_NAME:-market_data}
+      # A dedicated, least-privilege application user -- not root. The root
+      # password is used only by the health check and by an operator who needs
+      # to inspect the server.
+      MYSQL_USER: ${MYSQL_APP_USER:-market_data}
+      MYSQL_PASSWORD: ${MYSQL_APP_PASSWORD:-market_data_local_pw}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_local_pw_change_me}
+    volumes:
+      # Named volume: the data outlives `docker compose down` (but not
+      # `down -v`). See "Backups and recovery" in docs/docker_deployment.md.
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      # Ready when the server answers -- not merely when the container is up.
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # AOF on so an unclean stop does not lose a queued job message. The database
+    # row is still the source of truth; this only avoids re-enqueueing by hand.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------------- #
+  # One-shot schema migration. web and worker wait for it to EXIT ZERO, so no
+  # request is ever served or task run against a half-migrated schema.
+  # ----------------------------------------------------------------------- #
+  migrate:
+    <<: *app-image
+    env_file: [.env]
+    environment:
+      <<: *app-env
+    command: ["python", "manage.py", "migrate", "--noinput"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
+
+  # ----------------------------------------------------------------------- #
+  # Web tier -- gunicorn in front of the WSGI app.
+  # ----------------------------------------------------------------------- #
+  web:
+    <<: *app-image
+    env_file: [.env]
+    environment:
+      <<: *app-env
+      COLLECT_STATIC: "true"
+    command:
+      - gunicorn
+      - config.wsgi:application
+      - --bind
+      - 0.0.0.0:8000
+      - --workers
+      - "3"
+      - --timeout
+      - "120"
+      - --access-logfile
+      - "-"
+      - --error-logfile
+      - "-"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    expose:
+      - "8000"
+    healthcheck:
+      # /readyz, not /healthz: the web instance should join the load balancer
+      # only when the database answers. Written with the interpreter so the image
+      # needs no curl.
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=4).status==200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------------- #
+  # Celery worker -- the ingestion queue. Same image, different command.
+  # ----------------------------------------------------------------------- #
+  worker:
+    <<: *app-image
+    env_file: [.env]
+    environment:
+      <<: *app-env
+      WAIT_FOR_BROKER: "true"
+    command:
+      - celery
+      - -A
+      - config
+      - worker
+      - --loglevel=info
+      - --concurrency=4
+      - --max-tasks-per-child=100
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # A worker that cannot reach the broker can do no work, so a failed ping
+      # is a genuinely unhealthy worker, not a flaky one.
+      test: ["CMD-SHELL", "celery -A config inspect ping --timeout 5 || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  mysql-data:
+  redis-data:
