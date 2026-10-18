@@ -106,6 +106,12 @@ except `register`, `login`, and `token/refresh`. Each app owns its URL namespace
 (`app_name` in `urls.py`), so routes are referenced as
 `reverse("instruments:list")` rather than by hardcoded path.
 
+A flatter public surface — `/api/v1/stocks/`, `/api/v1/jobs/`, `/api/v1/me/` —
+sits on top of these same services, keyed by symbol for stocks and returning a
+job id for the asynchronous ETL. It adds no models and changes none of the
+routes below; see [docs/public_api.md](docs/public_api.md) for the full route
+table, examples, and the synchronous-versus-asynchronous discussion.
+
 | # | Method | Endpoint | Access | Purpose |
 |---|---|---|---|---|
 | 1 | `GET` | `/api/v1/instruments/` | authenticated | list instruments, filter and search |
@@ -122,7 +128,9 @@ except `register`, `login`, and `token/refresh`. Each app owns its URL namespace
 | 12 | `GET` | `/api/v1/ingestion/<uuid>/rule-summaries/` | authenticated, **owner** | rule-level PASS/FAIL for a job |
 | 13 | `GET` | `/api/v1/ingestion/<uuid>/validation-errors/` | authenticated, **owner** | rejected rows for a job |
 | 14 | `GET` | `/api/v1/analytics/instruments/<id>/metrics/` | authenticated | metric snapshots for an instrument |
-| 15 | `GET` | `/api/v1/auth/usage/` | authenticated | activity statistics |
+| 15 | `GET` | `/api/v1/analytics/instruments/<id>/series/` | authenticated | one metric computed on demand for an instrument |
+| 16 | `GET` | `/api/v1/analytics/rankings/` | authenticated | instruments ranked by one measure |
+| 17 | `GET` | `/api/v1/auth/usage/` | authenticated | activity statistics |
 
 Instruments, prices, and analytics are **read-only** through the API — those
 rows are written by the ingestion pipeline, never by a client. There are two
@@ -135,9 +143,11 @@ documented in [docs/celery_async.md](docs/celery_async.md).
 ### Query parameters
 
 All parameters are optional and combine with `&`. An **unknown** parameter is
-always ignored. An invalid *value* usually gives a `400` — with two documented
-exceptions noted under each table (`is_active` silently ignoring a
-non-boolean, and `page` returning `404` when out of range).
+always ignored — with one documented exception, the two computed analytics
+endpoints (`.../series/` and `/rankings/`), which reject one rather than silently
+computing something the client did not ask for. An invalid *value* usually gives a
+`400` — with two further exceptions noted under each table (`is_active` silently
+ignoring a non-boolean, and `page` returning `404` when out of range).
 
 **`GET /api/v1/instruments/`**
 
@@ -212,6 +222,52 @@ Unpaginated — a job has one row per rule. Default order is `rule_name` ascendi
 | `page`, `page_size` | pagination | `page_size` ≤ 100 | `?page_size=50` |
 
 Default order is `as_of_date` descending, then `metric_type`.
+
+**`GET /api/v1/analytics/instruments/<id>/series/`**
+
+One metric of one instrument, computed on demand from stored prices. `metric`
+selects which one; `start_date`, `end_date` and `backend` apply to all of them.
+
+| Parameter | Match | Accepted values | Default when omitted |
+|---|---|---|---|
+| `metric` | exact | `returns`, `cumulative_returns`, `moving_averages`, `volatility`, `drawdown`, `extremes`, `volume`, `percentage_change` | `returns` |
+| `start_date` | inclusive lower bound | ISO date `YYYY-MM-DD` | the instrument's first session |
+| `end_date` | inclusive upper bound | ISO date `YYYY-MM-DD` | the instrument's last session |
+| `backend` | exact | `sql`, `python`, `pandas` — but only where the metric has one: `cumulative_returns` and `percentage_change` take `python` or `pandas` | the metric's own (`sql` where it exists, else `python`) |
+| `window` | integer ≥ 2 | `volatility` only | `30` |
+| `names` | comma-separated | `moving_averages` only: `moving_average_7`, `moving_average_30`, `moving_average_90` | all three |
+| `periods` | JSON array | `percentage_change` only: `[{"label": "q1", "start_date": "...", "end_date": "..."}]`; `label` is optional | one period spanning `start_date`..`end_date` |
+
+Unpaginated deliberately: a windowed metric cannot be paged without recomputing
+its warm-up for every page. The body is one object whose `points` are the series,
+beside `padding` (warm-up rows read but not answered), `undefined` (points the
+metric could not compute) and the metric's own summary. A `window` on any other
+metric, or any other parameter these do not take, is a `400`.
+
+**`GET /api/v1/analytics/rankings/`**
+
+Instruments compared to one another over one window — no instrument in the path,
+because the answer is *about* symbols.
+
+| Parameter | Match | Accepted values | Default when omitted |
+|---|---|---|---|
+| `measure` | exact | `return`, `volume` | `return` |
+| `instrument_ids` | comma-separated ids | any instrument primary keys | every instrument priced in the window |
+| `start_date` | inclusive lower bound | ISO date `YYYY-MM-DD` | the window's first session |
+| `end_date` | inclusive upper bound | ISO date `YYYY-MM-DD` | the window's last session |
+| `lookback` | integer ≥ 1 | sessions, **per instrument** | the whole bounded range |
+| `descending` | boolean | `true`, `false`, `1`, `0`, `yes`, `no` | `true` (best first) |
+| `limit` | integer ≥ 0 | how many rows to return | every ranked instrument |
+| `backend` | exact | `python`, `pandas` | `python` |
+
+`limit` truncates **after** ranking, so the rows that come back keep their real
+places: with `limit=1` the one row is still rank `1`, and `truncated` says how many
+were left out.
+
+> **These two endpoints reject an unknown query parameter** (`400`) instead of
+> ignoring it as the rest of the API does — including a parameter belonging to a
+> *different* metric, such as `?metric=moving_averages&window=7`. Ignoring it would
+> return a three-series answer that looks like it honoured the window.
 
 **Endpoints with no query parameters**
 
@@ -470,6 +526,85 @@ oversize upload is a `400` naming the `file` field, and no job is created.
 }
 ```
 
+That endpoint reads *stored* snapshots. The metrics engine itself — daily returns,
+cumulative returns, 7/30/90-day moving averages, rolling volatility, maximum
+drawdown, price extremes, volume summaries, percentage change over a period, and
+cross-sectional rankings by return and by volume — is served by the two endpoints
+below, which compute on demand and cache nothing (a computed series depends on
+price rows, and their writes do not invalidate the analytics cache).
+
+**Daily returns, computed on demand** — `GET /api/v1/analytics/instruments/1/series/?metric=returns&start_date=2024-03-12`
+
+```json
+{
+  "symbol": "AAPL",
+  "backend": "sql",
+  "start_date": "2024-03-12",
+  "end_date": null,
+  "padding": 1,
+  "undefined": 0,
+  "points": [
+    {
+      "trading_date": "2024-03-12",
+      "close": "102.00000000",
+      "previous_close": "100.00000000",
+      "value": "0.02000000"
+    },
+    {
+      "trading_date": "2024-03-13",
+      "close": "101.00000000",
+      "previous_close": "102.00000000",
+      "value": "-0.00980392"
+    },
+    {
+      "trading_date": "2024-03-14",
+      "close": "103.00000000",
+      "previous_close": "101.00000000",
+      "value": "0.01980198"
+    },
+    {
+      "trading_date": "2024-03-15",
+      "close": "104.00000000",
+      "previous_close": "103.00000000",
+      "value": "0.00970874"
+    }
+  ]
+}
+```
+
+**A cross-sectional ranking** — `GET /api/v1/analytics/rankings/?measure=return&limit=2`
+
+```json
+{
+  "measure": "return",
+  "backend": "python",
+  "descending": true,
+  "start_date": null,
+  "end_date": null,
+  "lookback": null,
+  "universe": 3,
+  "ranked": 3,
+  "unranked": 0,
+  "truncated": 1,
+  "rows": [
+    { "rank": 1, "instrument_id": 3, "symbol": "GOOG", "value": "0.08000000", "observations": 5, "first_date": "2024-03-11", "last_date": "2024-03-15" },
+    { "rank": 2, "instrument_id": 2, "symbol": "MSFT", "value": "0.05000000", "observations": 5, "first_date": "2024-03-11", "last_date": "2024-03-15" }
+  ]
+}
+```
+
+Every value is a **string**: money and ratios at eight decimal places (the width of
+`AnalyticSnapshot.value`), counts whole, and a ranking's `value` at the precision
+its measure carries — so the payload does not depend on which database driver
+answered it. A measure the engine could not compute is `null`, counted in
+`undefined` (or `unranked`, in a ranking).
+
+The engine is documented separately in
+[docs/market_analytics.md](docs/market_analytics.md): the formula behind each
+measure, how missing prices and zero denominators are handled, trading days versus
+calendar days, the SQL-window and Pandas implementations, and the hand-calculated
+samples its tests assert.
+
 **Usage statistics** — `GET /api/v1/auth/usage/`
 
 ```json
@@ -671,6 +806,7 @@ market_data_analysiss/
 ├── apps/
 │   ├── accounts/             # Custom user model, login, roles
 │   ├── analytics/            # AnalyticSnapshot
+│   ├── api/                  # Public facade: /stocks/, /jobs/, /me/
 │   ├── audit/                # AuditEvent
 │   ├── common/               # Shared permissions and the error envelope
 │   ├── ingestion/            # IngestionJob, IngestionFile, IngestionValidationError, IngestionRuleSummary
@@ -690,6 +826,9 @@ market_data_analysiss/
 - `config/`: project-level settings, URL routing, and ASGI/WSGI server entry points.
 - `apps/accounts/`: the custom `User` model (email login), JWT endpoints, and the
   analyst/administrator role field.
+- `apps/api/`: the public facade (`/stocks/`, `/jobs/`, `/me/`) — thin views with
+  no models, delegating to the domain services. Documented in
+  [docs/public_api.md](docs/public_api.md).
 - `apps/common/`: `IsOwner` for object-level ownership checks and the single
   `{"error": {...}}` response envelope used by every endpoint.
 - `apps/instruments/`: `Exchange` and `Instrument`, the reference-data dimension table.

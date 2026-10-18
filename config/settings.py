@@ -27,6 +27,7 @@ INSTALLED_APPS = [
     "django_filters",
     "apps.accounts.apps.AccountsConfig",
     "apps.common.apps.CommonConfig",
+    "apps.api.apps.ApiConfig",
     "apps.instruments.apps.InstrumentsConfig",
     "apps.marketdata.apps.MarketdataConfig",
     "apps.ingestion.apps.IngestionConfig",
