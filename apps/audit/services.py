@@ -13,6 +13,8 @@ from __future__ import annotations
 import logging
 import uuid
 
+from apps.common.request_context import get_request_id
+
 from .events import sanitize_metadata
 from .models import AuditEvent
 
@@ -27,7 +29,13 @@ REQUEST_ID_HEADER = "X-Request-ID"
 def _request_id(request) -> str:
     if request is None:
         return uuid.uuid4().hex
-    supplied = (request.headers.get(REQUEST_ID_HEADER) or "").strip()
+    # Prefer the id the middleware already resolved for this request, so the
+    # audit row, the response's ``X-Request-ID`` header, and the request log line
+    # all carry one value. Fall back to the header and then to a fresh id for
+    # callers that reach this writer without the middleware (management commands,
+    # tasks, direct service calls).
+    assigned = getattr(request, "request_id", "") or get_request_id()
+    supplied = assigned or (request.headers.get(REQUEST_ID_HEADER) or "").strip()
     return (supplied or uuid.uuid4().hex)[:64]
 
 

@@ -60,6 +60,42 @@ class EngineAPITestCase(AuthenticatedAPITestCase):
         ]
 
 
+class ComputationLoggingTests(EngineAPITestCase):
+    """A computation leaves a line saying what ran and how long it took.
+
+    These are the lines that answer "why was that request slow?" -- the request
+    log says the endpoint took 1.4s, and this says which metric ran, on which
+    backend, and for how long.
+    """
+
+    def test_a_series_computation_is_logged_with_its_backend_and_duration(self):
+        with self.assertLogs("market_data.analytics", level="INFO") as captured:
+            response = self.get_series(metric="returns")
+
+        self.assertEqual(response.status_code, 200)
+        message = captured.records[0].getMessage()
+        self.assertIn("metric=returns", message)
+        self.assertIn(f"instrument={self.aapl.pk}", message)
+        self.assertIn("backend=", message)
+        self.assertIn("ms", message)
+
+    def test_a_ranking_computation_is_logged(self):
+        with self.assertLogs("market_data.analytics", level="INFO") as captured:
+            response = self.get_ranking(measure="return")
+
+        self.assertEqual(response.status_code, 200)
+        message = captured.records[0].getMessage()
+        self.assertIn("ranking", message)
+        self.assertIn("measure=return", message)
+
+    def test_a_rejected_metric_logs_nothing(self):
+        # A 400 never reaches the engine, so the computation logger stays quiet.
+        with self.assertNoLogs("market_data.analytics", level="INFO"):
+            response = self.get_series(metric="not_a_metric")
+
+        self.assertEqual(response.status_code, 400)
+
+
 class DefaultsTests(EngineAPITestCase):
     """What a bare request asks for, without the client naming anything."""
 

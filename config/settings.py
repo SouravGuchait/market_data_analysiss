@@ -6,6 +6,8 @@ from pathlib import Path
 
 import environ
 
+from config.logging_config import add_file_handler, file_log_handler
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 env = environ.Env(DEBUG=(bool, False))
@@ -38,6 +40,10 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    # Second so it brackets the whole request -- auth, view, response -- and can
+    # read request.user on the way out (Django's middleware is LIFO on the way
+    # back, so everything registered below has already run).
+    "apps.common.middleware.RequestContextMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -230,12 +236,33 @@ if TESTING:
     }
     API_CACHE_ENABLED = False
 
+# A request slower than this is logged at WARNING by
+# apps.common.middleware.RequestContextMiddleware, so slow endpoints surface in
+# the log stream without a separate monitoring stack. 0 disables the escalation.
+API_SLOW_REQUEST_MS = env.int("API_SLOW_REQUEST_MS", default=1000)
+
+# --------------------------------------------------------------------------- #
+# Request log file
+# --------------------------------------------------------------------------- #
+# Beside the console, every log line is appended to a rotating plain-text file
+# so the request history survives a container's stdout being lost and can be read
+# with no log collector. Rotation is by size: when api.log reaches
+# API_LOG_MAX_BYTES it is renamed to api.log.1 and a fresh file is started, with
+# API_LOG_BACKUP_COUNT generations kept. The directory is ignored by Git. File
+# logging is off during tests so the suite never writes to the working tree.
+LOG_DIR = Path(env("DJANGO_LOG_DIR", default=str(BASE_DIR / "logs")))
+API_LOG_FILENAME = env("API_LOG_FILENAME", default="api.log")
+API_LOG_MAX_BYTES = env.int("API_LOG_MAX_BYTES", default=10 * 1024 * 1024)
+API_LOG_BACKUP_COUNT = env.int("API_LOG_BACKUP_COUNT", default=10)
+
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
     "formatters": {
         "verbose": {
-            "format": "{asctime} {levelname} {name} {message}",
+            # ``request_id`` is filled by the RequestIdFilter on the console
+            # handler, so every line is attributable to one request.
+            "format": "{asctime} {levelname} {name} [{request_id}] {message}",
             "style": "{",
         },
     },
@@ -246,12 +273,15 @@ LOGGING = {
         "suppress_probe_not_found": {
             "()": "config.log_filters.SuppressProbeNotFound",
         },
+        "request_id": {
+            "()": "config.log_filters.RequestIdFilter",
+        },
     },
     "handlers": {
         "console": {
             "class": "logging.StreamHandler",
             "formatter": "verbose",
-            "filters": ["suppress_probe_not_found"],
+            "filters": ["request_id", "suppress_probe_not_found"],
         },
     },
     "root": {"handlers": ["console"], "level": "INFO"},
@@ -259,11 +289,29 @@ LOGGING = {
         "django.request": {"handlers": ["console"], "level": "WARNING", "propagate": False},
         "market_data": {"handlers": ["console"], "level": "INFO", "propagate": False},
         "market_data.tasks": {"handlers": ["console"], "level": "INFO", "propagate": False},
+        # One line per HTTP request: method, path, status, latency, trace id.
+        "market_data.request": {"handlers": ["console"], "level": "INFO", "propagate": False},
+        # One line per on-demand metric/ranking computation, uncached and often
+        # the expensive part of a request.
+        "market_data.analytics": {"handlers": ["console"], "level": "INFO", "propagate": False},
         # Cache degradation is reported here, throttled, so a Redis outage
         # produces one warning a minute instead of one per request.
         "market_data.cache": {"handlers": ["console"], "level": "INFO", "propagate": False},
     },
 }
+
+# Add the rotating file handler on top of the console. Skipped under tests, and
+# skipped silently if the log directory cannot be created (add_file_handler is
+# only reached when file_log_handler returned a handler rather than None).
+if not TESTING:
+    _file_handler = file_log_handler(
+        log_dir=LOG_DIR,
+        filename=API_LOG_FILENAME,
+        max_bytes=API_LOG_MAX_BYTES,
+        backup_count=API_LOG_BACKUP_COUNT,
+    )
+    if _file_handler is not None:
+        add_file_handler(LOGGING, _file_handler)
 
 # --------------------------------------------------------------------------- #
 # Celery / Redis

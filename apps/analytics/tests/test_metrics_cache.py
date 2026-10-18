@@ -29,6 +29,18 @@ class MetricsCacheTests(MetricsAPITestCase):
         self.assertEqual(first["X-Cache"], "MISS")
         self.assertEqual(second["X-Cache"], "HIT")
 
+    def test_a_miss_then_a_hit_is_logged_so_a_read_can_be_traced(self):
+        with self.assertLogs("market_data.cache", level="DEBUG") as captured:
+            self.get_as(self.user, self.url)
+            self.get_as(self.user, self.url)
+
+        verdicts = [
+            "MISS" if "cache MISS" in record.getMessage() else "HIT"
+            for record in captured.records
+            if "cache " in record.getMessage()
+        ]
+        self.assertEqual(verdicts, ["MISS", "HIT"])
+
     def test_a_hit_costs_no_queries_and_a_miss_costs_the_page(self):
         with self.assertNumQueries(4):
             # The JWT user, the instrument, the paginator's COUNT, the page.

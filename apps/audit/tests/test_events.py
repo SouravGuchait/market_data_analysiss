@@ -117,6 +117,19 @@ class RecordEventTests(TestCase):
         self.assertEqual(event.request_id, "req-9")
         self.assertEqual(event.ip_address, "203.0.113.7")
 
+    def test_the_middleware_assigned_request_id_wins_over_the_header(self):
+        # The middleware resolves one id per request and puts it on the request,
+        # so the audit row, the response header, and the request log agree even
+        # when a header was also present.
+        request = self.request(request_id="from-header")
+        request.request_id = "from-middleware"
+
+        event = services.record_event(
+            action=AuditAction.JOB_CREATED, request=request
+        )
+
+        self.assertEqual(event.request_id, "from-middleware")
+
     def test_a_missing_request_id_is_generated_not_left_blank(self):
         event = services.record_event(action=AuditAction.JOB_CREATED, request=self.request())
 

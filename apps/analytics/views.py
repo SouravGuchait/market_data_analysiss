@@ -9,6 +9,8 @@ serving a series computed before the newest session. See ``docs/market_analytics
 """
 
 import json
+import logging
+import time
 from datetime import date
 
 from django.shortcuts import get_object_or_404
@@ -34,6 +36,13 @@ from .serializers import (
     RollingVolatilitySerializer,
     VolumeSummariesSerializer,
 )
+
+#: The computed metrics are uncached and can be the most expensive work in a
+#: request, so each one gets a line inside the request it belongs to: which
+#: metric, which instrument, which backend actually ran, and how long it took.
+#: The request id is ambient, so the line is already correlated with the request
+#: log without passing anything down.
+logger = logging.getLogger("market_data.analytics")
 
 
 class AnalyticSnapshotListAPIView(CachedReadMixin, generics.ListAPIView):
@@ -390,15 +399,24 @@ class MetricSeriesAPIView(QueryParameterMixin, generics.GenericAPIView):
         self.reject_unknown(SHARED_PARAMS + EXTRA_PARAMS.get(metric, ()))
 
         try:
-            result = METRIC_SERVICES[metric](
-                self.get_instrument(), **self.service_kwargs(metric)
-            )
+            instrument = self.get_instrument()
+            service_kwargs = self.service_kwargs(metric)
+            started = time.monotonic()
+            result = METRIC_SERVICES[metric](instrument, **service_kwargs)
         except ValueError as exc:
             # Every ValueError the engine raises is about the request -- an unknown
             # backend, an inverted range, a window too small, a period passed
             # alongside the dates it excludes. That is the client's mistake, so 400.
             raise ValidationError({"metric": [str(exc)]}) from exc
 
+        logger.info(
+            "computed metric=%s instrument=%s backend=%s points=%s in %.2fms",
+            metric,
+            instrument.pk,
+            getattr(result, "backend", "?"),
+            len(getattr(result, "points", ()) or ()),
+            (time.monotonic() - started) * 1000,
+        )
         return Response(METRIC_SERIALIZERS[metric](result).data)
 
     def service_kwargs(self, metric):
@@ -493,10 +511,18 @@ class RankingAPIView(QueryParameterMixin, generics.GenericAPIView):
     def get(self, request, *args, **kwargs):
         self.reject_unknown(RANKING_PARAMS)
         try:
-            ranking = services.ranking_for_instruments(**self.service_kwargs())
+            service_kwargs = self.service_kwargs()
+            started = time.monotonic()
+            ranking = services.ranking_for_instruments(**service_kwargs)
         except ValueError as exc:
             raise ValidationError({"ranking": [str(exc)]}) from exc
 
+        logger.info(
+            "computed ranking measure=%s ranked=%s in %.2fms",
+            service_kwargs["measure"],
+            getattr(ranking, "ranked", "?"),
+            (time.monotonic() - started) * 1000,
+        )
         return Response(RankingSerializer(ranking).data)
 
     def service_kwargs(self):

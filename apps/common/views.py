@@ -1,9 +1,18 @@
 """View mixins shared across apps."""
 
+import logging
+
 from django.conf import settings
 from rest_framework.response import Response
 
 from apps.common import cache
+
+#: Hit/miss is logged here rather than inside the cache backend because this is
+#: the one place that knows the answer semantically: ``payload is not None`` is
+#: "the body was served from cache", whereas inside the backend a ``None`` also
+#: means "caching is off" or "the entry would not decode". DEBUG, because every
+#: cached read produces a line and the default stream is meant to stay readable.
+logger = logging.getLogger("market_data.cache")
 
 
 class CachedReadMixin:
@@ -49,6 +58,15 @@ class CachedReadMixin:
                 lambda: self.produce_payload(request, *args, **kwargs),
                 ttl=self.get_cache_ttl(),
             )
+
+        # The ambient request id makes this line findable from the request line
+        # it belongs to; the key says which answer was hit or had to be built.
+        logger.debug(
+            "cache %s namespace=%s key=%s",
+            "HIT" if hit else "MISS",
+            self.cache_namespace,
+            key,
+        )
 
         response = Response(payload)
         response["X-Cache"] = "HIT" if hit else "MISS"

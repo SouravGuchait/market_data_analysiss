@@ -726,6 +726,105 @@ API examples, and the design notes (conditional aggregation, one-to-many join
 inflation, `rows_received` versus `rows_processed`, and audit events versus logs
 versus job status).
 
+## Observability: request tracing and latency
+
+Every request through the API is assigned a **trace id** and timed end to end.
+The id is returned to the client on the `X-Request-ID` response header, prefixed
+onto every log line written while the request is in flight, and stored on the
+audit row the request produces — so a client, our logs, and the audit trail all
+name the same request.
+
+```
+X-Request-ID: 3f9c1e0b7a2d4e6f8b1c0d2e4f6a8b0c
+```
+
+A caller may supply its own `X-Request-ID`; the API echoes it verbatim (clipped
+to the 64-character audit column), which is what lets a frontend or an upstream
+gateway correlate its logs with ours. When the header is absent one is generated,
+so a request is never logged without an id.
+
+### What lands in the log
+
+`apps.common.middleware.RequestContextMiddleware` writes exactly one line per
+request on the `market_data.request` logger, after the response is built:
+
+```
+2026-10-18 16:33:47,503 INFO market_data.request [3f9c1e0b…] GET /api/v1/instruments/?page=2 -> 200 in 18.40ms user=1
+```
+
+The trailing `[3f9c…]` is the trace id, injected by
+`config.log_filters.RequestIdFilter` on the console handler — so a warning from
+the cache or a library stack trace carries it too, not just the line the API
+writes itself. A request that raises is still logged (as a `500`) and then
+re-raised, so a stack trace and its request line share one id.
+
+A request slower than `API_SLOW_REQUEST_MS` (default `1000`, `0` disables) is
+logged at `WARNING` instead of `INFO`, so slow endpoints stand out in the log
+stream without a separate monitoring stack:
+
+```
+2026-10-18 16:33:47,503 WARNING market_data.request [3f9c1e0b…] GET /api/v1/analytics/rankings/ -> 200 in 1420.88ms user=1
+```
+
+The middleware resets the ambient id in a `finally`, so a recycled worker thread
+cannot leak one request's id into the next, and the timing wraps the view in a
+`try` so the measurement is emitted on the error path as well.
+
+### Where the lines go
+
+Two handlers receive every line: the **console** (stdout — the terminal in
+development, the platform's log collector in production) and a **rotating
+plain-text file** at `logs/api.log`. Rotation is by size: when the file reaches
+`API_LOG_MAX_BYTES` it is renamed to `api.log.1` and a fresh one started, keeping
+`API_LOG_BACKUP_COUNT` generations (`api.log.2`, …; the oldest is discarded).
+
+There is **one line per request, not one file per request** — a file per call
+would be thousands of tiny files a day and unsearchable. The file is UTF-8,
+shares the console's `[request_id]` prefix and `API_SLOW_REQUEST_MS` escalation,
+and `logs/` is ignored by Git. File logging is skipped when the log directory
+cannot be created (a read-only filesystem costs the file copy, not the
+application) and during the test suite, so tests never write to the tree.
+
+| Knob | Default | Effect |
+|---|---|---|
+| `X-Request-ID` header (in) | — | reused as the request's trace id when present |
+| `X-Request-ID` header (out) | always set | the same id, returned on every response |
+| `DJANGO_LOG_DIR` | `logs/` | directory holding `api.log` |
+| `API_LOG_FILENAME` | `api.log` | the log file's name |
+| `API_LOG_MAX_BYTES` | `10485760` (10 MiB) | rotate once the file reaches this size |
+| `API_LOG_BACKUP_COUNT` | `10` | rotated files kept, oldest discarded |
+| `API_SLOW_REQUEST_MS` | `1000` | `≥` this many ms logs at `WARNING`; `0` disables |
+| `market_data.request` logger | `INFO` | one line per request |
+
+### Inside a request: service logs
+
+The request line answers *how slow*; two more loggers answer *what happened
+inside*, and both carry the same `[request_id]`, so a slow request and its cause
+are one grep apart.
+
+- **`market_data.analytics`** (`INFO`) — one line per on-demand metric or ranking
+  computation, which is uncached and often the expensive part of a request:
+
+  ```
+  … INFO market_data.analytics [8652c…] computed metric=volatility instrument=1 backend=pandas points=250 in 1389.10ms
+  ```
+
+- **`market_data.cache`** (`DEBUG`) — a hit/miss line per cached read, naming the
+  key that was answered from cache or had to be built:
+
+  ```
+  … DEBUG market_data.cache [8652c…] cache MISS namespace=analytics key=analytics:v4:role:analyst:instrument=1:page=1
+  ```
+
+Hit/miss is `DEBUG` so it does not flood the default stream; raise that logger to
+see it. Raising `market_data` anywhere to `DEBUG` shows both.
+
+Logging is deliberately added only at **boundaries and decisions**, never on
+entry to every function — a line per service call would be noise, and the request
+line already covers the read-only services (`instruments`, `marketdata`,
+`reports`). The heavier write paths already do this: `apps/ingestion/etl`,
+`apps/ingestion/tasks`, and `apps/audit`.
+
 ## Ingestion ETL
 
 Price batches are loaded synchronously by `apps.ingestion.etl` — one pipeline for

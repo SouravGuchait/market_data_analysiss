@@ -7,6 +7,22 @@ filter logic stays out of a file that should read as configuration.
 
 import logging
 
+from apps.common.request_context import get_request_id
+
+
+class RequestIdFilter(logging.Filter):
+    """Stamp every record with the id of the request it was logged during.
+
+    Attached to the console handler rather than to one logger, so a warning from
+    the cache or a library line is correlated with the request that triggered it,
+    not only the lines the API logs itself. Outside a request the value is the
+    literal ``"-"``, so the format string always has a field to render.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = get_request_id() or "-"
+        return True
+
 
 class SuppressProbeNotFound(logging.Filter):
     """Drop ``Not Found`` warnings raised for liveness probes.
